@@ -1,5 +1,5 @@
 #!/bin/bash
-sh_v="4.3.3"
+sh_v="4.3.4"
 
 
 gl_hui='\e[37m'
@@ -118,7 +118,7 @@ UserLicenseAgreement() {
 	echo "首次使用脚本，请先阅读并同意用户许可协议。"
 	echo "用户许可协议: https://blog.kejilion.pro/user-license-agreement/"
 	echo -e "----------------------"
-	read -r -p "是否同意以上条款？(y/n): " user_input
+	read -e -p "是否同意以上条款？(y/n): " user_input
 
 
 	if [ "$user_input" = "y" ] || [ "$user_input" = "Y" ]; then
@@ -154,7 +154,7 @@ public_ip=$(get_public_ip)
 isp_info=$(curl -s --max-time 3 http://ipinfo.io/org)
 
 
-if echo "$isp_info" | grep -Eiq 'mobile|unicom|telecom'; then
+if echo "$isp_info" | grep -Eiq 'CHINANET|mobile|unicom|telecom'; then
   ipv4_address=$(get_local_ip)
 else
   ipv4_address="$public_ip"
@@ -1442,10 +1442,6 @@ install_ssltls() {
 					openssl req -x509 -key /etc/letsencrypt/live/$yuming/privkey.pem -out /etc/letsencrypt/live/$yuming/fullchain.pem -days 5475 -subj "/C=US/ST=State/L=City/O=Organization/OU=Organizational Unit/CN=Common Name"
 				fi
 			else
-				if ! iptables -C INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null; then
-					iptables -I INPUT 1 -p tcp --dport 80 -j ACCEPT
-				fi
-
 				docker run --rm -p 80:80 -v /etc/letsencrypt/:/etc/letsencrypt certbot/certbot certonly --standalone -d "$yuming" --email your@email.com --agree-tos --no-eff-email --force-renewal --key-type ecdsa
 			fi
 	  fi
@@ -1602,16 +1598,11 @@ certs_status() {
 			fi
 
 	  		  ;;
-	  	  3)
+	  	  *)
 	  	  	send_stats "不带证书改用HTTP访问"
 		  	sed -i '/if (\$scheme = http) {/,/}/s/^/#/' /home/web/conf.d/${yuming}.conf
 			sed -i '/ssl_certificate/d; /ssl_certificate_key/d' /home/web/conf.d/${yuming}.conf
 			sed -i '/443 ssl/d; /443 quic/d' /home/web/conf.d/${yuming}.conf
-	  		  ;;
-	  	  *)
-	  	  	send_stats "退出申请"
-			rm -f /home/web/conf.d/${yuming}.conf
-			exit
 	  		  ;;
 		esac
 	fi
@@ -3018,7 +3009,7 @@ docker_app_plus() {
 			1)
 				setup_docker_dir
 				check_disk_space $app_size /home/docker
-				
+
 				while true; do
 					read -e -p "输入应用对外服务端口，回车默认使用${docker_port}端口: " app_port
 					local app_port=${app_port:-${docker_port}}
@@ -4852,13 +4843,12 @@ new_ssh_port() {
 }
 
 
-
 add_sshkey() {
 	chmod 700 ~/
 	mkdir -p ~/.ssh
 	chmod 700 ~/.ssh
 	touch ~/.ssh/authorized_keys
-	ssh-keygen -t ed25519 -C "xxxx@gmail.com" -f /root/.ssh/sshkey -N ""
+	ssh-keygen -t ed25519 -C "xxxx@gmail.com" -f ~/.ssh/sshkey -N ""
 	cat ~/.ssh/sshkey.pub >> ~/.ssh/authorized_keys
 	chmod 600 ~/.ssh/authorized_keys
 
@@ -4880,13 +4870,30 @@ add_sshkey() {
 }
 
 
+
+
+
 import_sshkey() {
 
-	read -e -p "请输入您的SSH公钥内容（通常以 'ssh-rsa' 或 'ssh-ed25519' 开头）: " public_key
+	local public_key="$1"
+
+	if [[ -z "$public_key" ]]; then
+		read -e -p "请输入您的SSH公钥内容（通常以 'ssh-rsa' 或 'ssh-ed25519' 开头）: " public_key
+	fi
 
 	if [[ -z "$public_key" ]]; then
 		echo -e "${gl_hong}错误：未输入公钥内容。${gl_bai}"
 		return 1
+	fi
+
+	if [[ ! "$public_key" =~ ^ssh-(rsa|ed25519|ecdsa) ]]; then
+		echo -e "${gl_hong}错误：看起来不像合法的 SSH 公钥。${gl_bai}"
+		return 1
+	fi	
+
+	if grep -Fxq "$public_key" ~/.ssh/authorized_keys 2>/dev/null; then
+		echo "该公钥已存在，无需重复添加"
+		return 0
 	fi
 
 	chmod 700 ~/
@@ -4906,6 +4913,206 @@ import_sshkey() {
 	echo -e "${gl_lv}公钥已成功导入，ROOT私钥登录已开启，已关闭ROOT密码登录，重连将会生效${gl_bai}"
 
 }
+
+
+fetch_remote_ssh_keys() {
+
+	local keys_url="$1"
+	local authorized_keys="${HOME}/.ssh/authorized_keys"
+	local temp_file
+
+	if [[ -z "${keys_url}" ]]; then
+		read -e -p "请输入您的远端公钥URL： " keys_url
+	fi
+
+	echo "此脚本将从远程 URL 拉取 SSH 公钥，并添加到 ${authorized_keys}"
+	echo ""
+	echo "远程公钥地址："
+	echo "  ${keys_url}"
+	echo ""
+
+	# 创建临时文件
+	temp_file=$(mktemp)
+
+	# 下载公钥
+	if command -v curl >/dev/null 2>&1; then
+		curl -fsSL --connect-timeout 10 "${keys_url}" -o "${temp_file}" || {
+			echo "错误：无法从 URL 下载公钥（网络问题或地址无效）" >&2
+			rm -f "${temp_file}"
+			return 1
+		}
+	elif command -v wget >/dev/null 2>&1; then
+		wget -q --timeout=10 -O "${temp_file}" "${keys_url}" || {
+			echo "错误：无法从 URL 下载公钥（网络问题或地址无效）" >&2
+			rm -f "${temp_file}"
+			return 1
+		}
+	else
+		echo "错误：系统中未找到 curl 或 wget，无法下载公钥" >&2
+		rm -f "${temp_file}"
+		return 1
+	fi
+
+	# 检查内容是否有效
+	if [[ ! -s "${temp_file}" ]]; then
+		echo "错误：下载到的文件为空，URL 可能不包含任何公钥" >&2
+		rm -f "${temp_file}"
+		return 1
+	fi
+
+	mkdir -p ~/.ssh
+	chmod 700 ~/.ssh
+	touch "${authorized_keys}"
+	chmod 600 "${authorized_keys}"
+
+	# 备份原有 authorized_keys
+	if [[ -f "${authorized_keys}" ]]; then
+		cp "${authorized_keys}" "${authorized_keys}.bak.$(date +%Y%m%d-%H%M%S)"
+		echo "已备份原有 authorized_keys 文件"
+	fi
+
+	# 追加公钥（避免重复）
+	local added=0
+	while IFS= read -r line; do
+		[[ -z "${line}" || "${line}" =~ ^# ]] && continue
+
+		if ! grep -Fxq "${line}" "${authorized_keys}" 2>/dev/null; then
+			echo "${line}" >> "${authorized_keys}"
+			((added++))
+		fi
+	done < "${temp_file}"
+
+	rm -f "${temp_file}"
+
+	echo ""
+	if (( added > 0 )); then
+		echo "成功添加 ${added} 条新的公钥到 ${authorized_keys}"
+		sed -i -e 's/^\s*#\?\s*PermitRootLogin .*/PermitRootLogin prohibit-password/' \
+			   -e 's/^\s*#\?\s*PasswordAuthentication .*/PasswordAuthentication no/' \
+			   -e 's/^\s*#\?\s*PubkeyAuthentication .*/PubkeyAuthentication yes/' \
+			   -e 's/^\s*#\?\s*ChallengeResponseAuthentication .*/ChallengeResponseAuthentication no/' /etc/ssh/sshd_config
+
+		rm -rf /etc/ssh/sshd_config.d/* /etc/ssh/ssh_config.d/*
+		restart_ssh
+	else
+		echo "没有新的公钥需要添加（可能已全部存在）"
+	fi
+
+	echo ""
+}
+
+
+
+fetch_github_ssh_keys() {
+
+	local username="$1"
+
+	echo "操作前，请确保您已在 GitHub 账户中添加了 SSH 公钥："
+	echo "  1. 登录 https://github.com/settings/keys"
+	echo "  2. 点击 New SSH key 或 Add SSH key"
+	echo "  3. Title 可随意填写（例如：Home Laptop 2026）"
+	echo "  4. 将本地公钥内容（通常是 ~/.ssh/id_ed25519.pub 或 id_rsa.pub 的全部内容）粘贴到 Key 字段"
+	echo "  5. 点击 Add SSH key 完成添加"
+	echo ""
+	echo "添加完成后，GitHub 会公开提供您的所有公钥，地址为："
+	echo "  https://github.com/您的用户名.keys"
+	echo ""
+
+
+	if [[ -z "${username}" ]]; then
+		read -e -p "请输入您的 GitHub 用户名（username，不含 @）： " username
+	fi
+
+	if [[ -z "${username}" ]]; then
+		echo "错误：GitHub 用户名不能为空" >&2
+		return 1
+	fi
+
+	keys_url="https://github.com/${username}.keys"
+
+	fetch_remote_ssh_keys "${keys_url}"
+
+}
+
+
+
+
+sshkey_panel() {
+
+  root_use
+  send_stats "私钥登录"
+  while true; do
+	  clear
+	  local REAL_STATUS=$(grep -i "^PubkeyAuthentication" /etc/ssh/sshd_config | tr '[:upper:]' '[:lower:]')
+	  if [[ "$REAL_STATUS" =~ "yes" ]]; then
+		  IS_KEY_ENABLED="${gl_lv}已启用${gl_bai}"
+	  else
+	  	  IS_KEY_ENABLED="${gl_hui}未启用${gl_bai}"
+	  fi
+  	  echo -e "ROOT私钥登录模式 ${IS_KEY_ENABLED}"
+  	  echo "视频介绍: https://www.bilibili.com/video/BV1Q4421X78n?t=209.4"
+  	  echo "------------------------------------------------"
+  	  echo "将会生成密钥对，更安全的方式SSH登录"
+	  echo "------------------------"
+	  echo "1. 生成新密钥对                  2. 手动输入已有公钥"
+	  echo "3. 从GitHub导入已有公钥          4. 从URL导入已有公钥"
+	  echo "5. 编辑公钥文件                  6. 查看本机密钥"
+	  echo "------------------------"
+	  echo "0. 返回上一级选单"
+	  echo "------------------------"
+	  read -e -p "请输入你的选择: " host_dns
+	  case $host_dns in
+		  1)
+	  		send_stats "生成新密钥"
+	  		add_sshkey
+			break_end
+			  ;;
+		  2)
+			send_stats "导入已有公钥"
+			import_sshkey
+			break_end
+			  ;;
+		  3)
+			send_stats "导入GitHub远端公钥"
+			fetch_github_ssh_keys
+			break_end
+			  ;;
+		  4)
+			send_stats "导入URL远端公钥"
+			read -e -p "请输入您的远端公钥URL： " keys_url
+			fetch_remote_ssh_keys "${keys_url}"
+			break_end
+			  ;;
+
+		  5)
+			send_stats "编辑公钥文件"
+			install nano
+			nano ~/.ssh/authorized_keys
+			break_end
+			  ;;
+
+		  6)
+			send_stats "查看本机密钥"
+			echo "------------------------"
+			echo "公钥信息"
+			cat ~/.ssh/authorized_keys
+			echo "------------------------"
+			echo "私钥信息"
+			cat ~/.ssh/sshkey
+			echo "------------------------"
+			break_end
+			  ;;
+		  *)
+			  break  # 跳出循环，退出菜单
+			  ;;
+	  esac
+  done
+
+
+}
+
+
+
 
 
 
@@ -6082,7 +6289,7 @@ create_backup() {
 	echo "  - 备份单个目录: /var/www"
 	echo "  - 备份多个目录: /etc /home /var/log"
 	echo "  - 直接回车将使用默认目录 (/etc /usr /home)"
-	read -r -p "请输入要备份的目录（多个目录用空格分隔，直接回车则使用默认目录）：" input
+	read -e -p "请输入要备份的目录（多个目录用空格分隔，直接回车则使用默认目录）：" input
 
 	# 如果用户没有输入目录，则使用默认目录
 	if [ -z "$input" ]; then
@@ -8808,6 +9015,7 @@ linux_ldnmp() {
 		echo "已阻止IP+端口访问该服务"
 	  else
 	  	ip_address
+		close_port "$port"
 		block_container_port "$docker_name" "$ipv4_address"
 	  fi
 
@@ -9281,11 +9489,11 @@ clear
 cd ~
 install git
 if [ ! -d apps/.git ]; then
-	git clone ${gh_proxy}github.com/kejilion/apps.git
+	timeout 10s git clone ${gh_proxy}github.com/kejilion/apps.git
 else
 	cd apps
 	# git pull origin main > /dev/null 2>&1
-	git pull ${gh_proxy}github.com/kejilion/apps.git main > /dev/null 2>&1
+	timeout 10s git pull ${gh_proxy}github.com/kejilion/apps.git main > /dev/null 2>&1
 fi
 
 while true; do
@@ -13115,11 +13323,11 @@ discourse,yunsou,ahhhhfs,nsgame,gying" \
 		cd ~
 		install git
 		if [ ! -d apps/.git ]; then
-			git clone ${gh_proxy}github.com/kejilion/apps.git
+			timeout 10s git clone ${gh_proxy}github.com/kejilion/apps.git
 		else
 			cd apps
 			# git pull origin main > /dev/null 2>&1
-			git pull ${gh_proxy}github.com/kejilion/apps.git main > /dev/null 2>&1
+			timeout 10s git pull ${gh_proxy}github.com/kejilion/apps.git main > /dev/null 2>&1
 		fi
 		local custom_app="$HOME/apps/${sub_choice}.conf"
 		if [ -f "$custom_app" ]; then
@@ -14235,53 +14443,7 @@ EOF
 
 
 		  24)
-
-			  root_use
-			  send_stats "私钥登录"
-			  while true; do
-				  clear
-			  	  echo "ROOT私钥登录模式"
-			  	  echo "视频介绍: https://www.bilibili.com/video/BV1Q4421X78n?t=209.4"
-			  	  echo "------------------------------------------------"
-			  	  echo "将会生成密钥对，更安全的方式SSH登录"
-				  echo "------------------------"
-				  echo "1. 生成新密钥              2. 导入已有密钥              3. 查看本机密钥"
-				  echo "------------------------"
-				  echo "0. 返回上一级选单"
-				  echo "------------------------"
-				  read -e -p "请输入你的选择: " host_dns
-
-				  case $host_dns in
-					  1)
-				  		send_stats "生成新密钥"
-				  		add_sshkey
-						break_end
-
-						  ;;
-					  2)
-						send_stats "导入已有公钥"
-						import_sshkey
-						break_end
-
-						  ;;
-					  3)
-						send_stats "查看本机密钥"
-						echo "------------------------"
-						echo "公钥信息"
-						cat ~/.ssh/authorized_keys
-						echo "------------------------"
-						echo "私钥信息"
-						cat ~/.ssh/sshkey
-						echo "------------------------"
-						break_end
-
-						  ;;
-					  *)
-						  break  # 跳出循环，退出菜单
-						  ;;
-				  esac
-			  done
-
+			sshkey_panel
 			  ;;
 
 		  25)
@@ -15896,6 +16058,10 @@ echo "应用市场管理        k app"
 echo "应用编号快捷管理    k app 26 | k app 1panel | k app npm"
 echo "fail2ban管理        k fail2ban | k f2b"
 echo "显示系统信息        k info"
+echo "ROOT密钥管理        k sshkey"
+echo "SSH公钥导入(URL)    k sshkey <url>"
+echo "SSH公钥导入(GitHub) k sshkey github <user> "
+
 }
 
 
@@ -15969,6 +16135,7 @@ else
 			  echo "已阻止IP+端口访问该服务"
 	  		else
 			  ip_address
+			  close_port "$port"
 	  		  block_container_port "$docker_name" "$ipv4_address"
 	  		fi
 			;;
@@ -16131,8 +16298,46 @@ else
 			fail2ban_panel
 			;;
 
+
+		sshkey)
+			shift		
+			case "$1" in
+				"" )
+					# sshkey → 交互菜单
+					send_stats "SSHKey 交互菜单"
+					sshkey_panel
+					;;
+		
+				github )
+					shift
+					send_stats "从 GitHub 导入 SSH 公钥"
+					fetch_github_ssh_keys "$1"
+					;;
+		
+				http://*|https://* )
+					send_stats "从 URL 导入 SSH 公钥"
+					fetch_remote_ssh_keys "$1"
+					;;
+
+				ssh-rsa*|ssh-ed25519*|ssh-ecdsa* )
+					send_stats "公钥直接导入"
+					import_sshkey "$1"
+					;;
+
+				* )
+					echo "错误：未知参数 '$1'"
+					echo "用法："
+					echo "  k sshkey                  进入交互菜单"
+					echo "  k sshkey \"<pubkey>\"     直接导入 SSH 公钥"
+					echo "  k sshkey <url>            从 URL 导入 SSH 公钥"
+					echo "  k sshkey github <user>    从 GitHub 导入 SSH 公钥"
+					;;
+			esac
+			;;
 		*)
 			k_info
 			;;
 	esac
 fi
+
+
