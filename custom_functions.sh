@@ -337,6 +337,86 @@ EOF
 
 
 
+x_install_x-ui-yg() {
+    install_docker
+    
+    local COMPOSE_DIR="/home/docker/x-ui-yg"
+    local COMPOSE_FILE="${COMPOSE_DIR}/docker-compose.yml"
+    local DATA_DIR="/home/docker/x-ui-yg/data"
+    local INIT_LOG="${DATA_DIR}/init.log"
+    
+    echo -e "${gl_lv}正在准备 x-ui-yg 容器环境...${gl_bai}"
+    
+    sudo mkdir -p "${COMPOSE_DIR}"
+    sudo mkdir -p "${DATA_DIR}"
+    sudo mkdir -p /home/web/certs
+    
+    cat <<'EOF' | sudo tee "${COMPOSE_FILE}" > /dev/null
+services:
+  x-ui-yg:
+    image: shaogme/x-ui-yg:alpine
+    container_name: x-ui-yg
+    restart: always
+    network_mode: host
+    volumes:
+      - /home/docker/x-ui-yg/data:/usr/local/x-ui
+      - /home/web/certs:/root/cert
+    environment:
+      - TZ=Asia/Shanghai
+      - XUI_USER=
+      - XUI_PASS=
+      - XUI_PORT=
+      - XUI_PATH=
+EOF
+    
+    echo -e "${gl_lv}正在启动 x-ui-yg 容器...${gl_bai}"
+    cd "${COMPOSE_DIR}"
+
+    if sudo docker compose up -d; then
+        echo -e "${gl_lv}x-ui-yg 容器已启动。${gl_bai}"
+        echo -e "${gl_lv}正在读取初始化信息 (init.log)...${gl_bai}"
+
+        # 等待 init.log 生成（最多 10 秒）
+        for i in {1..10}; do
+            if [ -f "$INIT_LOG" ]; then
+
+                # 解析 init.log（唯一事实来源）
+                XUI_USER=$(grep -E '^XUI_USER' "$INIT_LOG" | awk -F':' '{print $2}' | xargs)
+                XUI_PASS=$(grep -E '^XUI_PASS' "$INIT_LOG" | awk -F':' '{print $2}' | xargs)
+                XUI_PORT=$(grep -E '^XUI_PORT' "$INIT_LOG" | awk -F':' '{print $2}' | xargs)
+                XUI_PATH=$(grep -E '^XUI_PATH' "$INIT_LOG" | awk -F':' '{print $2}' | xargs)
+
+                SERVER_IP=$(hostname -I | awk '{print $1}')
+
+                echo -e "${gl_lv}========== x-ui-yg 初始化信息 ==========${gl_bai}"
+                echo -e "用户名: ${XUI_USER}"
+                echo -e "密码:   ${XUI_PASS}"
+                echo -e "端口:   ${XUI_PORT}"
+                echo -e "路径:   ${XUI_PATH}"
+                echo -e "${gl_lv}========================================${gl_bai}"
+
+                if [ -n "$SERVER_IP" ] && [ -n "$XUI_PORT" ] && [ -n "$XUI_PATH" ]; then
+                    echo -e "${gl_lv}面板访问地址：${gl_bai}"
+                    echo -e "${gl_huang}http://${SERVER_IP}:${XUI_PORT}${XUI_PATH}${gl_bai}"
+                fi
+
+                break
+            fi
+            sleep 1
+        done
+
+        if [ ! -f "$INIT_LOG" ]; then
+            echo -e "${gl_huang}可手动查看：${INIT_LOG}${gl_bai}"
+        fi
+    else
+        echo -e "${gl_hong}错误：x-ui-yg 容器启动失败。${gl_bai}"
+    fi
+    
+    cd ~
+}
+
+
+
 x_apply_ssl() {
     install_docker
     x_configure_initial_settings
