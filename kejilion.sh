@@ -1,5 +1,5 @@
 #!/bin/bash
-sh_v="4.3.7"
+sh_v="4.3.9"
 
 
 gl_hui='\e[37m'
@@ -3652,20 +3652,20 @@ ldnmp_Proxy_backend_stream() {
 	echo "开始部署 $webname"
 
 	# 获取代理名称
-	read -rp "请输入代理转发名称 (如 mysql_proxy): " proxy_name
+	read -erp "请输入代理转发名称 (如 mysql_proxy): " proxy_name
 	if [ -z "$proxy_name" ]; then
 		echo "名称不能为空"; return 1
 	fi
 
 	# 获取监听端口
-	read -rp "请输入本机监听端口 (如 3306): " listen_port
+	read -erp "请输入本机监听端口 (如 3306): " listen_port
 	if ! [[ "$listen_port" =~ ^[0-9]+$ ]]; then
 		echo "端口必须是数字"; return 1
 	fi
 
 	echo "请选择协议类型："
 	echo "1. TCP    2. UDP"
-	read -rp "请输入序号 [1-2]: " proto_choice
+	read -erp "请输入序号 [1-2]: " proto_choice
 
 	case "$proto_choice" in
 		1) proto="tcp"; listen_suffix="" ;;
@@ -4819,10 +4819,12 @@ correct_ssh_config() {
 
 new_ssh_port() {
 
+  local new_port=$1
+
   cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
 
-  sed -i 's/^\s*#\?\s*Port/Port/' /etc/ssh/sshd_config
-  sed -i "s/Port [0-9]\+/Port $new_port/g" /etc/ssh/sshd_config
+  sed -i '/^\s*#\?\s*Port\s\+/d' /etc/ssh/sshd_config
+  echo "Port $new_port" >> /etc/ssh/sshd_config
 
   correct_ssh_config
 
@@ -6649,37 +6651,65 @@ list_partitions() {
 	lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT | grep -v "sr\|loop"
 }
 
-# 挂载分区
+
+# 持久化挂载分区
 mount_partition() {
 	send_stats "挂载分区"
 	read -e -p "请输入要挂载的分区名称（例如 sda1）: " PARTITION
 
+	DEVICE="/dev/$PARTITION"
+	MOUNT_POINT="/mnt/$PARTITION"
+
 	# 检查分区是否存在
-	if ! lsblk -o NAME | grep -w "$PARTITION" > /dev/null; then
+	if ! lsblk -no NAME | grep -qw "$PARTITION"; then
 		echo "分区不存在！"
-		return
+		return 1
 	fi
 
-	# 检查分区是否已经挂载
-	if lsblk -o MOUNTPOINT | grep -w "$PARTITION" > /dev/null; then
+	# 检查是否已挂载
+	if mount | grep -qw "$DEVICE"; then
 		echo "分区已经挂载！"
-		return
+		return 1
+	fi
+
+	# 获取 UUID
+	UUID=$(blkid -s UUID -o value "$DEVICE")
+	if [ -z "$UUID" ]; then
+		echo "无法获取 UUID！"
+		return 1
+	fi
+
+	# 获取文件系统类型
+	FSTYPE=$(blkid -s TYPE -o value "$DEVICE")
+	if [ -z "$FSTYPE" ]; then
+		echo "无法获取文件系统类型！"
+		return 1
 	fi
 
 	# 创建挂载点
-	MOUNT_POINT="/mnt/$PARTITION"
 	mkdir -p "$MOUNT_POINT"
 
-	# 挂载分区
-	mount "/dev/$PARTITION" "$MOUNT_POINT"
-
-	if [ $? -eq 0 ]; then
-		echo "分区挂载成功: $MOUNT_POINT"
-	else
+	# 挂载
+	if ! mount "$DEVICE" "$MOUNT_POINT"; then
 		echo "分区挂载失败！"
 		rmdir "$MOUNT_POINT"
+		return 1
 	fi
+
+	echo "分区已成功挂载到 $MOUNT_POINT"
+
+	# 检查 /etc/fstab 是否已经存在 UUID 或挂载点
+	if grep -qE "UUID=$UUID|[[:space:]]$MOUNT_POINT[[:space:]]" /etc/fstab; then
+		echo "/etc/fstab 中已存在该分区记录，跳过写入"
+		return 0
+	fi
+
+	# 写入 /etc/fstab
+	echo "UUID=$UUID $MOUNT_POINT $FSTYPE defaults,nofail 0 2" >> /etc/fstab
+
+	echo "已写入 /etc/fstab，实现持久化挂载"
 }
+
 
 # 卸载分区
 unmount_partition() {
@@ -7157,8 +7187,7 @@ linux_info() {
 	local tcp_count=$(ss -t | wc -l)
 	local udp_count=$(ss -u | wc -l)
 
-
-	echo ""
+	clear
 	echo -e "系统信息查询"
 	echo -e "${gl_kjlan}-------------"
 	echo -e "${gl_kjlan}主机名:         ${gl_bai}$hostname"
@@ -9588,7 +9617,33 @@ linux_ldnmp() {
 moltbot_menu() {
 	local app_id="114"
 
-	send_stats "clawdbot/moltbot安装"
+	send_stats "clawdbot/moltbot管理"
+
+	check_openclaw_update() {
+		if ! command -v npm >/dev/null 2>&1; then
+			return 1
+		fi
+
+		# 加上 --no-update-notifier，并确保错误重定向位置正确
+		local_version=$(npm list -g openclaw --depth=0 --no-update-notifier 2>/dev/null | grep openclaw | awk '{print $NF}' | sed 's/^.*@//')
+
+		if [ -z "$local_version" ]; then
+			return 1
+		fi
+
+		remote_version=$(npm view openclaw version --no-update-notifier 2>/dev/null)
+
+		if [ -z "$remote_version" ]; then
+			return 1
+		fi
+
+		if [ "$local_version" != "$remote_version" ]; then
+			echo "${gl_huang}检测到新版本:$remote_version${gl_bai}"
+		else
+			echo "${gl_lv}当前版本已是最新:$local_version${gl_bai}"
+		fi
+	}
+
 	get_install_status() {
 		if command -v openclaw >/dev/null 2>&1; then
 			echo "${gl_lv}已安装${gl_bai}"
@@ -9605,27 +9660,36 @@ moltbot_menu() {
 		fi
 	}
 
-
 	show_menu() {
+
+
 		clear
 
 		local install_status=$(get_install_status)
 		local running_status=$(get_running_status)
+		local update_message=$(check_openclaw_update)
+
 		echo "======================================="
 		echo -e "ClawdBot > MoltBot > OpenClaw 管理"
-		echo -e "$install_status $running_status"
+		echo -e "$install_status $running_status $update_message"
 		echo "======================================="
-		echo "1. 安装"
-		echo "2. 启动"
-		echo "3. 停止"
+		echo "1.  安装"
+		echo "2.  启动"
+		echo "3.  停止"
 		echo "--------------------"
-		echo "4. 日志查看"
-		echo "5. 换模型"
-		echo "6. 加新模型API"
-		echo "7. TG输入连接码"
+		echo "4.  日志查看"
+		echo "5.  换模型"
+		echo "6.  加新模型API"
+		echo "7.  TG输入连接码"
+		echo "8.  安装插件（如：飞书）"
+		echo "9.  安装技能（skills）"
+		echo "10. 编辑主配置文件"
+		echo "11. 配置向导"
+		echo "12. 健康检测与修复"
+		echo "13. WebUI访问与设置"
 		echo "--------------------"
-		echo "8. 更新"
-		echo "9. 卸载"
+		echo "14. 更新"
+		echo "15. 卸载"
 		echo "--------------------"
 		echo "0. 返回上一级选单"
 		echo "--------------------"
@@ -9635,6 +9699,7 @@ moltbot_menu() {
 
 	start_tmux() {
 		install tmux
+		openclaw gateway stop
 		tmux kill-session -t gateway > /dev/null 2>&1
 		tmux new -d -s gateway "openclaw gateway"
 		check_crontab_installed
@@ -9645,17 +9710,20 @@ moltbot_menu() {
 
 	install_moltbot() {
 		echo "开始安装 OpenClaw..."
+		send_stats "开始安装 OpenClaw..."
+
+		if command -v dnf &>/dev/null; then
+			dnf update -y
+			dnf groupinstall -y "Development Tools"
+			dnf install -y cmake
+		fi
+
 		country=$(curl -s ipinfo.io/country)
 		if [[ "$country" == "CN" || "$country" == "HK" ]]; then
 			pnpm config set registry https://registry.npmmirror.com
+			npm config set registry https://registry.npmmirror.com
 		fi
-		curl -fsSL https://openclaw.ai/install.sh | bash -s -- --install-method git
-		ln -s /root/.local/bin/openclaw /usr/local/bin/openclaw
-		source ~/.bashrc
-		source ~/.profile
-		openclaw doctor --fix
-		openclaw onboard --install-daemon
-		openclaw gateway stop
+		curl -fsSL https://openclaw.ai/install.sh | bash
 		start_tmux
 		add_app_id
 		break_end
@@ -9665,13 +9733,14 @@ moltbot_menu() {
 
 	start_bot() {
 		echo "启动 OpenClaw..."
+		send_stats "启动 OpenClaw..."
 		start_tmux
 		break_end
 	}
 
 	stop_bot() {
 		echo "停止 OpenClaw..."
-		install tmux
+		send_stats "停止 OpenClaw..."
 		openclaw gateway stop
 		tmux kill-session -t gateway > /dev/null 2>&1
 		break_end
@@ -9679,6 +9748,7 @@ moltbot_menu() {
 
 	view_logs() {
 		echo "查看 OpenClaw 日志，Ctrl+C 退出"
+		send_stats "查看 OpenClaw 日志"
 		openclaw logs
 		break_end
 	}
@@ -9785,27 +9855,28 @@ moltbot_menu() {
 
 
 	add-openclaw-provider-interactive() {
+		send_stats "添加API"
 		echo "=== 交互式添加 OpenClaw Provider ==="
 
 		# Provider 名称
-		read -rp "请输入 Provider 名称 (如: deepseek): " provider_name
+		read -erp "请输入 Provider 名称 (如: deepseek): " provider_name
 		while [[ -z "$provider_name" ]]; do
 			echo "❌ Provider 名称不能为空"
-			read -rp "请输入 Provider 名称: " provider_name
+			read -erp "请输入 Provider 名称: " provider_name
 		done
 
 		# Model ID
-		read -rp "请输入 Model ID (如: deepseek-chat): " model_id
+		read -erp "请输入 Model ID (如: deepseek-chat): " model_id
 		while [[ -z "$model_id" ]]; do
 			echo "❌ Model ID 不能为空"
-			read -rp "请输入 Model ID: " model_id
+			read -erp "请输入 Model ID: " model_id
 		done
 
 		# Base URL
-		read -rp "请输入 Base URL (如: https://api.xxx.com/v1): " base_url
+		read -erp "请输入 Base URL (如: https://api.xxx.com/v1): " base_url
 		while [[ -z "$base_url" ]]; do
 			echo "❌ Base URL 不能为空"
-			read -rp "请输入 Base URL: " base_url
+			read -erp "请输入 Base URL: " base_url
 		done
 
 		# API Key（隐藏输入）
@@ -9825,7 +9896,7 @@ moltbot_menu() {
 		echo "API Key  : ${api_key:0:8}****"
 		echo "======================"
 
-		read -rp "确认添加？(y/N): " confirm
+		read -erp "确认添加？(y/N): " confirm
 		if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
 			echo "❎ 已取消"
 			return 1
@@ -9837,39 +9908,303 @@ moltbot_menu() {
 			"$model_id" \
 			"$base_url" \
 			"$api_key"
-	
+
 		break_end
 	}
 
 
 
 	change_model() {
-		echo "所有模型:"
-		openclaw models list --all
-		echo "当前模型:"
-		openclaw models list
-		printf "请输入要设置的模型名称 (例如 openrouter/openai/gpt-4o): "
-		read model
-		echo "切换模型为 $model"
-		openclaw models set "$model"
-		break_end
+		send_stats "换模型"
+
+		while true; do
+			clear
+			echo "--- 模型管理 ---"
+			echo "所有模型:"
+			openclaw models list --all
+			echo "----------------"
+			echo "当前模型:"
+			openclaw models list
+			echo "----------------"
+			read -e -p "请输入要设置的模型名称 (例如 openrouter/openai/gpt-4o)（输入 0 退出）： " model
+
+			# 1. 检查是否输入 0 以退出
+			if [ "$model" = "0" ]; then
+				echo "操作已取消，正在退出..."
+				break  # 跳出 while 循环
+
+			fi
+
+			# 2. 验证输入是否为空
+			if [ -z "$model" ]; then
+				echo "错误：模型名称不能为空。请重试。"
+				echo "" # 换行美化
+				continue # 跳过本次循环，重新开始
+			fi
+
+			# 3. 执行切换逻辑
+			echo "正在切换模型为: $model ..."
+			openclaw models set "$model"
+
+			break_end
+		done
+
 	}
 
 
 
+
+	install_plugin() {
+
+		send_stats "安装插件"
+		while true; do
+			clear
+			echo "========================================"
+			echo "            插件管理 (安装)            "
+			echo "========================================"
+			echo "当前已安装插件:"
+			openclaw plugins list
+			echo "----------------------------------------"
+
+			# 输出推荐的实用插件列表，便于用户复制
+			echo "推荐的实用插件（可直接复制名称输入）："
+			echo "feishu                # 飞书/Lark 集成 (当前已加载 ✓)"
+			echo "telegram              # Telegram 机器人集成 (当前已加载 ✓)"
+			echo "memory-core           # 核心记忆增强：基于文件的上下文搜索 (当前已加载 ✓)"
+			echo "@openclaw/slack       # Slack 频道与 DMs 深度连接"
+			echo "@openclaw/bluebubbles # iMessage 桥接 (macOS 用户首选)"
+			echo "@openclaw/msteams     # Microsoft Teams 企业通讯集成"
+			echo "@openclaw/voice-call  # 语音通话插件 (基于 Twilio 等后端)"
+			echo "@openclaw/discord     # Discord 频道自动化管理"
+			echo "@openclaw/nostr       # Nostr 协议：隐私安全加密聊天"
+			echo "lobster               # 审批工作流：带有人工干预的自动任务"
+			echo "memory-lancedb        # 长期记忆增强：基于向量数据库的精准召回"
+			echo "copilot-proxy         # GitHub Copilot 代理接入增强"
+			echo "----------------------------------------"
+
+			# 提示用户输入插件名称
+			read -e -p "请输入要安装的插件名称（输入 0 退出）： " plugin_name
+
+			# 1. 检查是否输入 0 以退出
+			if [ "$plugin_name" = "0" ]; then
+				echo "操作已取消，退出插件安装。"
+				break
+			fi
+
+			# 2. 验证输入是否为空
+			if [ -z "$plugin_name" ]; then
+				echo "错误：插件名称不能为空，请重新输入。"
+				echo ""
+				continue
+			fi
+
+			# 1. 彻底清理之前失败的残留（用户目录）
+			rm -rf "/root/.openclaw/extensions/$plugin_name"
+
+			# 2. 检查系统是否已经预装（防止 duplicate id 冲突）
+			if [ -d "/usr/lib/node_modules/openclaw/extensions/$plugin_name" ]; then
+				echo "💡 检测到系统目录已存在该插件，正在直接激活..."
+				openclaw plugins enable "$plugin_name"
+			else
+				echo "📥 正在通过官方渠道下载安装插件..."
+				# 使用 openclaw 自己的 install 命令，它会自动处理 package.json 的规范检查
+				openclaw plugins install "$plugin_name"
+
+				# 3. 如果 openclaw install 报错，再尝试作为普通 npm 包安装（最后的备选）
+				if [ $? -ne 0 ]; then
+					echo "⚠️ 官方安装失败，尝试通过 npm 全局强制安装..."
+					npm install -g "$plugin_name" --unsafe-perm
+				fi
+
+				# 4. 最后统一执行启用
+				openclaw plugins enable "$plugin_name"
+			fi
+
+			start_tmux
+			break_end
+		done
+	}
+
+	install_plugin() {
+		send_stats "安装插件"
+		while true; do
+			clear
+			echo "========================================"
+			echo "            插件管理 (安装)            "
+			echo "========================================"
+			echo "当前插件列表:"
+			openclaw plugins list
+			echo "--------------------------------------------------------"
+			echo "推荐的常用插件 ID (直接复制括号内的 ID 即可):"
+			echo "--------------------------------------------------------"
+			echo "📱 通讯渠道:"
+			echo "  - [feishu]       	# 飞书/Lark 集成"
+			echo "  - [telegram]     	# Telegram 机器人"
+			echo "  - [slack]        	# Slack 企业通讯"
+			echo "  - [msteams]      	# Microsoft Teams"
+			echo "  - [discord]      	# Discord 社区管理"
+			echo "  - [whatsapp]     	# WhatsApp 自动化"
+			echo ""
+			echo "🧠 记忆与 AI:"
+			echo "  - [memory-core]  	# 基础记忆 (文件检索)"
+			echo "  - [memory-lancedb]	# 增强记忆 (向量数据库)"
+			echo "  - [copilot-proxy]	# Copilot 接口转发"
+			echo ""
+			echo "⚙️ 功能扩展:"
+			echo "  - [lobster]      	# 审批流 (带人工确认)"
+			echo "  - [voice-call]   	# 语音通话能力"
+			echo "  - [nostr]        	# 加密隐私聊天"
+			echo "--------------------------------------------------------"
+
+			read -e -p "请输入插件 ID（输入 0 退出）： " raw_input
+
+			[ "$raw_input" = "0" ] && break
+			[ -z "$raw_input" ] && continue
+
+			# 1. 自动处理：如果用户输入带 @openclaw/，提取纯 ID 方便路径检查
+			local plugin_id=$(echo "$raw_input" | sed 's|^@openclaw/||')
+			local plugin_full="$raw_input"
+
+			echo "🔍 正在检查插件状态..."
+
+			# 2. 检查是否已经在 list 中且为 disabled (最常见的情况)
+			if echo "$plugin_list" | grep -qW "$plugin_id" && echo "$plugin_list" | grep "$plugin_id" | grep -q "disabled"; then
+				echo "💡 插件 [$plugin_id] 已预装，正在激活..."
+				openclaw plugins enable "$plugin_id" && echo "✅ 激活成功" || echo "❌ 激活失败"
+
+			# 3. 检查系统物理目录是否存在
+			elif [ -d "/usr/lib/node_modules/openclaw/extensions/$plugin_id" ]; then
+				echo "💡 发现系统内置目录存在该插件，尝试直接启用..."
+				openclaw plugins enable "$plugin_id"
+
+			else
+				# 4. 远程安装逻辑
+				echo "📥 本地未发现，尝试下载安装..."
+
+				# 清理旧的失败残留
+				rm -rf "/root/.openclaw/extensions/$plugin_id"
+
+				# 执行安装，并捕获结果
+				if openclaw plugins install "$plugin_full"; then
+					echo "✅ 下载成功，正在启用..."
+					openclaw plugins enable "$plugin_id"
+				else
+					echo "⚠️ 官方渠道下载失败，尝试备选方案..."
+					# 备选 npm 安装
+					if npm install -g "$plugin_full" --unsafe-perm; then
+						echo "✅ npm 安装成功，尝试启用..."
+						openclaw plugins enable "$plugin_id"
+					else
+						echo "❌ 严重错误：无法获取该插件。请检查 ID 是否正确或网络是否可用。"
+						# 关键：这里直接 return 或 continue，不走下面的 start_tmux，防止写死配置
+						break_end
+						continue
+					fi
+				fi
+			fi
+
+			echo "🔄 正在重启 OpenClaw 服务以加载新插件..."
+			start_tmux
+			break_end
+		done
+	}
+
+
+
+
+
+
+
+	install_skill() {
+		send_stats "安装技能"
+		while true; do
+			clear
+			echo "========================================"
+			echo "            技能管理 (安装)            "
+			echo "========================================"
+			echo "当前已安装技能:"
+			openclaw skills list
+			echo "----------------------------------------"
+
+			# 输出推荐的实用技能列表
+			echo "推荐的实用技能（可直接复制名称输入）："
+			echo "github             # 管理 GitHub Issues/PR/CI (gh CLI)"
+			echo "notion             # 操作 Notion 页面、数据库和块"
+			echo "apple-notes        # macOS 原生笔记管理 (创建/编辑/搜索)"
+			echo "apple-reminders    # macOS 提醒事项管理 (待办清单)"
+			echo "1password          # 自动化读取和注入 1Password 密钥"
+			echo "gog                # Google Workspace (Gmail/云盘/文档) 全能助手"
+			echo "things-mac         # 深度整合 Things 3 任务管理"
+			echo "bluebubbles        # 通过 BlueBubbles 完美收发 iMessage"
+			echo "himalaya           # 终端邮件管理 (IMAP/SMTP 强力工具)"
+			echo "summarize          # 网页/播客/YouTube 视频内容一键总结"
+			echo "openhue            # 控制 Philips Hue 智能灯光场景"
+			echo "video-frames       # 视频抽帧与短片剪辑 (ffmpeg 驱动)"
+			echo "openai-whisper     # 本地音频转文字 (离线隐私保护)"
+			echo "coding-agent       # 自动运行 Claude Code/Codex 等编程助手"
+			echo "----------------------------------------"
+
+			# 提示用户输入技能名称
+			read -e -p "请输入要安装的技能名称（输入 0 退出）： " skill_name
+
+			# 1. 检查是否输入 0 以退出
+			if [ "$skill_name" = "0" ]; then
+				echo "操作已取消，退出技能安装。"
+				break
+			fi
+
+			# 2. 验证输入是否为空
+			if [ -z "$skill_name" ]; then
+				echo "错误：技能名称不能为空。请重试。"
+				echo ""
+				continue
+			fi
+
+			# 3. 执行安装命令
+			echo "正在安装技能：$skill_name ..."
+			npx clawhub install "$skill_name"
+
+			# 获取上一条命令的退出状态
+			if [ $? -eq 0 ]; then
+				echo "✅ 技能 $skill_name 安装成功。"
+				# 执行重启/启动服务逻辑
+				start_tmux
+			else
+				echo "❌ 安装失败。请检查技能名称是否正确，或参考文档排查。"
+			fi
+
+			break_end
+		done
+
+	}
 
 
 
 	change_tg_bot_code() {
-		printf "请输入TG机器人收到的连接码 (例如 Pairing code: NYA99R2F: "
-		read code
+		send_stats "机器人对接"
+		read -e -p "请输入TG机器人收到的连接码 (例如 Pairing code: NYA99R2F)（输入 0 退出）： " code
+
+		# 检查是否输入 0 以退出
+		if [ "$code" = "0" ]; then
+			echo "操作已取消。"
+			return 0  # 正常退出函数
+		fi
+
+		# 验证输入是否为空
+		if [ -z "$code" ]; then
+			echo "错误：连接码不能为空。请重试。"
+			return 1
+		fi
+
 		openclaw pairing approve telegram $code
 		break_end
 	}
 
+
 	update_moltbot() {
 		echo "更新 OpenClaw..."
-		curl -fsSL https://openclaw.ai/install.sh | bash -s -- --install-method git
+		send_stats "更新 OpenClaw..."
+		curl -fsSL https://openclaw.ai/install.sh | bash
 		openclaw gateway stop
 		start_tmux
 		add_app_id
@@ -9880,12 +10215,147 @@ moltbot_menu() {
 
 	uninstall_moltbot() {
 		echo "卸载 OpenClaw..."
+		send_stats "卸载 OpenClaw..."
 		openclaw uninstall
 		npm uninstall -g openclaw
+		crontab -l 2>/dev/null | grep -v "s gateway" | crontab -
+		hash -r
 		sed -i "/\b${app_id}\b/d" /home/docker/appno.txt
 		echo "卸载完成"
 		break_end
 	}
+
+	nano_openclaw_json() {
+		send_stats "编辑 OpenClaw 配置文件"
+		install nano
+		nano ~/.openclaw/openclaw.json
+		start_tmux
+	}
+
+
+
+
+
+
+	openclaw_find_webui_domain() {
+		local conf domain_list
+
+		domain_list=$(
+			grep -R "18789" /home/web/conf.d/*.conf 2>/dev/null \
+			| awk -F: '{print $1}' \
+			| sort -u \
+			| while read conf; do
+				basename "$conf" .conf
+			done
+		)
+
+		if [ -n "$domain_list" ]; then
+			echo "$domain_list"
+		fi
+	}
+
+
+
+	openclaw_show_webui_addr() {
+		local local_ip token domains
+
+		echo "=================================="
+		echo "OpenClaw WebUI 访问地址"
+		local_ip="127.0.0.1"
+
+		token=$(
+			openclaw dashboard 2>/dev/null \
+			| sed -n 's/.*:18789\/?token=\([a-f0-9]\+\).*/\1/p' \
+			| head -n 1
+		)
+		echo
+		echo "本机地址："
+		echo "http://${local_ip}:18789/?token=${token}"
+
+		domains=$(openclaw_find_webui_domain)
+		if [ -n "$domains" ]; then
+			echo "域名地址："
+			echo "$domains" | while read d; do
+				echo "https://${d}/?token=${token}"
+			done
+		fi
+
+		echo "=================================="
+	}
+
+
+
+	# 添加域名（调用你给的函数）
+	openclaw_domain_webui() {
+		add_yuming
+		ldnmp_Proxy ${yuming} 127.0.0.1 18789
+
+		token=$(
+			openclaw dashboard 2>/dev/null \
+			| sed -n 's/.*:18789\/?token=\([a-f0-9]\+\).*/\1/p' \
+			| head -n 1
+		)
+
+		clear
+		echo "访问地址:"
+		echo "https://${yuming}/?token=$token"
+		echo "先访问URL触发设备ID，然后回车下一步进行配对。"
+		read
+		echo -e "${gl_kjlan}正在加载设备列表……${gl_bai}"
+		openclaw devices list
+
+		read -e -p "请输入 Request_Key: " Request_Key
+
+		[ -z "$Request_Key" ] && {
+			echo "Request_Key 不能为空"
+			return 1
+		}
+
+		openclaw devices approve "$Request_Key"
+
+	}
+
+	# 删除域名
+	openclaw_remove_domain() {
+		echo "域名格式 example.com 不带https://"
+		web_del
+	}
+
+	# 主菜单
+	openclaw_webui_menu() {
+
+		send_stats "WebUI访问与设置"
+		while true; do
+			clear
+			openclaw_show_webui_addr
+			echo
+			echo "1. 添加域名访问"
+			echo "2. 删除域名访问"
+			echo "0. 退出"
+			echo
+			read -e -p "请选择: " choice
+
+			case "$choice" in
+				1)
+					openclaw_domain_webui
+					echo
+					read -p "按回车返回菜单..."
+					;;
+				2)
+					openclaw_remove_domain
+					read -p "按回车返回菜单..."
+					;;
+				0)
+					break
+					;;
+				*)
+					echo "无效选项"
+					sleep 1
+					;;
+			esac
+		done
+	}
+
 
 
 	# 主循环
@@ -9900,8 +10370,20 @@ moltbot_menu() {
 			5) change_model ;;
 			6) add-openclaw-provider-interactive ;;
 			7) change_tg_bot_code ;;
-			8) update_moltbot ;;
-			9) uninstall_moltbot ;;
+			8) install_plugin ;;
+			9) install_skill ;;
+			10) nano_openclaw_json ;;
+			11) send_stats "初始化配置向导"
+				openclaw onboard --install-daemon
+				break_end
+				;;
+			12) send_stats "健康检测与修复"
+				openclaw doctor --fix
+				break_end
+			 	;;
+			13) openclaw_webui_menu ;;
+			14) update_moltbot ;;
+			15) uninstall_moltbot ;;
 			*) break ;;
 		esac
 	done
@@ -14103,32 +14585,32 @@ net_menu() {
 		echo "4. 刷新网卡信息"
 		echo "0. 返回上一级选单"
 		echo "===================================="
-		read -rp "请选择操作: " choice
+		read -erp "请选择操作: " choice
 
 		case $choice in
 			1)
 				send_stats "启用网卡"
-				read -rp "请输入要启用的网卡名: " nic
+				read -erp "请输入要启用的网卡名: " nic
 				if ip link show "$nic" &>/dev/null; then
 					ip link set "$nic" up && echo "✔ 网卡 $nic 已启用"
 				else
 					echo "✘ 网卡不存在"
 				fi
-				read -rp "按回车继续..."
+				read -erp "按回车继续..."
 				;;
 			2)
 				send_stats "禁用网卡"
-				read -rp "请输入要禁用的网卡名: " nic
+				read -erp "请输入要禁用的网卡名: " nic
 				if ip link show "$nic" &>/dev/null; then
 					ip link set "$nic" down && echo "✔ 网卡 $nic 已禁用"
 				else
 					echo "✘ 网卡不存在"
 				fi
-				read -rp "按回车继续..."
+				read -erp "按回车继续..."
 				;;
 			3)
 				send_stats "查看网卡详情"
-				read -rp "请输入要查看的网卡名: " nic
+				read -erp "请输入要查看的网卡名: " nic
 				if ip link show "$nic" &>/dev/null; then
 					echo "========== $nic 详细信息 =========="
 					ip addr show "$nic"
@@ -14136,7 +14618,7 @@ net_menu() {
 				else
 					echo "✘ 网卡不存在"
 				fi
-				read -rp "按回车继续..."
+				read -erp "按回车继续..."
 				;;
 			4)
 				send_stats "刷新网卡信息"
@@ -14179,25 +14661,25 @@ log_menu() {
 		echo "5. 清理旧 journal 日志"
 		echo "0. 返回上一级选单"
 		echo "======================================="
-		read -rp "请选择操作: " choice
+		read -erp "请选择操作: " choice
 
 		case $choice in
 			1)
 				send_stats "查看最近日志"
-				read -rp "查看最近多少行日志？[默认 100]: " lines
+				read -erp "查看最近多少行日志？[默认 100]: " lines
 				lines=${lines:-100}
 				journalctl -n "$lines" --no-pager
-				read -rp "按回车继续..."
+				read -erp "按回车继续..."
 				;;
 			2)
 				send_stats "查看指定服务日志"
-				read -rp "请输入服务名（如 sshd、nginx）: " svc
+				read -erp "请输入服务名（如 sshd、nginx）: " svc
 				if systemctl list-unit-files | grep -q "^$svc"; then
 					journalctl -u "$svc" -n 100 --no-pager
 				else
 					echo "✘ 服务不存在或无日志"
 				fi
-				read -rp "按回车继续..."
+				read -erp "按回车继续..."
 				;;
 			3)
 				send_stats "查看登录/安全日志"
@@ -14212,17 +14694,17 @@ log_menu() {
 				else
 					echo "未找到安全日志文件"
 				fi
-				read -rp "按回车继续..."
+				read -erp "按回车继续..."
 				;;
 			4)
 				send_stats "实时跟踪日志"
 				echo "1) 系统日志"
 				echo "2) 指定服务日志"
-				read -rp "选择跟踪类型: " t
+				read -erp "选择跟踪类型: " t
 				if [ "$t" = "1" ]; then
 					journalctl -f
 				elif [ "$t" = "2" ]; then
-					read -rp "输入服务名: " svc
+					read -erp "输入服务名: " svc
 					journalctl -u "$svc" -f
 				else
 					echo "无效选择"
@@ -14234,7 +14716,7 @@ log_menu() {
 				echo "1) 保留最近 7 天"
 				echo "2) 保留最近 3 天"
 				echo "3) 限制日志最大 500M"
-				read -rp "请选择清理方式: " c
+				read -erp "请选择清理方式: " c
 				case $c in
 					1) journalctl --vacuum-time=7d ;;
 					2) journalctl --vacuum-time=3d ;;
@@ -14300,7 +14782,7 @@ env_menu() {
 
 		echo
 		echo "==============================================="
-		read -rp "按回车继续..."
+		read -erp "按回车继续..."
 	}
 
 
@@ -14315,7 +14797,7 @@ env_menu() {
 		else
 			echo "文件不存在：$file"
 		fi
-		read -rp "按回车继续..."
+		read -erp "按回车继续..."
 	}
 
 	edit_file() {
@@ -14331,7 +14813,7 @@ env_menu() {
 		source "$BASHRC"
 		source "$PROFILE"
 		echo "✔ 环境变量已重新加载"
-		read -rp "按回车继续..."
+		read -erp "按回车继续..."
 	}
 
 	while true; do
@@ -14348,7 +14830,7 @@ env_menu() {
 		echo "--------------------------------------"
 		echo "0. 返回上一级选单"
 		echo "--------------------------------------"
-		read -rp "请选择操作: " choice
+		read -erp "请选择操作: " choice
 
 		case "$choice" in
 			1)
@@ -14621,7 +15103,7 @@ EOF
 
 			while true; do
 				clear
-				sed -i 's/#Port/Port/' /etc/ssh/sshd_config
+				sed -i 's/^\s*#\?\s*Port/Port/' /etc/ssh/sshd_config
 
 				# 读取当前的 SSH 端口号
 				local current_port=$(grep -E '^ *Port [0-9]+' /etc/ssh/sshd_config | awk '{print $2}')
@@ -14639,7 +15121,7 @@ EOF
 				if [[ $new_port =~ ^[0-9]+$ ]]; then  # 检查输入是否为数字
 					if [[ $new_port -ge 1 && $new_port -le 65535 ]]; then
 						send_stats "SSH端口已修改"
-						new_ssh_port
+						new_ssh_port $new_port
 					elif [[ $new_port -eq 0 ]]; then
 						send_stats "退出SSH端口修改"
 						break
@@ -15451,8 +15933,7 @@ EOF
 				  echo -e "[${gl_lv}OK${gl_bai}] 3/12. 设置虚拟内存${gl_huang}1G${gl_bai}"
 
 				  echo "------------------------------------------------"
-				  local new_port=5522
-				  new_ssh_port
+				  new_ssh_port 5522
 				  echo -e "[${gl_lv}OK${gl_bai}] 4/12. 设置SSH端口号为${gl_huang}5522${gl_bai}"
 				  echo "------------------------------------------------"
 				  f2b_install_sshd
