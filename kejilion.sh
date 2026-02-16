@@ -1,5 +1,5 @@
 #!/bin/bash
-sh_v="4.3.9"
+sh_v="4.3.10"
 
 
 gl_hui='\e[37m'
@@ -9755,46 +9755,101 @@ moltbot_menu() {
 
 
 
-	add-openclaw-provider() {
-		local config_file="${HOME}/.openclaw/openclaw.json"
+
+
+	# 核心函数：获取并添加所有模型
+	add-all-models-from-provider() {
 		local provider_name="$1"
-		local models_id="$2"
-		local base_url="$3"
-		local api_key="$4"
+		local base_url="$2"
+		local api_key="$3"
+		local config_file="${HOME}/.openclaw/openclaw.json"
 
-		echo "=== 添加自定义 OpenAI 兼容模型到 OpenClaw ==="
-		echo "Provider: $provider_name"
-		echo "Model ID: $models_id"
-		echo "Base URL: $base_url"
-		echo "API Key: ${api_key:0:8}****"
+		echo "🔍 正在获取 $provider_name 的所有可用模型..."
 
-		# 检查参数
-		if [[ -z "$provider_name" || -z "$models_id" || -z "$base_url" || -z "$api_key" ]]; then
-			echo "错误：参数不能为空！"
-			echo "用法: add-openclaw-provider <provider> <model-id> <base-url> <api-key>"
+		# 获取模型列表
+		local models_json=$(curl -s -m 10 \
+			-H "Authorization: Bearer $api_key" \
+			"${base_url}/models")
+
+		if [[ -z "$models_json" ]]; then
+			echo "❌ 无法获取模型列表"
 			return 1
 		fi
 
-		# 检查 jq
-		if ! command -v jq &> /dev/null; then
-			echo "安装 jq: apt update && apt install -y jq"
-			apt update && apt install -y jq || {
-				echo "安装 jq 失败"
-				return 1
-			}
+		# 提取所有模型ID
+		local model_ids=$(echo "$models_json" | grep -oP '"id":\s*"\K[^"]+')
+
+		if [[ -z "$model_ids" ]]; then
+			echo "❌ 未找到任何模型"
+			return 1
 		fi
 
-		# 备份原文件
-		if [[ -f "$config_file" ]]; then
-			cp "$config_file" "${config_file}.bak.$(date +%s)"
-			echo "备份: ${config_file}.bak.*"
-		fi
+		local model_count=$(echo "$model_ids" | wc -l)
+		echo "✅ 发现 $model_count 个模型"
 
+		# 智能推断模型参数
+		local models_array="["
+		local first=true
 
+		while read -r model_id; do
+			[[ $first == false ]] && models_array+=","
+			first=false
+
+			# 根据模型名称推断上下文窗口
+			local context_window=131072
+			local max_tokens=8192
+			local input_cost=0.14
+			local output_cost=0.28
+
+			case "$model_id" in
+				*preview*|*thinking*|*opus*|*pro*)
+					context_window=1048576  # 1M
+					max_tokens=16384
+					input_cost=0.30
+					output_cost=0.60
+					;;
+				*gpt-5*|*codex*)
+					context_window=131072   # 128K
+					max_tokens=8192
+					input_cost=0.20
+					output_cost=0.40
+					;;
+				*flash*|*lite*|*haiku*)
+					context_window=131072
+					max_tokens=8192
+					input_cost=0.07
+					output_cost=0.14
+					;;
+			esac
+
+			models_array+=$(cat <<EOF
+{
+	"id": "$model_id",
+	"name": "$provider_name / $model_id",
+	"input": ["text", "image"],
+	"contextWindow": $context_window,
+	"maxTokens": $max_tokens,
+	"cost": {
+		"input": $input_cost,
+		"output": $output_cost,
+		"cacheRead": 0,
+		"cacheWrite": 0
+	}
+}
+EOF
+)
+		done <<< "$model_ids"
+
+		models_array+="]"
+
+		# 备份配置
+		[[ -f "$config_file" ]] && cp "$config_file" "${config_file}.bak.$(date +%s)"
+
+		# 使用jq注入所有模型
 		jq --arg prov "$provider_name" \
 		   --arg url "$base_url" \
 		   --arg key "$api_key" \
-		   --arg mid "$models_id" \
+		   --argjson models "$models_array" \
 		'
 		.models |= (
 			(. // { mode: "merge", providers: {} })
@@ -9803,83 +9858,41 @@ moltbot_menu() {
 				baseUrl: $url,
 				apiKey: $key,
 				api: "openai-completions",
-				models: [
-					{
-						id: $mid,
-						name: ($prov + " / " + $mid),
-						input: ["text"],
-						contextWindow: 131072,
-						maxTokens: 8192,
-						cost: {
-							input: 0.14,
-							output: 0.28,
-							cacheRead: 0,
-							cacheWrite: 0
-						}
-					}
-				]
+				models: $models
 			}
 		)
 		' "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
 
 		if [[ $? -eq 0 ]]; then
-			echo "✅ 已添加 provider: $provider_name"
-			echo "📦 模型引用方式: $provider_name/$models_id"
-			echo "🔧 设置默认模型:"
-			echo "    openclaw config patch '{\"agents.defaults.model.primary\": \"$provider_name/$models_id\"}'"
-			echo "🔄 重启网关:"
-			echo "    openclaw gateway restart"
+			echo "✅ 成功添加 $model_count 个模型到 $provider_name"
+			echo "📦 模型引用格式: $provider_name/<model-id>"
+			return 0
 		else
-			echo "❌ 添加失败，检查 jq 语法"
+			echo "❌ 配置注入失败"
 			return 1
 		fi
 	}
 
-	# 可选：自动设置默认并重启
-	add-openclaw-provider-and-switch() {
-		install jq
-
-		add-openclaw-provider "$1" "$2" "$3" "$4"
-
-		if [[ $? -eq 0 ]]; then
-			echo "🔄 设置默认模型并重启网关..."
-			openclaw models set "$1/$2"
-			start_tmux
-			echo "✅ 完成！当前默认模型: $1/$2"
-			openclaw status | grep -A2 "Sessions"
-		fi
-	}
-
-
-
-
-
 	add-openclaw-provider-interactive() {
 		send_stats "添加API"
-		echo "=== 交互式添加 OpenClaw Provider ==="
+		echo "=== 交互式添加 OpenClaw Provider (全量模型) ==="
 
-		# Provider 名称
+		# 1. Provider 名称
 		read -erp "请输入 Provider 名称 (如: deepseek): " provider_name
 		while [[ -z "$provider_name" ]]; do
 			echo "❌ Provider 名称不能为空"
 			read -erp "请输入 Provider 名称: " provider_name
 		done
 
-		# Model ID
-		read -erp "请输入 Model ID (如: deepseek-chat): " model_id
-		while [[ -z "$model_id" ]]; do
-			echo "❌ Model ID 不能为空"
-			read -erp "请输入 Model ID: " model_id
-		done
-
-		# Base URL
+		# 2. Base URL
 		read -erp "请输入 Base URL (如: https://api.xxx.com/v1): " base_url
 		while [[ -z "$base_url" ]]; do
 			echo "❌ Base URL 不能为空"
 			read -erp "请输入 Base URL: " base_url
 		done
+		base_url="${base_url%/}"
 
-		# API Key（隐藏输入）
+		# 3. API Key
 		read -rsp "请输入 API Key (输入不显示): " api_key
 		echo
 		while [[ -z "$api_key" ]]; do
@@ -9888,26 +9901,71 @@ moltbot_menu() {
 			echo
 		done
 
+		# 4. 获取模型列表
+		echo "🔍 正在获取可用模型列表..."
+		models_json=$(curl -s -m 10 \
+			-H "Authorization: Bearer $api_key" \
+			"${base_url}/models")
+
+		if [[ -n "$models_json" ]]; then
+			available_models=$(echo "$models_json" | grep -oP '"id":\s*"\K[^"]+' | sort)
+
+			if [[ -n "$available_models" ]]; then
+				model_count=$(echo "$available_models" | wc -l)
+				echo "✅ 发现 $model_count 个可用模型："
+				echo "--------------------------------"
+				# 全部显示，带序号
+				i=1
+				declare -A model_map
+				while read -r model; do
+					echo "[$i] $model"
+					model_map[$i]="$model"
+					((i++))
+				done <<< "$available_models"
+				echo "--------------------------------"
+			fi
+		fi
+
+		# 5. 选择默认模型
+		echo
+		read -erp "请输入默认 Model ID (或序号，留空则使用第一个): " input_model
+
+		if [[ -z "$input_model" && -n "$available_models" ]]; then
+			default_model=$(echo "$available_models" | head -1)
+			echo "🎯 使用第一个模型: $default_model"
+		elif [[ -n "${model_map[$input_model]}" ]]; then
+			default_model="${model_map[$input_model]}"
+			echo "🎯 已选择模型: $default_model"
+		else
+			default_model="$input_model"
+		fi
+
+		# 6. 确认信息
 		echo
 		echo "====== 确认信息 ======"
-		echo "Provider : $provider_name"
-		echo "Model ID : $model_id"
-		echo "Base URL : $base_url"
-		echo "API Key  : ${api_key:0:8}****"
+		echo "Provider    : $provider_name"
+		echo "Base URL    : $base_url"
+		echo "API Key     : ${api_key:0:8}****"
+		echo "默认模型    : $default_model"
+		echo "模型总数    : $model_count"
 		echo "======================"
 
-		read -erp "确认添加？(y/N): " confirm
+		read -erp "确认添加所有 $model_count 个模型？(y/N): " confirm
 		if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
 			echo "❎ 已取消"
 			return 1
 		fi
 
-		echo
-		add-openclaw-provider-and-switch \
-			"$provider_name" \
-			"$model_id" \
-			"$base_url" \
-			"$api_key"
+		install jq
+		add-all-models-from-provider "$provider_name" "$base_url" "$api_key"
+
+		if [[ $? -eq 0 ]]; then
+			echo
+			echo "🔄 设置默认模型并重启网关..."
+			openclaw models set "$provider_name/$default_model"
+			start_tmux
+			echo "✅ 完成！所有 $model_count 个模型已加载"
+		fi
 
 		break_end
 	}
@@ -10265,18 +10323,18 @@ moltbot_menu() {
 
 		token=$(
 			openclaw dashboard 2>/dev/null \
-			| sed -n 's/.*:18789\/?token=\([a-f0-9]\+\).*/\1/p' \
+			| sed -n 's/.*:18789\/#token=\([a-f0-9]\+\).*/\1/p' \
 			| head -n 1
 		)
 		echo
 		echo "本机地址："
-		echo "http://${local_ip}:18789/?token=${token}"
+		echo "http://${local_ip}:18789/#token=${token}"
 
 		domains=$(openclaw_find_webui_domain)
 		if [ -n "$domains" ]; then
 			echo "域名地址："
 			echo "$domains" | while read d; do
-				echo "https://${d}/?token=${token}"
+				echo "https://${d}/#token=${token}"
 			done
 		fi
 
@@ -10292,13 +10350,13 @@ moltbot_menu() {
 
 		token=$(
 			openclaw dashboard 2>/dev/null \
-			| sed -n 's/.*:18789\/?token=\([a-f0-9]\+\).*/\1/p' \
+			| sed -n 's/.*:18789\/#token=\([a-f0-9]\+\).*/\1/p' \
 			| head -n 1
 		)
 
 		clear
 		echo "访问地址:"
-		echo "https://${yuming}/?token=$token"
+		echo "https://${yuming}/#token=$token"
 		echo "先访问URL触发设备ID，然后回车下一步进行配对。"
 		read
 		echo -e "${gl_kjlan}正在加载设备列表……${gl_bai}"
