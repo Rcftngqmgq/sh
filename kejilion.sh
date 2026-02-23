@@ -1,5 +1,5 @@
 #!/bin/bash
-sh_v="4.3.10"
+sh_v="4.4.0"
 
 
 gl_hui='\e[37m'
@@ -13,7 +13,7 @@ gl_kjlan='\033[96m'
 
 
 canshu="default"
-permission_granted="false"
+permission_granted="true"
 ENABLE_STATS="false"
 
 
@@ -3299,7 +3299,6 @@ send_stats "安装nginx环境"
 root_use
 clear
 echo -e "${gl_huang}nginx未安装，开始安装nginx环境...${gl_bai}"
-check_disk_space 1 /home
 install_dependency
 install_docker
 install_certbot
@@ -9644,6 +9643,7 @@ moltbot_menu() {
 		fi
 	}
 
+
 	get_install_status() {
 		if command -v openclaw >/dev/null 2>&1; then
 			echo "${gl_lv}已安装${gl_bai}"
@@ -9653,12 +9653,13 @@ moltbot_menu() {
 	}
 
 	get_running_status() {
-		if pgrep -f "openclaw gateway" >/dev/null 2>&1; then
+		if pgrep -f "openclaw-gatewa" >/dev/null 2>&1; then
 			echo "${gl_lv}运行中${gl_bai}"
 		else
 			echo "${gl_hui}未运行${gl_bai}"
 		fi
 	}
+
 
 	show_menu() {
 
@@ -9677,7 +9678,7 @@ moltbot_menu() {
 		echo "2.  启动"
 		echo "3.  停止"
 		echo "--------------------"
-		echo "4.  日志查看"
+		echo "4.  状态日志查看"
 		echo "5.  换模型"
 		echo "6.  加新模型API"
 		echo "7.  TG输入连接码"
@@ -9697,34 +9698,41 @@ moltbot_menu() {
 	}
 
 
-	start_tmux() {
-		install tmux
+	start_gateway() {
 		openclaw gateway stop
-		tmux kill-session -t gateway > /dev/null 2>&1
-		tmux new -d -s gateway "openclaw gateway"
-		check_crontab_installed
-		crontab -l 2>/dev/null | grep -q "s gateway" || (crontab -l 2>/dev/null; echo "* * * * * tmux has-session -t gateway 2>/dev/null || tmux new -d -s gateway 'openclaw gateway'") | crontab -
+		openclaw gateway start
 		sleep 3
 	}
 
+
+	install_node_and_tools() {
+		if command -v dnf &>/dev/null; then
+			curl -fsSL https://rpm.nodesource.com/setup_24.x | sudo bash -
+			dnf update -y
+			dnf group install -y "Development Tools" "Development Libraries"
+			dnf install -y cmake libatomic nodejs
+		fi
+
+		if command -v apt &>/dev/null; then
+			curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
+			apt update -y
+			apt install build-essential python3 libatomic1 nodejs -y
+		fi
+	}
 
 	install_moltbot() {
 		echo "开始安装 OpenClaw..."
 		send_stats "开始安装 OpenClaw..."
 
-		if command -v dnf &>/dev/null; then
-			dnf update -y
-			dnf groupinstall -y "Development Tools"
-			dnf install -y cmake
-		fi
+		install_node_and_tools
 
 		country=$(curl -s ipinfo.io/country)
 		if [[ "$country" == "CN" || "$country" == "HK" ]]; then
-			pnpm config set registry https://registry.npmmirror.com
 			npm config set registry https://registry.npmmirror.com
 		fi
-		curl -fsSL https://openclaw.ai/install.sh | bash
-		start_tmux
+		npm install -g openclaw@latest
+		openclaw onboard --install-daemon
+		start_gateway
 		add_app_id
 		break_end
 
@@ -9734,21 +9742,23 @@ moltbot_menu() {
 	start_bot() {
 		echo "启动 OpenClaw..."
 		send_stats "启动 OpenClaw..."
-		start_tmux
+		start_gateway
 		break_end
 	}
 
 	stop_bot() {
 		echo "停止 OpenClaw..."
 		send_stats "停止 OpenClaw..."
-		openclaw gateway stop
 		tmux kill-session -t gateway > /dev/null 2>&1
+		openclaw gateway stop
 		break_end
 	}
 
 	view_logs() {
-		echo "查看 OpenClaw 日志，Ctrl+C 退出"
+		echo "查看 OpenClaw 状态日志"
 		send_stats "查看 OpenClaw 日志"
+		openclaw status
+		openclaw gateway status
 		openclaw logs
 		break_end
 	}
@@ -9963,7 +9973,7 @@ EOF
 			echo
 			echo "🔄 设置默认模型并重启网关..."
 			openclaw models set "$provider_name/$default_model"
-			start_tmux
+			start_gateway
 			echo "✅ 完成！所有 $model_count 个模型已加载"
 		fi
 
@@ -10078,7 +10088,7 @@ EOF
 				openclaw plugins enable "$plugin_name"
 			fi
 
-			start_tmux
+			start_gateway
 			break_end
 		done
 	}
@@ -10126,7 +10136,7 @@ EOF
 			echo "🔍 正在检查插件状态..."
 
 			# 2. 检查是否已经在 list 中且为 disabled (最常见的情况)
-			if echo "$plugin_list" | grep -qW "$plugin_id" && echo "$plugin_list" | grep "$plugin_id" | grep -q "disabled"; then
+			if echo "$plugin_list" | grep -qw "$plugin_id" && echo "$plugin_list" | grep "$plugin_id" | grep -q "disabled"; then
 				echo "💡 插件 [$plugin_id] 已预装，正在激活..."
 				openclaw plugins enable "$plugin_id" && echo "✅ 激活成功" || echo "❌ 激活失败"
 
@@ -10154,7 +10164,7 @@ EOF
 						openclaw plugins enable "$plugin_id"
 					else
 						echo "❌ 严重错误：无法获取该插件。请检查 ID 是否正确或网络是否可用。"
-						# 关键：这里直接 return 或 continue，不走下面的 start_tmux，防止写死配置
+						# 关键：这里直接 return 或 continue，不走下面的 start_gateway，防止写死配置
 						break_end
 						continue
 					fi
@@ -10162,7 +10172,7 @@ EOF
 			fi
 
 			echo "🔄 正在重启 OpenClaw 服务以加载新插件..."
-			start_tmux
+			start_gateway
 			break_end
 		done
 	}
@@ -10226,7 +10236,7 @@ EOF
 			if [ $? -eq 0 ]; then
 				echo "✅ 技能 $skill_name 安装成功。"
 				# 执行重启/启动服务逻辑
-				start_tmux
+				start_gateway
 			else
 				echo "❌ 安装失败。请检查技能名称是否正确，或参考文档排查。"
 			fi
@@ -10262,9 +10272,10 @@ EOF
 	update_moltbot() {
 		echo "更新 OpenClaw..."
 		send_stats "更新 OpenClaw..."
-		curl -fsSL https://openclaw.ai/install.sh | bash
-		openclaw gateway stop
-		start_tmux
+		install_node_and_tools
+		npm install -g openclaw@latest
+		start_gateway
+		hash -r
 		add_app_id
 		echo "更新完成"
 		break_end
@@ -10287,7 +10298,7 @@ EOF
 		send_stats "编辑 OpenClaw 配置文件"
 		install nano
 		nano ~/.openclaw/openclaw.json
-		start_tmux
+		start_gateway
 	}
 
 
