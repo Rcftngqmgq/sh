@@ -1,5 +1,5 @@
 #!/bin/bash
-sh_v="4.4.1"
+sh_v="4.4.3"
 
 
 gl_hui='\e[37m'
@@ -13,7 +13,7 @@ gl_kjlan='\033[96m'
 
 
 canshu="default"
-permission_granted="true"
+permission_granted="false"
 ENABLE_STATS="false"
 
 
@@ -3213,6 +3213,80 @@ f2b_sshd() {
 	fi
 }
 
+# 基础参数配置：封禁时长(bantime)、时间窗口(findtime)、重试次数(maxretry)
+# 说明：
+# - 优先写入 /etc/fail2ban/jail.d/sshd.local（覆盖默认 jail 配置，升级不易丢）
+# - 若是 Alpine 且 jail 名称不同，依然写 sshd.local；Fail2Ban 会按 jail 名称匹配
+f2b_basic_config() {
+	root_use
+	install nano
+
+	if ! command -v fail2ban-client >/dev/null 2>&1; then
+		echo -e "${gl_hui}未检测到 fail2ban-client，请先安装 fail2ban。${gl_bai}"
+		return
+	fi
+
+	local jail_name="sshd"
+	if grep -qi 'Alpine' /etc/issue 2>/dev/null; then
+		# Alpine 默认 jail 通常为 sshd；仅当检测到自定义 alpine-sshd 规则时才切换
+		if [ -f /etc/fail2ban/filter.d/alpine-sshd.conf ] || [ -f /etc/fail2ban/jail.d/alpine-ssh.conf ] || [ -f /etc/fail2ban/jail.d/alpine-sshd.local ]; then
+			jail_name="alpine-sshd"
+		fi
+	fi
+
+	echo "即将配置 SSH jail：$jail_name"
+	read -e -p "封禁时长 bantime (秒/分钟/小时，如 3600 或 1h) [默认 1h]: " bantime
+	read -e -p "时间窗口 findtime (秒/分钟/小时，如 600 或 10m) [默认 10m]: " findtime
+	read -e -p "重试次数 maxretry (整数) [默认 5]: " maxretry
+
+	bantime=${bantime:-1h}
+	findtime=${findtime:-10m}
+	maxretry=${maxretry:-5}
+
+	mkdir -p /etc/fail2ban/jail.d
+	cat > /etc/fail2ban/jail.d/sshd.local <<EOF
+[$jail_name]
+# Managed by kejilion.sh
+# Note: enable the jail so these parameters take effect
+enabled = true
+bantime = $bantime
+findtime = $findtime
+maxretry = $maxretry
+EOF
+
+	# Ensure a logfile exists for sshd jail on Debian/Ubuntu minimal images
+	# (without it, fail2ban-server may refuse to start)
+	if [ "$jail_name" = "sshd" ]; then
+		if [ -f /etc/fail2ban/jail.d/sshd.local ]; then
+			grep -qE '^\s*logpath\s*=' /etc/fail2ban/jail.d/sshd.local || echo 'logpath = /var/log/auth.log' >> /etc/fail2ban/jail.d/sshd.local
+		fi
+	fi
+
+	echo -e "${gl_lv}已写入配置${gl_bai}: /etc/fail2ban/jail.d/sshd.local"
+	fail2ban-client reload >/dev/null 2>&1 || true
+	sleep 2
+	fail2ban-client status $jail_name || true
+}
+
+# 直接打开主配置/覆盖配置编辑（nano）
+# 优先编辑 /etc/fail2ban/jail.d/sshd.local（更安全），若不存在则创建
+f2b_edit_config() {
+	root_use
+	install nano
+
+	if [ ! -d /etc/fail2ban ]; then
+		echo -e "${gl_hui}/etc/fail2ban 不存在，请先安装 fail2ban。${gl_bai}"
+		return
+	fi
+
+	mkdir -p /etc/fail2ban/jail.d
+	local cfg="/etc/fail2ban/jail.d/sshd.local"
+	[ -f "$cfg" ] || printf "[sshd]\n# bantime/findtime/maxretry\n" > "$cfg"
+
+	nano "$cfg"
+	echo -e "${gl_lv}已保存${gl_bai}，正在 reload fail2ban..."
+	fail2ban-client reload >/dev/null 2>&1 || true
+}
 
 
 
@@ -9883,16 +9957,17 @@ moltbot_menu() {
 		echo "4.  状态日志查看"
 		echo "5.  换模型"
 		echo "6.  加新模型API"
-		echo "7.  TG输入连接码"
+		echo "7.  机器人连接对接"
 		echo "8.  安装插件（如：飞书）"
 		echo "9.  安装技能（skills）"
 		echo "10. 编辑主配置文件"
 		echo "11. 配置向导"
 		echo "12. 健康检测与修复"
 		echo "13. WebUI访问与设置"
+		echo "14. TUI命令行对话窗口"
 		echo "--------------------"
-		echo "14. 更新"
-		echo "15. 卸载"
+		echo "15. 更新"
+		echo "16. 卸载"
 		echo "--------------------"
 		echo "0. 返回上一级选单"
 		echo "--------------------"
@@ -9922,6 +9997,36 @@ moltbot_menu() {
 		fi
 	}
 
+	configure_openclaw_session_policy() {
+		local config_file="${HOME}/.openclaw/openclaw.json"
+
+		[ ! -f "$config_file" ] && return 1
+
+		python3 - "$config_file" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path, 'r', encoding='utf-8') as f:
+    obj = json.load(f)
+
+session = obj.setdefault('session', {})
+session['dmScope'] = session.get('dmScope', 'per-channel-peer')
+session['resetTriggers'] = ['/new', '/reset']
+session['reset'] = {
+    'mode': 'idle',
+    'idleMinutes': 10080
+}
+session['resetByType'] = {
+    'direct': {'mode': 'idle', 'idleMinutes': 10080},
+    'thread': {'mode': 'idle', 'idleMinutes': 1440},
+    'group': {'mode': 'idle', 'idleMinutes': 120}
+}
+
+with open(path, 'w', encoding='utf-8') as f:
+    json.dump(obj, f, ensure_ascii=False, indent=2)
+    f.write('\n')
+PY
+	}
+
 	install_moltbot() {
 		echo "开始安装 OpenClaw..."
 		send_stats "开始安装 OpenClaw..."
@@ -9932,8 +10037,14 @@ moltbot_menu() {
 		if [[ "$country" == "CN" || "$country" == "HK" ]]; then
 			npm config set registry https://registry.npmmirror.com
 		fi
+
+		git config --global url."${gh_https_url}github.com/".insteadOf ssh://git@github.com/
+		git config --global url."${gh_https_url}github.com/".insteadOf git@github.com:
+
 		npm install -g openclaw@latest
 		openclaw onboard --install-daemon
+		sed -i 's|"profile": "messaging"|"profile": "full"|g' ~/.openclaw/openclaw.json
+		configure_openclaw_session_policy
 		start_gateway
 		add_app_id
 		break_end
@@ -10220,78 +10331,7 @@ EOF
 
 
 
-	install_plugin() {
-
-		send_stats "安装插件"
-		while true; do
-			clear
-			echo "========================================"
-			echo "            插件管理 (安装)            "
-			echo "========================================"
-			echo "当前已安装插件:"
-			openclaw plugins list
-			echo "----------------------------------------"
-
-			# 输出推荐的实用插件列表，便于用户复制
-			echo "推荐的实用插件（可直接复制名称输入）："
-			echo "feishu                # 飞书/Lark 集成 (当前已加载 ✓)"
-			echo "telegram              # Telegram 机器人集成 (当前已加载 ✓)"
-			echo "memory-core           # 核心记忆增强：基于文件的上下文搜索 (当前已加载 ✓)"
-			echo "@openclaw/slack       # Slack 频道与 DMs 深度连接"
-			echo "@openclaw/bluebubbles # iMessage 桥接 (macOS 用户首选)"
-			echo "@openclaw/msteams     # Microsoft Teams 企业通讯集成"
-			echo "@openclaw/voice-call  # 语音通话插件 (基于 Twilio 等后端)"
-			echo "@openclaw/discord     # Discord 频道自动化管理"
-			echo "@openclaw/nostr       # Nostr 协议：隐私安全加密聊天"
-			echo "lobster               # 审批工作流：带有人工干预的自动任务"
-			echo "memory-lancedb        # 长期记忆增强：基于向量数据库的精准召回"
-			echo "copilot-proxy         # GitHub Copilot 代理接入增强"
-			echo "----------------------------------------"
-
-			# 提示用户输入插件名称
-			read -e -p "请输入要安装的插件名称（输入 0 退出）： " plugin_name
-
-			# 1. 检查是否输入 0 以退出
-			if [ "$plugin_name" = "0" ]; then
-				echo "操作已取消，退出插件安装。"
-				break
-			fi
-
-			# 2. 验证输入是否为空
-			if [ -z "$plugin_name" ]; then
-				echo "错误：插件名称不能为空，请重新输入。"
-				echo ""
-				continue
-			fi
-
-			# 1. 彻底清理之前失败的残留（用户目录）
-			rm -rf "/root/.openclaw/extensions/$plugin_name"
-
-			# 2. 检查系统是否已经预装（防止 duplicate id 冲突）
-			if [ -d "/usr/lib/node_modules/openclaw/extensions/$plugin_name" ]; then
-				echo "💡 检测到系统目录已存在该插件，正在直接激活..."
-				openclaw plugins enable "$plugin_name"
-			else
-				echo "📥 正在通过官方渠道下载安装插件..."
-				# 使用 openclaw 自己的 install 命令，它会自动处理 package.json 的规范检查
-				openclaw plugins install "$plugin_name"
-
-				# 3. 如果 openclaw install 报错，再尝试作为普通 npm 包安装（最后的备选）
-				if [ $? -ne 0 ]; then
-					echo "⚠️ 官方安装失败，尝试通过 npm 全局强制安装..."
-					npm install -g "$plugin_name" --unsafe-perm
-				fi
-
-				# 4. 最后统一执行启用
-				openclaw plugins enable "$plugin_name"
-			fi
-
-			start_gateway
-			break_end
-		done
-	}
-
-	install_plugin() {
+		install_plugin() {
 		send_stats "安装插件"
 		while true; do
 			clear
@@ -10332,6 +10372,8 @@ EOF
 			local plugin_full="$raw_input"
 
 			echo "🔍 正在检查插件状态..."
+			# 获取当前插件列表用于状态检测
+			local plugin_list=$(openclaw plugins list 2>/dev/null)
 
 			# 2. 检查是否已经在 list 中且为 disabled (最常见的情况)
 			if echo "$plugin_list" | grep -qw "$plugin_id" && echo "$plugin_list" | grep "$plugin_id" | grep -q "disabled"; then
@@ -10426,14 +10468,29 @@ EOF
 				continue
 			fi
 
-			# 3. 执行安装命令
-			echo "正在安装技能：$skill_name ..."
-			npx clawhub install "$skill_name"
+			# 3. 检查技能是否已安装
+			local skill_found=false
+			if [ -d "${HOME}/.openclaw/workspace/skills/${skill_name}" ]; then
+				echo "💡 技能 [$skill_name] 已在用户目录安装。"
+				skill_found=true
+			elif [ -d "/usr/lib/node_modules/openclaw/skills/${skill_name}" ]; then
+				echo "💡 技能 [$skill_name] 已在系统目录安装。"
+				skill_found=true
+			fi
 
-			# 获取上一条命令的退出状态
-			if [ $? -eq 0 ]; then
+			if [ "$skill_found" = true ]; then
+				read -e -p "是否重新安装？(y/N): " reinstall
+				if [[ ! "$reinstall" =~ ^[Yy]$ ]]; then
+					echo "跳过安装。"
+					break_end
+					continue
+				fi
+			fi
+
+			# 4. 执行安装命令
+			echo "正在安装技能：$skill_name ..."
+			if npx clawhub install "$skill_name"; then
 				echo "✅ 技能 $skill_name 安装成功。"
-				# 执行重启/启动服务逻辑
 				start_gateway
 			else
 				echo "❌ 安装失败。请检查技能名称是否正确，或参考文档排查。"
@@ -10441,29 +10498,56 @@ EOF
 
 			break_end
 		done
-
 	}
 
 
 
 	change_tg_bot_code() {
 		send_stats "机器人对接"
-		read -e -p "请输入TG机器人收到的连接码 (例如 Pairing code: NYA99R2F)（输入 0 退出）： " code
+		while true; do
+			clear
+			echo "========================================"
+			echo "            机器人连接对接            "
+			echo "========================================"
+			echo "1. Telegram 机器人对接"
+			echo "2. 飞书 (Lark) 机器人对接"
+			echo "3. WhatsApp 机器人对接"
+			echo "----------------------------------------"
+			echo "0. 返回上一级选单"
+			echo "----------------------------------------"
+			read -e -p "请输入你的选择: " bot_choice
 
-		# 检查是否输入 0 以退出
-		if [ "$code" = "0" ]; then
-			echo "操作已取消。"
-			return 0  # 正常退出函数
-		fi
-
-		# 验证输入是否为空
-		if [ -z "$code" ]; then
-			echo "错误：连接码不能为空。请重试。"
-			return 1
-		fi
-
-		openclaw pairing approve telegram $code
-		break_end
+			case $bot_choice in
+				1)
+					read -e -p "请输入TG机器人收到的连接码 (例如 NYA99R2F)（输入 0 退出）： " code
+					if [ "$code" = "0" ]; then continue; fi
+					if [ -z "$code" ]; then echo "错误：连接码不能为空。"; sleep 1; continue; fi
+					openclaw pairing approve telegram "$code"
+					break_end
+					;;
+				2)
+					read -e -p "请输入飞书机器人收到的连接码 (例如 NYA99R2F)（输入 0 退出）： " code
+					if [ "$code" = "0" ]; then continue; fi
+					if [ -z "$code" ]; then echo "错误：连接码不能为空。"; sleep 1; continue; fi
+					openclaw pairing approve feishu "$code"
+					break_end
+					;;
+				3)
+					read -e -p "请输入WhatsApp收到的连接码 (例如 NYA99R2F)（输入 0 退出）： " code
+					if [ "$code" = "0" ]; then continue; fi
+					if [ -z "$code" ]; then echo "错误：连接码不能为空。"; sleep 1; continue; fi
+					openclaw pairing approve whatsapp "$code"
+					break_end
+					;;
+				0)
+					return 0
+					;;
+				*)
+					echo "无效的选择，请重试。"
+					sleep 1
+					;;
+			esac
+		done
 	}
 
 
@@ -10487,6 +10571,7 @@ EOF
 		openclaw uninstall
 		npm uninstall -g openclaw
 		crontab -l 2>/dev/null | grep -v "s gateway" | crontab -
+		rm -rf /root/.openclaw
 		hash -r
 		sed -i "/\b${app_id}\b/d" /home/docker/appno.txt
 		echo "卸载完成"
@@ -10570,6 +10655,19 @@ EOF
 		echo "先访问URL触发设备ID，然后回车下一步进行配对。"
 		read
 		echo -e "${gl_kjlan}正在加载设备列表……${gl_bai}"
+		# 自动添加域名到 allowedOrigins
+		config_file="$HOME/.openclaw/openclaw.json"
+		if [ -f "$config_file" ]; then
+			new_origin="https://${yuming}"
+			# 使用 jq 安全修改 JSON，确保结构存在且不重复添加域名
+			if command -v jq >/dev/null 2>&1; then
+				tmp_json=$(mktemp)
+				jq 'if .gateway.controlUi == null then .gateway.controlUi = {"allowedOrigins": ["http://127.0.0.1"]} else . end | if (.gateway.controlUi.allowedOrigins | contains([$origin]) | not) then .gateway.controlUi.allowedOrigins += [$origin] else . end' --arg origin "$new_origin" "$config_file" > "$tmp_json" && mv "$tmp_json" "$config_file"
+				echo -e "${gl_kjlan}已将域名 ${yuming} 加入 allowedOrigins 配置${gl_bai}"
+				openclaw gateway restart >/dev/null 2>&1
+			fi
+		fi
+
 		openclaw devices list
 
 		read -e -p "请输入 Request_Key: " Request_Key
@@ -10650,8 +10748,12 @@ EOF
 				break_end
 			 	;;
 			13) openclaw_webui_menu ;;
-			14) update_moltbot ;;
-			15) uninstall_moltbot ;;
+			14) send_stats "TUI命令行对话"
+				openclaw tui
+				break_end
+			 	;;
+			15) update_moltbot ;;
+			16) uninstall_moltbot ;;
 			*) break ;;
 		esac
 	done
@@ -14786,6 +14888,9 @@ fail2ban_panel() {
 				echo "2. 查看SSH拦截记录"
 				echo "3. 日志实时监控"
 				echo "------------------------"
+				echo "4. 基础参数配置（封禁时长/时间窗口/重试次数）"
+				echo "5. 编辑配置文件（nano）"
+				echo "------------------------"
 				echo "9. 卸载防御程序"
 				echo "------------------------"
 				echo "0. 返回上一级选单"
@@ -14807,6 +14912,16 @@ fail2ban_panel() {
 					3)
 						tail -f /var/log/fail2ban.log
 						break
+						;;
+					4)
+						send_stats "SSH防御基础参数配置"
+						f2b_basic_config
+						break_end
+						;;
+					5)
+						send_stats "SSH防御编辑配置文件"
+						f2b_edit_config
+						break_end
 						;;
 					9)
 						remove fail2ban
