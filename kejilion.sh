@@ -1,5 +1,5 @@
 #!/bin/bash
-sh_v="4.4.3"
+sh_v="4.4.7"
 
 
 gl_hui='\e[37m'
@@ -6738,6 +6738,164 @@ linux_backup() {
 
 
 
+# SSH 输入标准化函数
+kj_ssh_validate_host() {
+	local host="$1"
+	[[ -n "$host" && ! "$host" =~ [[:space:]] && "$host" =~ ^[A-Za-z0-9._:-]+$ ]]
+}
+
+kj_ssh_validate_port() {
+	local port="$1"
+	[[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
+}
+
+kj_ssh_validate_user() {
+	local user="$1"
+	[[ -n "$user" && "$user" =~ ^[A-Za-z_][A-Za-z0-9._-]*$ ]]
+}
+
+kj_ssh_read_host_port() {
+	local host_prompt="$1"
+	local port_prompt="$2"
+	local default_port="${3:-22}"
+
+	while true; do
+		read -e -p "$host_prompt" KJ_SSH_HOST
+		if kj_ssh_validate_host "$KJ_SSH_HOST"; then
+			break
+		fi
+		echo "错误: 请输入有效的服务器地址。"
+	done
+
+	while true; do
+		read -e -p "$port_prompt" KJ_SSH_PORT
+		KJ_SSH_PORT=${KJ_SSH_PORT:-$default_port}
+		if kj_ssh_validate_port "$KJ_SSH_PORT"; then
+			break
+		fi
+		echo "错误: 端口必须是 1-65535 之间的数字。"
+	done
+}
+
+kj_ssh_read_host_user_port() {
+	local host_prompt="$1"
+	local user_prompt="$2"
+	local port_prompt="$3"
+	local default_user="${4:-root}"
+	local default_port="${5:-22}"
+
+	kj_ssh_read_host_port "$host_prompt" "$port_prompt" "$default_port"
+
+	while true; do
+		read -e -p "$user_prompt" KJ_SSH_USER
+		KJ_SSH_USER=${KJ_SSH_USER:-$default_user}
+		if kj_ssh_validate_user "$KJ_SSH_USER"; then
+			break
+		fi
+		echo "错误: 用户名格式不正确。"
+	done
+}
+
+kj_ssh_parse_remote() {
+	local remote_raw="$1"
+	local default_user="${2:-root}"
+	local remote_user remote_host
+
+	if [[ "$remote_raw" == *@* ]]; then
+		remote_user="${remote_raw%@*}"
+		remote_host="${remote_raw#*@}"
+	else
+		remote_user="$default_user"
+		remote_host="$remote_raw"
+	fi
+
+	if ! kj_ssh_validate_user "$remote_user"; then
+		echo "错误: SSH 用户名格式不正确。"
+		return 1
+	fi
+
+	if ! kj_ssh_validate_host "$remote_host"; then
+		echo "错误: SSH 主机地址格式不正确。"
+		return 1
+	fi
+
+	KJ_SSH_USER="$remote_user"
+	KJ_SSH_HOST="$remote_host"
+	KJ_SSH_REMOTE="$remote_user@$remote_host"
+}
+
+kj_ssh_read_auth() {
+	local key_file="$1"
+	local password_or_key=""
+
+	echo "请选择身份验证方式:"
+	echo "1. 密码"
+	echo "2. 密钥"
+	read -e -p "请输入选择 (1/2): " auth_choice
+
+	case $auth_choice in
+		1)
+			read -s -p "请输入密码: " password_or_key
+			echo
+			if [ -z "$password_or_key" ]; then
+				echo "错误: 密码不能为空。"
+				return 1
+			fi
+			KJ_SSH_AUTH_METHOD="password"
+			KJ_SSH_AUTH_SECRET="$password_or_key"
+			;;
+		2)
+			echo "请粘贴密钥内容 (粘贴完成后按两次回车)："
+			while IFS= read -r line; do
+				if [[ -z "$line" && "$password_or_key" == *"-----BEGIN"* ]]; then
+					break
+				fi
+				if [[ -n "$line" || "$password_or_key" == *"-----BEGIN"* ]]; then
+					password_or_key+="${line}"$'\n'
+				fi
+			done
+
+			if [[ "$password_or_key" != *"-----BEGIN"* || "$password_or_key" != *"PRIVATE KEY-----"* ]]; then
+				echo "无效的密钥内容！"
+				return 1
+			fi
+
+			mkdir -p "$(dirname "$key_file")"
+			echo -n "$password_or_key" > "$key_file"
+			chmod 600 "$key_file"
+			KJ_SSH_AUTH_METHOD="key"
+			KJ_SSH_AUTH_SECRET="$key_file"
+			;;
+		*)
+			echo "无效的选择！"
+			return 1
+			;;
+	esac
+}
+
+kj_ssh_read_password() {
+	local prompt="${1:-请输入密码: }"
+	while true; do
+		read -e -s -p "$prompt" KJ_SSH_PASSWORD
+		echo
+		[ -n "$KJ_SSH_PASSWORD" ] && break
+		echo "错误: 密码不能为空。"
+	done
+}
+
+kj_ssh_read_port() {
+	local port_prompt="$1"
+	local default_port="${2:-22}"
+	while true; do
+		read -e -p "$port_prompt" KJ_SSH_PORT
+		KJ_SSH_PORT=${KJ_SSH_PORT:-$default_port}
+		if kj_ssh_validate_port "$KJ_SSH_PORT"; then
+			return 0
+		fi
+		echo "错误: 端口必须是 1-65535 之间的数字。"
+	done
+}
+
 # 显示连接列表
 list_connections() {
 	echo "已保存的连接:"
@@ -6757,51 +6915,13 @@ add_connection() {
 	echo "  - 端口: 22"
 	echo "------------------------"
 	read -e -p "请输入连接名称: " name
-	read -e -p "请输入IP地址: " ip
-	read -e -p "请输入用户名 (默认: root): " user
-	local user=${user:-root}  # 如果用户未输入，则使用默认值 root
-	read -e -p "请输入端口号 (默认: 22): " port
-	local port=${port:-22}  # 如果用户未输入，则使用默认值 22
 
-	echo "请选择身份验证方式:"
-	echo "1. 密码"
-	echo "2. 密钥"
-	read -e -p "请输入选择 (1/2): " auth_choice
+	kj_ssh_read_host_user_port "请输入IP地址: " "请输入用户名 (默认: root): " "请输入端口号 (默认: 22): " "root" "22"
+	if ! kj_ssh_read_auth "$KEY_DIR/$name.key"; then
+		return
+	fi
 
-	case $auth_choice in
-		1)
-			read -s -p "请输入密码: " password_or_key
-			echo  # 换行
-			;;
-		2)
-			echo "请粘贴密钥内容 (粘贴完成后按两次回车)："
-			local password_or_key=""
-			while IFS= read -r line; do
-				# 如果输入为空行且密钥内容已经包含了开头，则结束输入
-				if [[ -z "$line" && "$password_or_key" == *"-----BEGIN"* ]]; then
-					break
-				fi
-				# 如果是第一行或已经开始输入密钥内容，则继续添加
-				if [[ -n "$line" || "$password_or_key" == *"-----BEGIN"* ]]; then
-					local password_or_key+="${line}"$'\n'
-				fi
-			done
-
-			# 检查是否是密钥内容
-			if [[ "$password_or_key" == *"-----BEGIN"* && "$password_or_key" == *"PRIVATE KEY-----"* ]]; then
-				local key_file="$KEY_DIR/$name.key"
-				echo -n "$password_or_key" > "$key_file"
-				chmod 600 "$key_file"
-				local password_or_key="$key_file"
-			fi
-			;;
-		*)
-			echo "无效的选择！"
-			return
-			;;
-	esac
-
-	echo "$name|$ip|$user|$port|$password_or_key" >> "$CONFIG_FILE"
+	echo "$name|$KJ_SSH_HOST|$KJ_SSH_USER|$KJ_SSH_PORT|$KJ_SSH_AUTH_SECRET" >> "$CONFIG_FILE"
 	echo "连接已保存!"
 }
 
@@ -7134,52 +7254,23 @@ add_task() {
 	read -e -p "请输入任务名称: " name
 	read -e -p "请输入本地目录: " local_path
 	read -e -p "请输入远程目录: " remote_path
-	read -e -p "请输入远程用户@IP: " remote
-	read -e -p "请输入 SSH 端口 (默认 22): " port
-	port=${port:-22}
 
-	echo "请选择身份验证方式:"
-	echo "1. 密码"
-	echo "2. 密钥"
-	read -e -p "请选择 (1/2): " auth_choice
+	while true; do
+		read -e -p "请输入远程用户@IP: " remote
+		if kj_ssh_parse_remote "$remote" "root"; then
+			remote="$KJ_SSH_REMOTE"
+			break
+		fi
+	done
 
-	case $auth_choice in
-		1)
-			read -s -p "请输入密码: " password_or_key
-			echo  # 换行
-			auth_method="password"
-			;;
-		2)
-			echo "请粘贴密钥内容 (粘贴完成后按两次回车)："
-			local password_or_key=""
-			while IFS= read -r line; do
-				# 如果输入为空行且密钥内容已经包含了开头，则结束输入
-				if [[ -z "$line" && "$password_or_key" == *"-----BEGIN"* ]]; then
-					break
-				fi
-				# 如果是第一行或已经开始输入密钥内容，则继续添加
-				if [[ -n "$line" || "$password_or_key" == *"-----BEGIN"* ]]; then
-					password_or_key+="${line}"$'\n'
-				fi
-			done
+	kj_ssh_read_port "请输入 SSH 端口 (默认 22): " "22"
+	port="$KJ_SSH_PORT"
 
-			# 检查是否是密钥内容
-			if [[ "$password_or_key" == *"-----BEGIN"* && "$password_or_key" == *"PRIVATE KEY-----"* ]]; then
-				local key_file="$KEY_DIR/${name}_sync.key"
-				echo -n "$password_or_key" > "$key_file"
-				chmod 600 "$key_file"
-				password_or_key="$key_file"
-				auth_method="key"
-			else
-				echo "无效的密钥内容！"
-				return
-			fi
-			;;
-		*)
-			echo "无效的选择！"
-			return
-			;;
-	esac
+	if ! kj_ssh_read_auth "$KEY_DIR/${name}_sync.key"; then
+		return
+	fi
+	auth_method="$KJ_SSH_AUTH_METHOD"
+	password_or_key="$KJ_SSH_AUTH_SECRET"
 
 	echo "请选择同步模式:"
 	echo "1. 标准模式 (-avz)"
@@ -7197,6 +7288,7 @@ add_task() {
 
 	echo "任务已保存!"
 }
+
 
 # 删除任务
 delete_task() {
@@ -8137,10 +8229,10 @@ docker_ssh_migration() {
 		read -e -p  "请输入要迁移的备份目录: " BACKUP_DIR
 		[[ ! -d "$BACKUP_DIR" ]] && { echo -e "${gl_hong}备份目录不存在${gl_bai}"; return; }
 
-		read -e -p  "目标服务器IP: " TARGET_IP
-		read -e -p  "目标服务器SSH用户名: " TARGET_USER
-		read -e -p "目标服务器SSH端口 [默认22]: " TARGET_PORT
-		local TARGET_PORT=${TARGET_PORT:-22}
+		kj_ssh_read_host_user_port "目标服务器IP: " "目标服务器SSH用户名 [默认root]: " "目标服务器SSH端口 [默认22]: " "root" "22"
+		local TARGET_IP="$KJ_SSH_HOST"
+		local TARGET_USER="$KJ_SSH_USER"
+		local TARGET_PORT="$KJ_SSH_PORT"
 
 		local LATEST_TAR="$BACKUP_DIR"
 
@@ -9604,13 +9696,9 @@ linux_ldnmp() {
 		read -e -p "要传送备份数据到远程服务器吗？(Y/N): " choice
 		case "$choice" in
 		  [Yy])
-			read -e -p "请输入远端服务器IP:  " remote_ip
-			read -e -p "目标服务器SSH端口 [默认22]: " TARGET_PORT
-			local TARGET_PORT=${TARGET_PORT:-22}
-			if [ -z "$remote_ip" ]; then
-			  echo "错误: 请输入远端服务器IP。"
-			  continue
-			fi
+			kj_ssh_read_host_port "请输入远端服务器IP:  " "目标服务器SSH端口 [默认22]: " "22"
+			local remote_ip="$KJ_SSH_HOST"
+			local TARGET_PORT="$KJ_SSH_PORT"
 			local latest_tar=$(ls -t /home/*.tar.gz | head -1)
 			if [ -n "$latest_tar" ]; then
 			  ssh-keygen -f "/root/.ssh/known_hosts" -R "$remote_ip"
@@ -9956,18 +10044,20 @@ moltbot_menu() {
 		echo "--------------------"
 		echo "4.  状态日志查看"
 		echo "5.  换模型"
-		echo "6.  加新模型API"
+		echo "6.  API管理"
 		echo "7.  机器人连接对接"
-		echo "8.  安装插件（如：飞书）"
-		echo "9.  安装技能（skills）"
+		echo "8.  插件管理（安装/删除）"
+		echo "9.  技能管理（安装/删除）"
 		echo "10. 编辑主配置文件"
 		echo "11. 配置向导"
 		echo "12. 健康检测与修复"
 		echo "13. WebUI访问与设置"
 		echo "14. TUI命令行对话窗口"
+		echo "15. 记忆/Memory"
 		echo "--------------------"
-		echo "15. 更新"
-		echo "16. 卸载"
+		echo "16. 备份与还原"
+		echo "17. 更新"
+		echo "18. 卸载"
 		echo "--------------------"
 		echo "0. 返回上一级选单"
 		echo "--------------------"
@@ -10027,6 +10117,359 @@ with open(path, 'w', encoding='utf-8') as f:
 PY
 	}
 
+
+	sync_openclaw_api_models() {
+		local config_file="${HOME}/.openclaw/openclaw.json"
+
+		[ ! -f "$config_file" ] && return 0
+
+		install jq curl >/dev/null 2>&1
+
+		python3 - "$config_file" "$ENABLE_STATS" "$sh_v" <<'PY'
+import copy
+import json
+import os
+import platform
+import sys
+import time
+import urllib.request
+from datetime import datetime, timezone
+
+path = sys.argv[1]
+stats_enabled = (sys.argv[2].lower() == "true") if len(sys.argv) > 2 else True
+script_version = sys.argv[3] if len(sys.argv) > 3 else ""
+
+def send_stat(action):
+    if not stats_enabled:
+        return
+    payload = {
+        "action": action,
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        "country": "",
+        "os_info": platform.platform(),
+        "cpu_arch": platform.machine(),
+        "version": script_version,
+    }
+    try:
+        req = urllib.request.Request(
+            "https://api.kejilion.pro/api/log",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=3):
+            pass
+    except Exception:
+        pass
+
+with open(path, 'r', encoding='utf-8') as f:
+    obj = json.load(f)
+
+work = copy.deepcopy(obj)
+models_cfg = work.setdefault('models', {})
+providers = models_cfg.get('providers', {})
+if not isinstance(providers, dict) or not providers:
+    print('ℹ️ 未检测到 API providers，跳过模型同步')
+    raise SystemExit(0)
+
+agents = work.setdefault('agents', {})
+defaults = agents.setdefault('defaults', {})
+defaults_models_raw = defaults.get('models')
+if isinstance(defaults_models_raw, dict):
+    defaults_models = defaults_models_raw
+elif isinstance(defaults_models_raw, list):
+    defaults_models = {str(x): {} for x in defaults_models_raw if isinstance(x, str)}
+else:
+    defaults_models = {}
+defaults['models'] = defaults_models
+
+SUPPORTED_APIS = {'openai-completions', 'openai-responses'}
+
+changed = False
+fatal_errors = []
+summary = []
+
+
+def model_ref(provider_name, model_id):
+    return f"{provider_name}/{model_id}"
+
+
+def get_primary_ref(defaults_obj):
+    model_obj = defaults_obj.get('model')
+    if isinstance(model_obj, str):
+        return model_obj
+    if isinstance(model_obj, dict):
+        primary = model_obj.get('primary')
+        if isinstance(primary, str):
+            return primary
+    return None
+
+
+def set_primary_ref(defaults_obj, new_ref):
+    model_obj = defaults_obj.get('model')
+    if isinstance(model_obj, str):
+        defaults_obj['model'] = new_ref
+    elif isinstance(model_obj, dict):
+        model_obj['primary'] = new_ref
+    else:
+        defaults_obj['model'] = {'primary': new_ref}
+
+
+def ref_provider(ref):
+    if not isinstance(ref, str) or '/' not in ref:
+        return None
+    return ref.split('/', 1)[0]
+
+
+def collect_available_refs(exclude_provider=None):
+    refs = []
+    if not isinstance(providers, dict):
+        return refs
+    for pname, p in providers.items():
+        if exclude_provider and pname == exclude_provider:
+            continue
+        if not isinstance(p, dict):
+            continue
+        for m in p.get('models', []) or []:
+            if isinstance(m, dict) and m.get('id'):
+                refs.append(model_ref(pname, str(m['id'])))
+    return refs
+
+
+def prompt_delete_provider(name):
+    prompt = f"⚠️ {name} /models 探测连续失败 3 次。是否删除该 API 供应商及其全部相关模型？[y/N]: "
+    try:
+        ans = input(prompt).strip().lower()
+    except EOFError:
+        return False
+    return ans in ('y', 'yes')
+
+
+def rebind_defaults_before_delete(name):
+    global changed
+
+    replacement = None
+
+    def get_replacement():
+        nonlocal replacement
+        if replacement is None:
+            candidates = collect_available_refs(exclude_provider=name)
+            replacement = candidates[0] if candidates else None
+        return replacement
+
+    primary_ref = get_primary_ref(defaults)
+    if ref_provider(primary_ref) == name:
+        repl = get_replacement()
+        if not repl:
+            summary.append(f'❌ {name}: 默认主模型指向该 provider，但无可用替代模型，已中止删除')
+            return False
+        set_primary_ref(defaults, repl)
+        changed = True
+        summary.append(f'🔁 删除前已切换默认主模型: {primary_ref} -> {repl}')
+
+    for fk in ('modelFallback', 'imageModelFallback'):
+        val = defaults.get(fk)
+        if ref_provider(val) == name:
+            repl = get_replacement()
+            if not repl:
+                summary.append(f'❌ {name}: {fk} 指向该 provider，但无可用替代模型，已中止删除')
+                return False
+            defaults[fk] = repl
+            changed = True
+            summary.append(f'🔁 删除前已切换 {fk}: {val} -> {repl}')
+
+    return True
+
+
+def delete_provider_and_refs(name):
+    global changed
+
+    if not rebind_defaults_before_delete(name):
+        return False
+
+    removed_refs = [r for r in list(defaults_models.keys()) if r.startswith(name + '/')]
+    for r in removed_refs:
+        defaults_models.pop(r, None)
+    if removed_refs:
+        changed = True
+
+    if name in providers:
+        providers.pop(name, None)
+        changed = True
+
+    summary.append(f'🗑️ 已删除 provider {name}，并移除 defaults.models 下 {len(removed_refs)} 个模型引用')
+    return True
+
+
+def fetch_remote_models_with_retry(name, base_url, api_key, retries=3):
+    last_error = None
+    for attempt in range(1, retries + 1):
+        req = urllib.request.Request(
+            base_url.rstrip('/') + '/models',
+            headers={
+                'Authorization': f'Bearer {api_key}',
+                'User-Agent': 'Mozilla/5.0',
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                payload = resp.read().decode('utf-8', 'ignore')
+            data = json.loads(payload)
+            return data, None, attempt
+        except Exception as e:
+            last_error = e
+            if attempt < retries:
+                time.sleep(1)
+    return None, last_error, retries
+
+
+for name, provider in list(providers.items()):
+    if not isinstance(provider, dict):
+        summary.append(f'ℹ️ 跳过 {name}: provider 结构非法')
+        continue
+
+    api = provider.get('api', '')
+    base_url = provider.get('baseUrl')
+    api_key = provider.get('apiKey')
+    model_list = provider.get('models', [])
+
+    if not base_url or not api_key or not isinstance(model_list, list) or not model_list:
+        summary.append(f'ℹ️ 跳过 {name}: 无 baseUrl/apiKey/models')
+        continue
+
+    if api not in SUPPORTED_APIS:
+        summary.append(f'🔁 {name}: 发现非法协议 {api or "(unset)"}，将重新探测')
+        provider['api'] = ''
+        api = ''
+        changed = True
+
+    data, err, attempts = fetch_remote_models_with_retry(name, base_url, api_key, retries=3)
+    if err is not None:
+        summary.append(f'⚠️ {name}: /models 探测失败，已重试 {attempts} 次 ({type(err).__name__}: {err})')
+        send_stat('OpenClaw API确认介入')
+        if prompt_delete_provider(name):
+            deleted = delete_provider_and_refs(name)
+            if deleted:
+                send_stat('OpenClaw API删失败Provider-确认')
+                summary.append(f'✅ {name}: 用户已确认删除该 provider 及全部相关模型引用')
+        else:
+            send_stat('OpenClaw API删失败Provider-拒绝')
+            summary.append(f'ℹ️ {name}: 用户未确认删除，保留现有 provider 配置')
+        continue
+
+    if attempts > 1:
+        summary.append(f'🔁 {name}: /models 第 {attempts} 次重试后成功')
+
+    if not (isinstance(data, dict) and isinstance(data.get('data'), list)):
+        summary.append(f'⚠️ 跳过 {name}: /models 返回结构不可识别')
+        continue
+
+    remote_ids = []
+    for item in data['data']:
+        if isinstance(item, dict) and item.get('id'):
+            remote_ids.append(str(item['id']))
+    remote_set = set(remote_ids)
+
+    if not remote_set:
+        fatal_errors.append(f'❌ {name} 上游 /models 为空，无法为该 provider 提供兜底模型')
+        continue
+
+    local_models = [m for m in model_list if isinstance(m, dict) and m.get('id')]
+    local_ids = [str(m['id']) for m in local_models]
+    local_set = set(local_ids)
+
+    template = None
+    for m in local_models:
+        template = copy.deepcopy(m)
+        break
+    if template is None:
+        summary.append(f'⚠️ 跳过 {name}: 本地 models 无有效模板模型')
+        continue
+
+    removed_ids = [mid for mid in local_ids if mid not in remote_set]
+    added_ids = [mid for mid in remote_ids if mid not in local_set]
+
+    if added_ids:
+        summary.append(f'➕ 新增模型({len(added_ids)}):')
+        for mid in added_ids:
+            summary.append(f'  + {mid}')
+    if removed_ids:
+        summary.append(f'➖ 删除模型({len(removed_ids)}):')
+        for mid in removed_ids:
+            summary.append(f'  - {mid}')
+
+    kept_models = [copy.deepcopy(m) for m in local_models if str(m['id']) in remote_set]
+    new_models = kept_models[:]
+
+    for mid in added_ids:
+        nm = copy.deepcopy(template)
+        nm['id'] = mid
+        if isinstance(nm.get('name'), str):
+            nm['name'] = f'{name} / {mid}'
+        new_models.append(nm)
+
+    if not new_models:
+        fatal_errors.append(f'❌ {name} 同步后无可用模型，无法保障默认模型/回退模型兜底')
+        continue
+
+    expected_refs = {model_ref(name, str(m['id'])) for m in new_models if isinstance(m, dict) and m.get('id')}
+    local_refs = {model_ref(name, mid) for mid in local_ids}
+
+    first_ref = model_ref(name, str(new_models[0]['id']))
+
+    primary_ref = get_primary_ref(defaults)
+    if isinstance(primary_ref, str) and primary_ref in (local_refs - expected_refs):
+        set_primary_ref(defaults, first_ref)
+        changed = True
+        summary.append(f'🔁 默认模型已兜底替换: {primary_ref} -> {first_ref}')
+
+    for fk in ('modelFallback', 'imageModelFallback'):
+        val = defaults.get(fk)
+        if isinstance(val, str) and val in (local_refs - expected_refs):
+            defaults[fk] = first_ref
+            changed = True
+            summary.append(f'🔁 {fk} 已兜底替换: {val} -> {first_ref}')
+
+    stale_refs = [r for r in list(defaults_models.keys()) if r.startswith(name + '/') and r not in expected_refs]
+    for r in stale_refs:
+        defaults_models.pop(r, None)
+        changed = True
+
+    for r in sorted(expected_refs):
+        if r not in defaults_models:
+            defaults_models[r] = {}
+            changed = True
+
+    if removed_ids or added_ids or len(local_models) != len(new_models):
+        provider['models'] = new_models
+        changed = True
+
+    summary.append(f'✅ {name}: 删除 {len(removed_ids)} 个，新增 {len(added_ids)} 个，当前 {len(new_models)} 个')
+
+if fatal_errors:
+    for line in summary:
+        print(line)
+    for err in fatal_errors:
+        print(err)
+    print('❌ 模型同步失败：存在 provider 同步后无可用模型，已中止写入')
+    raise SystemExit(2)
+
+if changed:
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(work, f, ensure_ascii=False, indent=2)
+        f.write('\n')
+    for line in summary:
+        print(line)
+    print('✅ OpenClaw API 模型一致性同步完成并已写入配置')
+else:
+    for line in summary:
+        print(line)
+    print('ℹ️ 无需同步：配置已与上游 /models 保持一致')
+PY
+	}
+
+
+
 	install_moltbot() {
 		echo "开始安装 OpenClaw..."
 		send_stats "开始安装 OpenClaw..."
@@ -10038,12 +10481,13 @@ PY
 			npm config set registry https://registry.npmmirror.com
 		fi
 
-		git config --global url."${gh_https_url}github.com/".insteadOf ssh://git@github.com/
-		git config --global url."${gh_https_url}github.com/".insteadOf git@github.com:
+		git config --global url."${gh_proxy}github.com/".insteadOf ssh://git@github.com/
+		git config --global url."${gh_proxy}github.com/".insteadOf git@github.com:
 
 		npm install -g openclaw@latest
 		openclaw onboard --install-daemon
-		sed -i 's|"profile": "messaging"|"profile": "full"|g' ~/.openclaw/openclaw.json
+		openclaw config set tools.profile full
+		# 提示：修改配置后如需立即生效，可重启 gateway：openclaw gateway restart
 		configure_openclaw_session_policy
 		start_gateway
 		add_app_id
@@ -10080,6 +10524,9 @@ PY
 
 
 
+	# OpenClaw API 协议探测逻辑已移除：不再自动探测/判定 API 类型。
+	# 说明：API 类型由用户显式配置（models.providers.<name>.api），脚本不再尝试调用 /responses 做推断。
+
 	# 核心函数：获取并添加所有模型
 	add-all-models-from-provider() {
 		local provider_name="$1"
@@ -10088,6 +10535,9 @@ PY
 		local config_file="${HOME}/.openclaw/openclaw.json"
 
 		echo "🔍 正在获取 $provider_name 的所有可用模型..."
+
+		# 不再自动探测/纠正 API 协议；保持用户配置为准
+		DETECTED_API="openai-completions"
 
 		# 获取模型列表
 		local models_json=$(curl -s -m 10 \
@@ -10164,10 +10614,11 @@ EOF
 		# 备份配置
 		[[ -f "$config_file" ]] && cp "$config_file" "${config_file}.bak.$(date +%s)"
 
-		# 使用jq注入所有模型
+		# 使用jq注入所有模型，并同步 defaults.models
 		jq --arg prov "$provider_name" \
 		   --arg url "$base_url" \
 		   --arg key "$api_key" \
+		   --arg api "$DETECTED_API" \
 		   --argjson models "$models_array" \
 		'
 		.models |= (
@@ -10176,9 +10627,25 @@ EOF
 			| .providers[$prov] = {
 				baseUrl: $url,
 				apiKey: $key,
-				api: "openai-completions",
+				api: $api,
 				models: $models
 			}
+		)
+		| .agents |= (. // {})
+		| .agents.defaults |= (. // {})
+		| .agents.defaults.models |= (
+			(if type == "object" then .
+			 elif type == "array" then reduce .[] as $m ({}; if ($m|type) == "string" then .[$m] = {} else . end)
+			 else {}
+			 end) as $existing
+			| reduce ($models[]? | .id? // empty | tostring) as $mid (
+				$existing;
+				if ($mid | length) > 0 then
+					.["\($prov)/\($mid)"] //= {}
+				else
+					.
+				end
+			)
 		)
 		' "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
 
@@ -10193,7 +10660,7 @@ EOF
 	}
 
 	add-openclaw-provider-interactive() {
-		send_stats "添加API"
+		send_stats "OpenClaw API添加"
 		echo "=== 交互式添加 OpenClaw Provider (全量模型) ==="
 
 		# 1. Provider 名称
@@ -10220,7 +10687,9 @@ EOF
 			echo
 		done
 
-		# 4. 获取模型列表
+		# 4. 不再探测/判断 API 类型；协议由用户自行选择与维护
+
+		# 5. 获取模型列表
 		echo "🔍 正在获取可用模型列表..."
 		models_json=$(curl -s -m 10 \
 			-H "Authorization: Bearer $api_key" \
@@ -10235,10 +10704,10 @@ EOF
 				echo "--------------------------------"
 				# 全部显示，带序号
 				i=1
-				declare -A model_map
+				model_list=()
 				while read -r model; do
 					echo "[$i] $model"
-					model_map[$i]="$model"
+					model_list+=("$model")
 					((i++))
 				done <<< "$available_models"
 				echo "--------------------------------"
@@ -10252,8 +10721,8 @@ EOF
 		if [[ -z "$input_model" && -n "$available_models" ]]; then
 			default_model=$(echo "$available_models" | head -1)
 			echo "🎯 使用第一个模型: $default_model"
-		elif [[ -n "${model_map[$input_model]}" ]]; then
-			default_model="${model_map[$input_model]}"
+		elif [[ "$input_model" =~ ^[0-9]+$ ]] && [ "${#model_list[@]}" -gt 0 ] && [ "$input_model" -ge 1 ] && [ "$input_model" -le "${#model_list[@]}" ]; then
+			default_model="${model_list[$((input_model-1))]}"
 			echo "🎯 已选择模型: $default_model"
 		else
 			default_model="$input_model"
@@ -10284,59 +10753,951 @@ EOF
 			openclaw models set "$provider_name/$default_model"
 			start_gateway
 			echo "✅ 完成！所有 $model_count 个模型已加载"
+			echo "✅ 已自动识别协议为: $DETECTED_API"
 		fi
 
 		break_end
 	}
 
 
+	
+openclaw_api_manage_list() {
+	local config_file="${HOME}/.openclaw/openclaw.json"
+	send_stats "OpenClaw API列表"
 
-	change_model() {
-		send_stats "换模型"
+	while IFS=$'\t' read -r rec_type idx name base_url model_count api_type latency_txt latency_level; do
+		case "$rec_type" in
+			MSG)
+				echo "$idx"
+				;;
+			ROW)
+				local latency_color="$gl_bai"
+				case "$latency_level" in
+					low) latency_color="$gl_lv" ;;
+					medium) latency_color="$gl_huang" ;;
+					high|unavailable) latency_color="$gl_hong" ;;
+					unchecked) latency_color="$gl_bai" ;;
+				esac
 
+				printf '%b\n' "[$idx] ${name} | API: ${base_url} | 协议: ${api_type} | 模型数量: ${gl_huang}${model_count}${gl_bai} | 延迟/状态: ${latency_color}${latency_txt}${gl_bai}"
+				;;
+		esac
+	done < <(python3 - "$config_file" <<-'PY'
+import json
+import sys
+import time
+import urllib.request
+
+path = sys.argv[1]
+SUPPORTED_APIS = {'openai-completions', 'openai-responses'}
+
+
+def ping_models(base_url, api_key):
+    req = urllib.request.Request(
+        base_url.rstrip('/') + '/models',
+        headers={
+            'Authorization': f'Bearer {api_key}',
+            'User-Agent': 'OpenClaw-API-Manage/1.0',
+        },
+    )
+    start = time.perf_counter()
+    with urllib.request.urlopen(req, timeout=4) as resp:
+        resp.read(2048)
+    return int((time.perf_counter() - start) * 1000)
+
+
+def classify_latency(latency):
+    if latency == '不可用':
+        return '不可用', 'unavailable'
+    if latency == '未检测':
+        return '未检测', 'unchecked'
+    if isinstance(latency, int):
+        if latency <= 800:
+            level = 'low'
+        elif latency <= 2000:
+            level = 'medium'
+        else:
+            level = 'high'
+        return f'{latency}ms', level
+    return str(latency), 'unchecked'
+
+
+try:
+    with open(path, 'r', encoding='utf-8') as f:
+        obj = json.load(f)
+except FileNotFoundError:
+    print('MSG\tℹ️ 未找到 openclaw.json，请先完成安装/初始化。')
+    raise SystemExit(0)
+except Exception as e:
+    print(f'MSG\t❌ 读取配置失败: {type(e).__name__}: {e}')
+    raise SystemExit(0)
+
+providers = ((obj.get('models') or {}).get('providers') or {})
+if not isinstance(providers, dict) or not providers:
+    print('MSG\tℹ️ 当前未配置任何 API provider。')
+    raise SystemExit(0)
+
+print('MSG\t--- 已配置 API 列表 ---')
+
+for idx, name in enumerate(sorted(providers.keys()), start=1):
+    provider = providers.get(name)
+    if not isinstance(provider, dict):
+        base_url = '-'
+        model_count = 0
+        latency_raw = '不可用'
+    else:
+        base_url = provider.get('baseUrl') or provider.get('url') or provider.get('endpoint') or '-'
+        models = provider.get('models') if isinstance(provider.get('models'), list) else []
+        model_count = sum(1 for m in models if isinstance(m, dict) and m.get('id'))
+        api = provider.get('api', '')
+        api_key = provider.get('apiKey')
+
+        latency_raw = '未检测'
+        if api in SUPPORTED_APIS:
+            if isinstance(base_url, str) and base_url != '-' and isinstance(api_key, str) and api_key:
+                try:
+                    latency_raw = ping_models(base_url, api_key)
+                except Exception:
+                    latency_raw = '不可用'
+            else:
+                latency_raw = '不可用'
+
+    latency_text, latency_level = classify_latency(latency_raw)
+    api_label = api if api in SUPPORTED_APIS else '-'
+    print(
+        'ROW\t' + '\t'.join([
+            str(idx),
+            str(name),
+            str(base_url),
+            str(model_count),
+            str(api_label),
+            str(latency_text),
+            str(latency_level),
+        ])
+    )
+PY
+)
+}
+sync-openclaw-provider-interactive() {
+	local config_file="${HOME}/.openclaw/openclaw.json"
+	send_stats "OpenClaw API按Provider同步"
+
+	if [ ! -f "$config_file" ]; then
+		echo "❌ 未找到配置文件: $config_file"
+		break_end
+		return 1
+	fi
+
+	read -erp "请输入要同步的 API 名称(provider): " provider_name
+	if [ -z "$provider_name" ]; then
+		echo "❌ provider 名称不能为空"
+		break_end
+		return 1
+	fi
+
+	install jq curl >/dev/null 2>&1
+
+	python3 - "$config_file" "$provider_name" <<'PY2'
+import copy
+import json
+import sys
+import time
+import urllib.request
+
+path = sys.argv[1]
+target = sys.argv[2]
+SUPPORTED_APIS = {'openai-completions', 'openai-responses'}
+
+with open(path, 'r', encoding='utf-8') as f:
+    obj = json.load(f)
+
+work = copy.deepcopy(obj)
+models_cfg = work.setdefault('models', {})
+providers = models_cfg.get('providers', {})
+if not isinstance(providers, dict) or not providers:
+    print('❌ 未检测到 API providers，无法同步')
+    raise SystemExit(2)
+
+provider = providers.get(target)
+if not isinstance(provider, dict):
+    print(f'❌ 未找到 provider: {target}')
+    raise SystemExit(2)
+
+agents = work.setdefault('agents', {})
+defaults = agents.setdefault('defaults', {})
+defaults_models_raw = defaults.get('models')
+if isinstance(defaults_models_raw, dict):
+    defaults_models = defaults_models_raw
+elif isinstance(defaults_models_raw, list):
+    defaults_models = {str(x): {} for x in defaults_models_raw if isinstance(x, str)}
+else:
+    defaults_models = {}
+defaults['models'] = defaults_models
+
+
+def model_ref(provider_name, model_id):
+    return f"{provider_name}/{model_id}"
+
+
+def get_primary_ref(defaults_obj):
+    model_obj = defaults_obj.get('model')
+    if isinstance(model_obj, str):
+        return model_obj
+    if isinstance(model_obj, dict):
+        primary = model_obj.get('primary')
+        if isinstance(primary, str):
+            return primary
+    return None
+
+
+def set_primary_ref(defaults_obj, new_ref):
+    model_obj = defaults_obj.get('model')
+    if isinstance(model_obj, str):
+        defaults_obj['model'] = new_ref
+    elif isinstance(model_obj, dict):
+        model_obj['primary'] = new_ref
+    else:
+        defaults_obj['model'] = {'primary': new_ref}
+
+
+def fetch_remote_models_with_retry(base_url, api_key, retries=3):
+    last_error = None
+    for attempt in range(1, retries + 1):
+        req = urllib.request.Request(
+            base_url.rstrip('/') + '/models',
+            headers={
+                'Authorization': f'Bearer {api_key}',
+                'User-Agent': 'Mozilla/5.0',
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                payload = resp.read().decode('utf-8', 'ignore')
+            return json.loads(payload), None, attempt
+        except Exception as e:
+            last_error = e
+            if attempt < retries:
+                time.sleep(1)
+    return None, last_error, retries
+
+
+api = provider.get('api', '')
+base_url = provider.get('baseUrl')
+api_key = provider.get('apiKey')
+model_list = provider.get('models', [])
+
+if not base_url or not api_key or not isinstance(model_list, list) or not model_list:
+    print(f'❌ provider {target} 缺少 baseUrl/apiKey/models，无法执行同步')
+    raise SystemExit(3)
+
+if api not in SUPPORTED_APIS:
+    print(f'ℹ️ provider {target} 当前 api={api}，但脚本已不再探测/纠正协议；请手动设置为 openai-completions 或 openai-responses')
+
+protocol_msg = None
+
+data, err, attempts = fetch_remote_models_with_retry(base_url, api_key, retries=3)
+if err is not None:
+    print(f'❌ {target}: /models 探测失败，已重试 {attempts} 次 ({type(err).__name__}: {err})')
+    raise SystemExit(4)
+
+if not (isinstance(data, dict) and isinstance(data.get('data'), list)):
+    print(f'❌ {target}: /models 返回结构不可识别')
+    raise SystemExit(4)
+
+remote_ids = []
+for item in data['data']:
+    if isinstance(item, dict) and item.get('id'):
+        remote_ids.append(str(item['id']))
+remote_set = set(remote_ids)
+if not remote_set:
+    print(f'❌ {target}: 上游 /models 为空，已中止同步')
+    raise SystemExit(5)
+
+local_models = [m for m in model_list if isinstance(m, dict) and m.get('id')]
+local_ids = [str(m['id']) for m in local_models]
+local_set = set(local_ids)
+
+template = copy.deepcopy(local_models[0]) if local_models else None
+if template is None:
+    print(f'❌ {target}: 本地 models 无有效模板模型，无法补全新增模型')
+    raise SystemExit(3)
+
+removed_ids = [mid for mid in local_ids if mid not in remote_set]
+added_ids = [mid for mid in remote_ids if mid not in local_set]
+
+if added_ids:
+    print(f'➕ 新增模型({len(added_ids)}):')
+    for mid in added_ids:
+        print(f'  + {mid}')
+if removed_ids:
+    print(f'➖ 删除模型({len(removed_ids)}):')
+    for mid in removed_ids:
+        print(f'  - {mid}')
+
+kept_models = [copy.deepcopy(m) for m in local_models if str(m['id']) in remote_set]
+new_models = kept_models[:]
+for mid in added_ids:
+    nm = copy.deepcopy(template)
+    nm['id'] = mid
+    if isinstance(nm.get('name'), str):
+        nm['name'] = f'{target} / {mid}'
+    new_models.append(nm)
+
+if not new_models:
+    print(f'❌ {target}: 同步后无可用模型，已中止写入')
+    raise SystemExit(5)
+
+expected_refs = {model_ref(target, str(m['id'])) for m in new_models if isinstance(m, dict) and m.get('id')}
+local_refs = {model_ref(target, mid) for mid in local_ids}
+removed_refs = local_refs - expected_refs
+first_ref = model_ref(target, str(new_models[0]['id']))
+
+changed = False
+primary_ref = get_primary_ref(defaults)
+if isinstance(primary_ref, str) and primary_ref in removed_refs:
+    set_primary_ref(defaults, first_ref)
+    changed = True
+    print(f'🔁 默认模型已兜底替换: {primary_ref} -> {first_ref}')
+
+for fk in ('modelFallback', 'imageModelFallback'):
+    val = defaults.get(fk)
+    if isinstance(val, str) and val in removed_refs:
+        defaults[fk] = first_ref
+        changed = True
+        print(f'🔁 {fk} 已兜底替换: {val} -> {first_ref}')
+
+stale_refs = [r for r in list(defaults_models.keys()) if r.startswith(target + '/') and r not in expected_refs]
+for r in stale_refs:
+    defaults_models.pop(r, None)
+    changed = True
+
+for r in sorted(expected_refs):
+    if r not in defaults_models:
+        defaults_models[r] = {}
+        changed = True
+
+if removed_ids or added_ids or len(local_models) != len(new_models):
+    provider['models'] = new_models
+    changed = True
+
+
+if changed:
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(work, f, ensure_ascii=False, indent=2)
+        f.write('\n')
+
+print(f'✅ {target}: 删除 {len(removed_ids)} 个，新增 {len(added_ids)} 个，当前 {len(new_models)} 个')
+if changed:
+    print('✅ 指定 provider 模型一致性同步完成并已写入配置')
+else:
+    print('ℹ️ 无需同步：该 provider 配置已与上游 /models 保持一致')
+PY2
+	local rc=$?
+	case "$rc" in
+		0)
+			echo "✅ 同步执行完成"
+			start_gateway
+			;;
+		2)
+			echo "❌ 同步失败：provider 不存在或未配置"
+			;;
+		3)
+			echo "❌ 同步失败：provider 配置不完整或类型不支持"
+			;;
+		4)
+			echo "❌ 同步失败：上游 /models 请求失败"
+			;;
+		5)
+			echo "❌ 同步失败：上游模型为空或同步后无可用模型"
+			;;
+		*)
+			echo "❌ 同步失败：请检查配置文件结构或日志输出"
+			;;
+	esac
+
+	break_end
+}
+
+openclaw_detect_api_protocol_by_provider() {
+	# 协议探测逻辑已移除：脚本不再自动探测/判定 API 类型。
+	# 保留函数以兼容菜单调用，但不做任何改写。
+	echo "ℹ️ 已关闭协议探测：请手动在 ~/.openclaw/openclaw.json 中设置 provider.api 为 openai-completions 或 openai-responses"
+	return 0
+}
+
+fix-openclaw-provider-protocol-interactive() {
+	local config_file="${HOME}/.openclaw/openclaw.json"
+	send_stats "OpenClaw API协议切换"
+
+	if [ ! -f "$config_file" ]; then
+		echo "❌ 未找到配置文件: $config_file"
+		break_end
+		return 1
+	fi
+
+	read -erp "请输入要切换协议的 API 名称(provider): " provider_name
+	if [ -z "$provider_name" ]; then
+		echo "❌ provider 名称不能为空"
+		break_end
+		return 1
+	fi
+
+	echo "请选择要设置的 API 类型："
+	echo "1. openai-completions"
+	echo "2. openai-responses"
+	read -erp "请输入你的选择 (1/2): " proto_choice
+
+	local new_api=""
+	case "$proto_choice" in
+		1) new_api="openai-completions" ;;
+		2) new_api="openai-responses" ;;
+		*)
+			echo "❌ 无效选择"
+			break_end
+			return 1
+			;;
+	esac
+
+	install python3 >/dev/null 2>&1
+
+	python3 - "$config_file" "$provider_name" "$new_api" <<'PY'
+import copy
+import json
+import sys
+
+path = sys.argv[1]
+name = sys.argv[2]
+new_api = sys.argv[3]
+
+SUPPORTED_APIS = {'openai-completions', 'openai-responses'}
+if new_api not in SUPPORTED_APIS:
+    print('❌ 非法协议值')
+    raise SystemExit(3)
+
+with open(path, 'r', encoding='utf-8') as f:
+    obj = json.load(f)
+
+work = copy.deepcopy(obj)
+providers = ((work.get('models') or {}).get('providers') or {})
+if not isinstance(providers, dict) or name not in providers or not isinstance(providers.get(name), dict):
+    print(f'❌ 未找到 provider: {name}')
+    raise SystemExit(2)
+
+providers[name]['api'] = new_api
+
+with open(path, 'w', encoding='utf-8') as f:
+    json.dump(work, f, ensure_ascii=False, indent=2)
+    f.write('\n')
+
+print(f'✅ 已更新 provider {name} 协议为: {new_api}')
+PY
+	local rc=$?
+	case "$rc" in
+		0)
+			start_gateway
+			;;
+		2)
+			echo "❌ 切换失败：provider 不存在或未配置"
+			;;
+		3)
+			echo "❌ 切换失败：协议值非法"
+			;;
+		*)
+			echo "❌ 切换失败：请检查配置文件结构或日志输出"
+			;;
+	esac
+
+	break_end
+}
+
+	delete-openclaw-provider-interactive() {
+		local config_file="${HOME}/.openclaw/openclaw.json"
+		send_stats "OpenClaw API删除入口"
+
+		if [ ! -f "$config_file" ]; then
+			echo "❌ 未找到配置文件: $config_file"
+			break_end
+			return 1
+		fi
+
+		read -erp "请输入要删除的 API 名称(provider): " provider_name
+		if [ -z "$provider_name" ]; then
+			send_stats "OpenClaw API删除取消"
+			echo "❌ provider 名称不能为空"
+			break_end
+			return 1
+		fi
+
+		python3 - "$config_file" "$provider_name" <<'PY'
+import copy
+import json
+import sys
+
+path = sys.argv[1]
+name = sys.argv[2]
+
+with open(path, 'r', encoding='utf-8') as f:
+    obj = json.load(f)
+
+work = copy.deepcopy(obj)
+models_cfg = work.setdefault('models', {})
+providers = models_cfg.get('providers', {})
+if not isinstance(providers, dict) or name not in providers:
+    print(f'❌ 未找到 provider: {name}')
+    raise SystemExit(2)
+
+agents = work.setdefault('agents', {})
+defaults = agents.setdefault('defaults', {})
+defaults_models_raw = defaults.get('models')
+if isinstance(defaults_models_raw, dict):
+    defaults_models = defaults_models_raw
+elif isinstance(defaults_models_raw, list):
+    defaults_models = {str(x): {} for x in defaults_models_raw if isinstance(x, str)}
+else:
+    defaults_models = {}
+defaults['models'] = defaults_models
+
+
+def model_ref(provider_name, model_id):
+    return f"{provider_name}/{model_id}"
+
+
+def ref_provider(ref):
+    if not isinstance(ref, str) or '/' not in ref:
+        return None
+    return ref.split('/', 1)[0]
+
+
+def get_primary_ref(defaults_obj):
+    model_obj = defaults_obj.get('model')
+    if isinstance(model_obj, str):
+        return model_obj
+    if isinstance(model_obj, dict):
+        primary = model_obj.get('primary')
+        if isinstance(primary, str):
+            return primary
+    return None
+
+
+def set_primary_ref(defaults_obj, new_ref):
+    model_obj = defaults_obj.get('model')
+    if isinstance(model_obj, str):
+        defaults_obj['model'] = new_ref
+    elif isinstance(model_obj, dict):
+        model_obj['primary'] = new_ref
+    else:
+        defaults_obj['model'] = {'primary': new_ref}
+
+
+def collect_available_refs(exclude_provider=None):
+    refs = []
+    if not isinstance(providers, dict):
+        return refs
+    for pname, p in providers.items():
+        if exclude_provider and pname == exclude_provider:
+            continue
+        if not isinstance(p, dict):
+            continue
+        for m in p.get('models', []) or []:
+            if isinstance(m, dict) and m.get('id'):
+                refs.append(model_ref(pname, str(m['id'])))
+    return refs
+
+
+replacement_candidates = collect_available_refs(exclude_provider=name)
+replacement = replacement_candidates[0] if replacement_candidates else None
+
+primary_ref = get_primary_ref(defaults)
+if ref_provider(primary_ref) == name:
+    if not replacement:
+        print('❌ 删除中止：默认主模型指向该 provider，且无可用替代模型')
+        raise SystemExit(3)
+    set_primary_ref(defaults, replacement)
+    print(f'🔁 默认主模型切换: {primary_ref} -> {replacement}')
+
+for fk in ('modelFallback', 'imageModelFallback'):
+    val = defaults.get(fk)
+    if ref_provider(val) == name:
+        if not replacement:
+            print(f'❌ 删除中止：{fk} 指向该 provider，且无可用替代模型')
+            raise SystemExit(3)
+        defaults[fk] = replacement
+        print(f'🔁 {fk} 切换: {val} -> {replacement}')
+
+removed_refs = [r for r in list(defaults_models.keys()) if r.startswith(name + '/')]
+for r in removed_refs:
+    defaults_models.pop(r, None)
+
+providers.pop(name, None)
+
+with open(path, 'w', encoding='utf-8') as f:
+    json.dump(work, f, ensure_ascii=False, indent=2)
+    f.write('\n')
+
+print(f'🗑️ 已删除 provider: {name}')
+print(f'🧹 已清理 defaults.models 中 {len(removed_refs)} 个关联模型引用')
+PY
+		local rc=$?
+		case "$rc" in
+			0)
+				send_stats "OpenClaw API删除确认"
+				echo "✅ 删除完成"
+				start_gateway
+				;;
+			2)
+				echo "❌ 删除失败：provider 不存在"
+				;;
+			3)
+				send_stats "OpenClaw API删除取消"
+				echo "❌ 删除失败：无可用替代模型，已保持原配置"
+				;;
+			*)
+				echo "❌ 删除失败：请检查配置文件结构或日志输出"
+				;;
+		esac
+
+		break_end
+	}
+
+	openclaw_api_manage_menu() {
+		send_stats "OpenClaw API入口"
 		while true; do
 			clear
-			echo "--- 模型管理 ---"
-			echo "所有模型:"
-			openclaw models list --all
-			echo "----------------"
-			echo "当前模型:"
-			openclaw models list
-			echo "----------------"
-			read -e -p "请输入要设置的模型名称 (例如 openrouter/openai/gpt-4o)（输入 0 退出）： " model
+			echo "======================================="
+			echo "OpenClaw API 管理"
+			echo "======================================="
+			openclaw_api_manage_list
+			echo "---------------------------------------"
+			echo "1. 添加API"
+			echo "2. 同步API供应商模型列表"
+			echo "3. 切换 API 类型（completions / responses）"
+			echo "4. 删除API"
+			echo "0. 退出"
+			echo "---------------------------------------"
+			read -erp "请输入你的选择: " api_choice
 
-			# 1. 检查是否输入 0 以退出
-			if [ "$model" = "0" ]; then
-				echo "操作已取消，正在退出..."
-				break  # 跳出 while 循环
-
-			fi
-
-			# 2. 验证输入是否为空
-			if [ -z "$model" ]; then
-				echo "错误：模型名称不能为空。请重试。"
-				echo "" # 换行美化
-				continue # 跳过本次循环，重新开始
-			fi
-
-			# 3. 执行切换逻辑
-			echo "正在切换模型为: $model ..."
-			openclaw models set "$model"
-
-			break_end
+			case "$api_choice" in
+				1)
+					add-openclaw-provider-interactive
+					;;
+				2)
+					sync-openclaw-provider-interactive
+					;;
+				3)
+					fix-openclaw-provider-protocol-interactive
+					;;
+				4)
+					delete-openclaw-provider-interactive
+					;;
+				0)
+					return 0
+					;;
+				*)
+					echo "无效的选择，请重试。"
+					sleep 1
+					;;
+			esac
 		done
-
 	}
 
 
 
+	install_gum() {
+	    if command -v gum >/dev/null 2>&1; then
+	        return 0
+	    fi
+	    if [ -f /etc/debian_version ]; then
+	        mkdir -p /etc/apt/keyrings
+	        curl -fsSL https://repo.charm.sh/apt/gpg.key | gpg --dearmor -o /etc/apt/keyrings/charm.gpg
+	        echo "deb [signed-by=/etc/apt/keyrings/charm.gpg] https://repo.charm.sh/apt/ * *" | tee /etc/apt/sources.list.d/charm.list > /dev/null
+	        apt update && apt install -y gum
+	    elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+	        cat > /etc/yum.repos.d/charm.repo <<'REPO'
+[charm]
+name=Charm
+baseurl=https://repo.charm.sh/yum/
+enabled=1
+gpgcheck=1
+gpgkey=https://repo.charm.sh/yum/gpg.key
+REPO
+	        rpm --import https://repo.charm.sh/yum/gpg.key
+	        if command -v dnf >/dev/null 2>&1; then
+	            dnf install -y gum
+	        else
+	            yum install -y gum
+	        fi
+	    elif command -v zypper >/dev/null 2>&1; then
+	        zypper --non-interactive refresh
+	        zypper --non-interactive install gum
+	    fi
+	}
 
+
+	
+	change_model() {
+		send_stats "换模型"
+
+		local orange="#FF8C00"
+
+		clear
+
+		while true; do
+			local models_raw models_list default_model model_count selected_model
+
+			# 从配置文件读取模型键（不调用 openclaw models list）
+			local oc_config
+			oc_config="${HOME}/.openclaw/openclaw.json"
+			[ ! -f "$oc_config" ] && [ -f /root/.openclaw/openclaw.json ] && oc_config="/root/.openclaw/openclaw.json"
+
+			models_raw=$(jq -r '.agents.defaults.models | if type == "object" then keys[] else .[] end' "$oc_config" 2>/dev/null | sed '/^\s*$/d')
+			if [ -z "$models_raw" ]; then
+				echo "获取模型列表失败：配置文件中未找到 agents.defaults.models。"
+				break_end
+				return 1
+			fi
+
+			# 为每个模型加编号，便于快速定位（例如："(10) or-api/...:free"）
+			models_list=$(echo "$models_raw" | awk '{print "(" NR ") " $0}')
+			model_count=$(echo "$models_list" | sed '/^\s*$/d' | wc -l | tr -d ' ')
+
+			# 从配置文件读取默认模型（更快）；失败再回退到 openclaw 命令
+			default_model=$(jq -r '.agents.defaults.model.primary // empty' "$oc_config" 2>/dev/null)
+			[ -z "$default_model" ] && default_model="(unknown)"
+
+
+			install_gum
+			install gum
+
+			clear
+
+				# 若 gum 不存在，降级为原始手动输入流程（保持与之前完全一致）
+			if ! command -v gum >/dev/null 2>&1; then
+				echo "--- 模型管理 ---"
+				echo "当前可用模型:"
+				jq -r '.agents.defaults.models | if type == "object" then keys[] else .[] end' "$oc_config" 2>/dev/null | sed '/^\s*$/d'
+				echo "----------------"
+				read -e -p "请输入要设置的模型名称 (例如 openrouter/openai/gpt-4o)（输入 0 退出）： " selected_model
+
+				# 1. 检查是否输入 0 以退出
+				if [ "$selected_model" = "0" ]; then
+					echo "操作已取消，正在退出..."
+					break  # 跳出 while 循环
+				fi
+
+				# 2. 验证输入是否为空
+				if [ -z "$selected_model" ]; then
+					echo "错误：模型名称不能为空。请重试。"
+					echo "" # 换行美化
+					continue # 跳过本次循环，重新开始
+				fi
+			else
+				gum style --foreground "$orange" --bold "模型管理"
+				gum style --foreground "$orange" "可用模型（Auth=yes）：${model_count}"
+				gum style --foreground "$orange" "当前默认：${default_model}"
+				echo ""
+
+				# 底部提示
+				gum style --faint "↑↓ 选择 / Enter 确认 / Esc 退出"
+				echo ""
+
+				# gum filter：带搜索；gum 版本差异较大，这里只用兼容性最强的 flags
+				selected_model=$(echo "$models_list" | gum filter \
+					--placeholder "搜索模型（如 cli-api/gpt-5.2）" \
+					--prompt "选择模型 > " \
+					--indicator "➜ " \
+					--prompt.foreground "$orange" \
+					--indicator.foreground "$orange" \
+					--cursor-text.foreground "$orange" \
+					--match.foreground "$orange" \
+					--header "" \
+					--height 35)
+
+				if [ -z "$selected_model" ] || echo "$selected_model" | head -n 1 | grep -iqE '^(error|usage|gum:)'; then
+					echo "操作已取消，正在退出..."
+					break
+				fi
+			fi
+
+			# 去掉编号前缀："(10) model" -> "model"
+			selected_model=$(echo "$selected_model" | sed -E 's/^\([0-9]+\)[[:space:]]+//')
+
+			# 执行切换
+			echo "正在切换模型为: $selected_model ..."
+			if ! openclaw models set "$selected_model"; then
+				echo "切换失败：openclaw models set 返回错误。"
+				break_end
+				return 1
+			fi
+			start_gateway
+
+			break_end
+			done
+	}
+
+
+		resolve_openclaw_plugin_id() {
+			local raw_input="$1"
+			local plugin_id="$raw_input"
+
+			plugin_id="${plugin_id#@openclaw/}"
+			if [[ "$plugin_id" == @*/* ]]; then
+				plugin_id="${plugin_id##*/}"
+			fi
+			plugin_id="${plugin_id%%@*}"
+			echo "$plugin_id"
+		}
+
+		sync_openclaw_plugin_allowlist() {
+			local plugin_id="$1"
+			[ -z "$plugin_id" ] && return 1
+
+			local home_config="${HOME}/.openclaw/openclaw.json"
+			local root_config="/root/.openclaw/openclaw.json"
+			local config_file="$home_config"
+			if [ ! -f "$home_config" ] && [ -f "$root_config" ]; then
+				config_file="$root_config"
+			fi
+
+			mkdir -p "$(dirname "$config_file")"
+			if [ ! -s "$config_file" ]; then
+				echo '{}' > "$config_file"
+			fi
+
+			if command -v jq >/dev/null 2>&1; then
+				local tmp_json
+				tmp_json=$(mktemp)
+				if jq --arg pid "$plugin_id" '
+					.plugins = (if (.plugins | type) == "object" then .plugins else {} end)
+					| .plugins.allow = (if (.plugins.allow | type) == "array" then .plugins.allow else [] end)
+					| if (.plugins.allow | index($pid)) == null then .plugins.allow += [$pid] else . end
+				' "$config_file" > "$tmp_json" 2>/dev/null && mv "$tmp_json" "$config_file"; then
+					echo "✅ 已同步 plugins.allow 白名单: $plugin_id"
+					return 0
+				fi
+				rm -f "$tmp_json"
+			fi
+
+			if command -v python3 >/dev/null 2>&1; then
+				if python3 - "$config_file" "$plugin_id" <<'PYTHON_EOF'
+import json
+import sys
+from pathlib import Path
+
+config_file = Path(sys.argv[1])
+plugin_id = sys.argv[2]
+
+try:
+    data = json.loads(config_file.read_text(encoding='utf-8')) if config_file.exists() else {}
+    if not isinstance(data, dict):
+        data = {}
+except Exception:
+    data = {}
+
+plugins = data.get('plugins')
+if not isinstance(plugins, dict):
+    plugins = {}
+
+a = plugins.get('allow')
+if not isinstance(a, list):
+    a = []
+
+if plugin_id not in a:
+    a.append(plugin_id)
+
+plugins['allow'] = a
+data['plugins'] = plugins
+config_file.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding='utf-8')
+PYTHON_EOF
+				then
+					echo "✅ 已同步 plugins.allow 白名单: $plugin_id"
+					return 0
+				fi
+			fi
+
+			echo "⚠️ 已安装插件，但同步 plugins.allow 失败，请手动检查: $config_file"
+			return 1
+		}
+
+		sync_openclaw_plugin_denylist() {
+			local plugin_id="$1"
+			[ -z "$plugin_id" ] && return 1
+
+			local home_config="${HOME}/.openclaw/openclaw.json"
+			local root_config="/root/.openclaw/openclaw.json"
+			local config_file="$home_config"
+			if [ ! -f "$home_config" ] && [ -f "$root_config" ]; then
+				config_file="$root_config"
+			fi
+
+			mkdir -p "$(dirname "$config_file")"
+			if [ ! -s "$config_file" ]; then
+				echo '{}' > "$config_file"
+			fi
+
+			if command -v jq >/dev/null 2>&1; then
+				local tmp_json
+				tmp_json=$(mktemp)
+				if jq --arg pid "$plugin_id" '
+					.plugins = (if (.plugins | type) == "object" then .plugins else {} end)
+					| .plugins.allow = (if (.plugins.allow | type) == "array" then .plugins.allow else [] end)
+					| .plugins.allow = (.plugins.allow | map(select(. != $pid)))
+				' "$config_file" > "$tmp_json" 2>/dev/null && mv "$tmp_json" "$config_file"; then
+					echo "✅ 已从 plugins.allow 移除: $plugin_id"
+					return 0
+				fi
+				rm -f "$tmp_json"
+			fi
+
+			if command -v python3 >/dev/null 2>&1; then
+				if python3 - "$config_file" "$plugin_id" <<'PYTHON_EOF'
+import json
+import sys
+from pathlib import Path
+
+config_file = Path(sys.argv[1])
+plugin_id = sys.argv[2]
+
+try:
+    data = json.loads(config_file.read_text(encoding='utf-8')) if config_file.exists() else {}
+    if not isinstance(data, dict):
+        data = {}
+except Exception:
+    data = {}
+
+plugins = data.get('plugins')
+if not isinstance(plugins, dict):
+    plugins = {}
+
+a = plugins.get('allow')
+if not isinstance(a, list):
+    a = []
+
+a = [x for x in a if x != plugin_id]
+plugins['allow'] = a
+data['plugins'] = plugins
+config_file.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding='utf-8')
+PYTHON_EOF
+				then
+					echo "✅ 已从 plugins.allow 移除: $plugin_id"
+					return 0
+				fi
+			fi
+
+			echo "⚠️ plugins.allow 移除失败，请手动检查: $config_file"
+			return 1
+		}
+
+
+
+
+
+		
 		install_plugin() {
-		send_stats "安装插件"
+		send_stats "插件管理"
 		while true; do
 			clear
 			echo "========================================"
-			echo "            插件管理 (安装)            "
+			echo "            插件管理 (安装/删除)            "
 			echo "========================================"
 			echo "当前插件列表:"
 			openclaw plugins list
@@ -10362,73 +11723,110 @@ EOF
 			echo "  - [nostr]        	# 加密隐私聊天"
 			echo "--------------------------------------------------------"
 
-			read -e -p "请输入插件 ID（输入 0 退出）： " raw_input
+			echo "1) 安装/启用插件"
+			echo "2) 删除/禁用插件"
+			echo "0) 返回"
+			read -e -p "请选择操作：" plugin_action
 
+			[ "$plugin_action" = "0" ] && break
+			[ -z "$plugin_action" ] && continue
+
+			read -e -p "请输入插件 ID（空格分隔，输入 0 退出）： " raw_input
 			[ "$raw_input" = "0" ] && break
 			[ -z "$raw_input" ] && continue
 
-			# 1. 自动处理：如果用户输入带 @openclaw/，提取纯 ID 方便路径检查
-			local plugin_id=$(echo "$raw_input" | sed 's|^@openclaw/||')
-			local plugin_full="$raw_input"
+			local success_list=""
+			local failed_list=""
+			local skipped_list=""
+			local changed=false
+			local token
 
-			echo "🔍 正在检查插件状态..."
-			# 获取当前插件列表用于状态检测
-			local plugin_list=$(openclaw plugins list 2>/dev/null)
+			for token in $raw_input; do
+				local plugin_id
+				local plugin_full
+				plugin_id=$(resolve_openclaw_plugin_id "$token")
+				plugin_full="$token"
+				[ -z "$plugin_id" ] && continue
 
-			# 2. 检查是否已经在 list 中且为 disabled (最常见的情况)
-			if echo "$plugin_list" | grep -qw "$plugin_id" && echo "$plugin_list" | grep "$plugin_id" | grep -q "disabled"; then
-				echo "💡 插件 [$plugin_id] 已预装，正在激活..."
-				openclaw plugins enable "$plugin_id" && echo "✅ 激活成功" || echo "❌ 激活失败"
+				if [ "$plugin_action" = "1" ]; then
+					echo "🔍 正在检查插件状态: $plugin_id"
+					local plugin_list
+					plugin_list=$(openclaw plugins list 2>/dev/null)
 
-			# 3. 检查系统物理目录是否存在
-			elif [ -d "/usr/lib/node_modules/openclaw/extensions/$plugin_id" ]; then
-				echo "💡 发现系统内置目录存在该插件，尝试直接启用..."
-				openclaw plugins enable "$plugin_id"
-
-			else
-				# 4. 远程安装逻辑
-				echo "📥 本地未发现，尝试下载安装..."
-
-				# 清理旧的失败残留
-				rm -rf "/root/.openclaw/extensions/$plugin_id"
-
-				# 执行安装，并捕获结果
-				if openclaw plugins install "$plugin_full"; then
-					echo "✅ 下载成功，正在启用..."
-					openclaw plugins enable "$plugin_id"
-				else
-					echo "⚠️ 官方渠道下载失败，尝试备选方案..."
-					# 备选 npm 安装
-					if npm install -g "$plugin_full" --unsafe-perm; then
-						echo "✅ npm 安装成功，尝试启用..."
-						openclaw plugins enable "$plugin_id"
-					else
-						echo "❌ 严重错误：无法获取该插件。请检查 ID 是否正确或网络是否可用。"
-						# 关键：这里直接 return 或 continue，不走下面的 start_gateway，防止写死配置
-						break_end
+					if echo "$plugin_list" | grep -qw "$plugin_id" && echo "$plugin_list" | grep "$plugin_id" | grep -q "disabled"; then
+						echo "💡 插件 [$plugin_id] 已预装，正在激活..."
+						if openclaw plugins enable "$plugin_id"; then
+							sync_openclaw_plugin_allowlist "$plugin_id"
+							success_list="$success_list $plugin_id"
+							changed=true
+						else
+							failed_list="$failed_list $plugin_id"
+						fi
 						continue
 					fi
-				fi
-			fi
 
-			echo "🔄 正在重启 OpenClaw 服务以加载新插件..."
-			start_gateway
+					if [ -d "/usr/lib/node_modules/openclaw/extensions/$plugin_id" ]; then
+						echo "💡 发现系统内置目录存在该插件，尝试直接启用..."
+						if openclaw plugins enable "$plugin_id"; then
+							sync_openclaw_plugin_allowlist "$plugin_id"
+							success_list="$success_list $plugin_id"
+							changed=true
+						else
+							failed_list="$failed_list $plugin_id"
+						fi
+						continue
+					fi
+
+					echo "📥 本地未发现，尝试下载安装: $plugin_full"
+					rm -rf "/root/.openclaw/extensions/$plugin_id"
+					if openclaw plugins install "$plugin_full"; then
+						echo "✅ 下载成功，正在启用..."
+						if openclaw plugins enable "$plugin_id"; then
+							sync_openclaw_plugin_allowlist "$plugin_id"
+							success_list="$success_list $plugin_id"
+							changed=true
+						else
+							failed_list="$failed_list $plugin_id"
+						fi
+					else
+						echo "❌ 安装失败：$plugin_full"
+						failed_list="$failed_list $plugin_id"
+					fi
+				else
+					echo "🗑️ 正在删除/禁用插件: $plugin_id"
+					openclaw plugins disable "$plugin_id" >/dev/null 2>&1
+					if openclaw plugins uninstall "$plugin_id"; then
+						echo "✅ 已卸载: $plugin_id"
+					else
+						echo "⚠️ 卸载失败，可能为预装插件，仅禁用: $plugin_id"
+					fi
+					sync_openclaw_plugin_denylist "$plugin_id" >/dev/null 2>&1
+					success_list="$success_list $plugin_id"
+					changed=true
+				fi
+			done
+
+			echo ""
+			echo "====== 操作汇总 ======"
+			echo "✅ 成功:$success_list"
+			[ -n "$failed_list" ] && echo "❌ 失败:$failed_list"
+			[ -n "$skipped_list" ] && echo "⏭️ 跳过:$skipped_list"
+
+			if [ "$changed" = true ]; then
+				echo "🔄 正在重启 OpenClaw 服务以加载变更..."
+				start_gateway
+			fi
 			break_end
 		done
 	}
 
 
-
-
-
-
-
 	install_skill() {
-		send_stats "安装技能"
+		send_stats "技能管理"
 		while true; do
 			clear
 			echo "========================================"
-			echo "            技能管理 (安装)            "
+			echo "            技能管理 (安装/删除)            "
 			echo "========================================"
 			echo "当前已安装技能:"
 			openclaw skills list
@@ -10452,55 +11850,287 @@ EOF
 			echo "coding-agent       # 自动运行 Claude Code/Codex 等编程助手"
 			echo "----------------------------------------"
 
-			# 提示用户输入技能名称
-			read -e -p "请输入要安装的技能名称（输入 0 退出）： " skill_name
+			echo "1) 安装技能"
+			echo "2) 删除技能"
+			echo "0) 返回"
+			read -e -p "请选择操作：" skill_action
 
-			# 1. 检查是否输入 0 以退出
-			if [ "$skill_name" = "0" ]; then
-				echo "操作已取消，退出技能安装。"
-				break
-			fi
+			[ "$skill_action" = "0" ] && break
+			[ -z "$skill_action" ] && continue
 
-			# 2. 验证输入是否为空
-			if [ -z "$skill_name" ]; then
-				echo "错误：技能名称不能为空。请重试。"
-				echo ""
-				continue
-			fi
+			read -e -p "请输入技能名称（空格分隔，输入 0 退出）： " skill_input
+			[ "$skill_input" = "0" ] && break
+			[ -z "$skill_input" ] && continue
 
-			# 3. 检查技能是否已安装
-			local skill_found=false
-			if [ -d "${HOME}/.openclaw/workspace/skills/${skill_name}" ]; then
-				echo "💡 技能 [$skill_name] 已在用户目录安装。"
-				skill_found=true
-			elif [ -d "/usr/lib/node_modules/openclaw/skills/${skill_name}" ]; then
-				echo "💡 技能 [$skill_name] 已在系统目录安装。"
-				skill_found=true
-			fi
+			local success_list=""
+			local failed_list=""
+			local skipped_list=""
+			local changed=false
+			local token
 
-			if [ "$skill_found" = true ]; then
-				read -e -p "是否重新安装？(y/N): " reinstall
-				if [[ ! "$reinstall" =~ ^[Yy]$ ]]; then
-					echo "跳过安装。"
+			if [ "$skill_action" = "2" ]; then
+				read -e -p "二次确认：删除仅影响用户目录 ~/.openclaw/workspace/skills，确认继续？(y/N): " confirm_del
+				if [[ ! "$confirm_del" =~ ^[Yy]$ ]]; then
+					echo "已取消删除。"
 					break_end
 					continue
 				fi
 			fi
 
-			# 4. 执行安装命令
-			echo "正在安装技能：$skill_name ..."
-			if npx clawhub install "$skill_name"; then
-				echo "✅ 技能 $skill_name 安装成功。"
-				start_gateway
-			else
-				echo "❌ 安装失败。请检查技能名称是否正确，或参考文档排查。"
-			fi
+			for token in $skill_input; do
+				local skill_name
+				skill_name="$token"
+				[ -z "$skill_name" ] && continue
 
+				if [ "$skill_action" = "1" ]; then
+					local skill_found=false
+					if [ -d "${HOME}/.openclaw/workspace/skills/${skill_name}" ]; then
+						echo "💡 技能 [$skill_name] 已在用户目录安装。"
+						skill_found=true
+					elif [ -d "/usr/lib/node_modules/openclaw/skills/${skill_name}" ]; then
+						echo "💡 技能 [$skill_name] 已在系统目录安装。"
+						skill_found=true
+					fi
+
+					if [ "$skill_found" = true ]; then
+						read -e -p "技能 [$skill_name] 已安装，是否重新安装？(y/N): " reinstall
+						if [[ ! "$reinstall" =~ ^[Yy]$ ]]; then
+							skipped_list="$skipped_list $skill_name"
+							continue
+						fi
+					fi
+
+					echo "正在安装技能：$skill_name ..."
+					if npx clawhub install "$skill_name" --yes --no-input 2>/dev/null || npx clawhub install "$skill_name"; then
+						echo "✅ 技能 $skill_name 安装成功。"
+						success_list="$success_list $skill_name"
+						changed=true
+					else
+						echo "❌ 安装失败：$skill_name"
+						failed_list="$failed_list $skill_name"
+					fi
+				else
+					echo "🗑️ 正在删除技能: $skill_name"
+					npx clawhub uninstall "$skill_name" --yes --no-input 2>/dev/null || npx clawhub uninstall "$skill_name" >/dev/null 2>&1
+					if [ -d "${HOME}/.openclaw/workspace/skills/${skill_name}" ]; then
+						rm -rf "${HOME}/.openclaw/workspace/skills/${skill_name}"
+						echo "✅ 已删除用户技能目录: $skill_name"
+						success_list="$success_list $skill_name"
+						changed=true
+					else
+						echo "⏭️ 未发现用户技能目录: $skill_name"
+						skipped_list="$skipped_list $skill_name"
+					fi
+				fi
+			done
+
+			echo ""
+			echo "====== 操作汇总 ======"
+			echo "✅ 成功:$success_list"
+			[ -n "$failed_list" ] && echo "❌ 失败:$failed_list"
+			[ -n "$skipped_list" ] && echo "⏭️ 跳过:$skipped_list"
+
+			if [ "$changed" = true ]; then
+				echo "🔄 正在重启 OpenClaw 服务以加载变更..."
+				start_gateway
+			fi
 			break_end
 		done
 	}
 
+openclaw_json_get_bool() {
+		local expr="$1"
+		local config_file="${HOME}/.openclaw/openclaw.json"
+		if [ ! -s "$config_file" ]; then
+			echo "false"
+			return
+		fi
+		jq -r "$expr" "$config_file" 2>/dev/null || echo "false"
+	}
 
+	openclaw_channel_has_cfg() {
+		local channel="$1"
+		local config_file="${HOME}/.openclaw/openclaw.json"
+		if [ ! -s "$config_file" ]; then
+			echo "false"
+			return
+		fi
+		jq -r --arg c "$channel" '
+			(.channels[$c] // null) as $v
+			| if ($v | type) != "object" then
+				false
+			  else
+				([ $v
+				   | to_entries[]
+				   | select((.key == "enabled" or .key == "dmPolicy" or .key == "groupPolicy" or .key == "streaming") | not)
+				   | .value
+				   | select(. != null and . != "" and . != false)
+				 ] | length) > 0
+			  end
+		' "$config_file" 2>/dev/null || echo "false"
+	}
+
+	openclaw_dir_has_files() {
+		local dir="$1"
+		[ -d "$dir" ] && find "$dir" -type f -print -quit 2>/dev/null | grep -q .
+	}
+
+	openclaw_plugin_local_installed() {
+		local plugin="$1"
+		local config_file="${HOME}/.openclaw/openclaw.json"
+		if [ -s "$config_file" ] && jq -e --arg p "$plugin" '.plugins.installs[$p]' "$config_file" >/dev/null 2>&1; then
+			return 0
+		fi
+
+		# 兼容两种常见目录命名：
+		# - ~/.openclaw/extensions/qqbot
+		# - ~/.openclaw/extensions/openclaw-qqbot
+		# 避免无脑 substring，优先精确匹配与 openclaw- 前缀匹配。
+		[ -d "${HOME}/.openclaw/extensions/${plugin}" ] \
+			|| [ -d "${HOME}/.openclaw/extensions/openclaw-${plugin}" ] \
+			|| [ -d "/usr/lib/node_modules/openclaw/extensions/${plugin}" ] \
+			|| [ -d "/usr/lib/node_modules/openclaw/extensions/openclaw-${plugin}" ]
+	}
+
+	openclaw_bot_status_text() {
+		local enabled="$1"
+		local configured="$2"
+		local connected="$3"
+		local abnormal="$4"
+		if [ "$abnormal" = "true" ]; then
+			echo "异常"
+		elif [ "$enabled" != "true" ]; then
+			echo "未启用"
+		elif [ "$connected" = "true" ]; then
+			echo "已连接"
+		elif [ "$configured" = "true" ]; then
+			echo "已配置"
+		else
+			echo "未配置"
+		fi
+	}
+
+	openclaw_colorize_bot_status() {
+		local status="$1"
+		case "$status" in
+			已连接) echo -e "${gl_lv}${status}${gl_bai}" ;;
+			已配置) echo -e "${gl_huang}${status}${gl_bai}" ;;
+			异常) echo -e "${gl_hong}${status}${gl_bai}" ;;
+			*) echo "$status" ;;
+		esac
+	}
+
+	openclaw_print_bot_status_line() {
+		local label="$1"
+		local status="$2"
+		echo -e "- ${label}: $(openclaw_colorize_bot_status "$status")"
+	}
+
+	openclaw_show_bot_local_status_block() {
+		local config_file="${HOME}/.openclaw/openclaw.json"
+		local json_ok="false"
+		if [ -s "$config_file" ] && jq empty "$config_file" >/dev/null 2>&1; then
+			json_ok="true"
+		fi
+
+		local tg_enabled tg_cfg tg_connected tg_abnormal tg_status
+		tg_enabled=$(openclaw_json_get_bool '.channels.telegram.enabled // .plugins.entries.telegram.enabled // false')
+		tg_cfg=$(openclaw_channel_has_cfg "telegram")
+		tg_connected="false"
+		if openclaw_dir_has_files "${HOME}/.openclaw/telegram"; then
+			tg_connected="true"
+		fi
+		tg_abnormal="false"
+		if [ "$tg_enabled" = "true" ] && [ "$json_ok" != "true" ]; then
+			tg_abnormal="true"
+		fi
+		tg_status=$(openclaw_bot_status_text "$tg_enabled" "$tg_cfg" "$tg_connected" "$tg_abnormal")
+
+		local feishu_enabled feishu_cfg feishu_connected feishu_abnormal feishu_status
+		feishu_enabled=$(openclaw_json_get_bool '.plugins.entries.feishu.enabled // .channels.feishu.enabled // false')
+		feishu_cfg=$(openclaw_channel_has_cfg "feishu")
+		feishu_connected="false"
+		if openclaw_dir_has_files "${HOME}/.openclaw/feishu"; then
+			feishu_connected="true"
+		fi
+		feishu_abnormal="false"
+		if [ "$feishu_enabled" = "true" ] && ! openclaw_plugin_local_installed "feishu"; then
+			feishu_abnormal="true"
+		fi
+		if [ "$feishu_enabled" = "true" ] && [ "$json_ok" != "true" ]; then
+			feishu_abnormal="true"
+		fi
+		feishu_status=$(openclaw_bot_status_text "$feishu_enabled" "$feishu_cfg" "$feishu_connected" "$feishu_abnormal")
+
+		local wa_enabled wa_cfg wa_connected wa_abnormal wa_status
+		wa_enabled=$(openclaw_json_get_bool '.plugins.entries.whatsapp.enabled // .channels.whatsapp.enabled // false')
+		wa_cfg=$(openclaw_channel_has_cfg "whatsapp")
+		wa_connected="false"
+		if openclaw_dir_has_files "${HOME}/.openclaw/whatsapp"; then
+			wa_connected="true"
+		fi
+		wa_abnormal="false"
+		if [ "$wa_enabled" = "true" ] && ! openclaw_plugin_local_installed "whatsapp"; then
+			wa_abnormal="true"
+		fi
+		if [ "$wa_enabled" = "true" ] && [ "$json_ok" != "true" ]; then
+			wa_abnormal="true"
+		fi
+		wa_status=$(openclaw_bot_status_text "$wa_enabled" "$wa_cfg" "$wa_connected" "$wa_abnormal")
+
+		local dc_enabled dc_cfg dc_connected dc_abnormal dc_status
+		dc_enabled=$(openclaw_json_get_bool '.channels.discord.enabled // .plugins.entries.discord.enabled // false')
+		dc_cfg=$(openclaw_channel_has_cfg "discord")
+		dc_connected="false"
+		if openclaw_dir_has_files "${HOME}/.openclaw/discord"; then
+			dc_connected="true"
+		fi
+		dc_abnormal="false"
+		if [ "$dc_enabled" = "true" ] && [ "$json_ok" != "true" ]; then
+			dc_abnormal="true"
+		fi
+		dc_status=$(openclaw_bot_status_text "$dc_enabled" "$dc_cfg" "$dc_connected" "$dc_abnormal")
+
+		local slack_enabled slack_cfg slack_connected slack_abnormal slack_status
+		slack_enabled=$(openclaw_json_get_bool '.plugins.entries.slack.enabled // .channels.slack.enabled // false')
+		slack_cfg=$(openclaw_channel_has_cfg "slack")
+		slack_connected="false"
+		if openclaw_dir_has_files "${HOME}/.openclaw/slack"; then
+			slack_connected="true"
+		fi
+		slack_abnormal="false"
+		if [ "$slack_enabled" = "true" ] && ! openclaw_plugin_local_installed "slack"; then
+			slack_abnormal="true"
+		fi
+		if [ "$slack_enabled" = "true" ] && [ "$json_ok" != "true" ]; then
+			slack_abnormal="true"
+		fi
+		slack_status=$(openclaw_bot_status_text "$slack_enabled" "$slack_cfg" "$slack_connected" "$slack_abnormal")
+
+		local qq_enabled qq_cfg qq_connected qq_abnormal qq_status
+		qq_enabled=$(openclaw_json_get_bool '.plugins.entries.qqbot.enabled // .channels.qqbot.enabled // false')
+		qq_cfg=$(openclaw_channel_has_cfg "qqbot")
+		qq_connected="false"
+		if openclaw_dir_has_files "${HOME}/.openclaw/qqbot/sessions" || openclaw_dir_has_files "${HOME}/.openclaw/qqbot/data"; then
+			qq_connected="true"
+		fi
+		qq_abnormal="false"
+		if [ "$qq_enabled" = "true" ] && ! openclaw_plugin_local_installed "qqbot"; then
+			qq_abnormal="true"
+		fi
+		if [ "$qq_enabled" = "true" ] && [ "$json_ok" != "true" ]; then
+			qq_abnormal="true"
+		fi
+		qq_status=$(openclaw_bot_status_text "$qq_enabled" "$qq_cfg" "$qq_connected" "$qq_abnormal")
+
+		echo "本地状态（仅本机配置/缓存，不做网络探测）："
+		openclaw_print_bot_status_line "Telegram" "$tg_status"
+		openclaw_print_bot_status_line "飞书(Lark)" "$feishu_status"
+		openclaw_print_bot_status_line "WhatsApp" "$wa_status"
+		openclaw_print_bot_status_line "Discord" "$dc_status"
+		openclaw_print_bot_status_line "Slack" "$slack_status"
+		openclaw_print_bot_status_line "QQ Bot" "$qq_status"
+	}
 
 	change_tg_bot_code() {
 		send_stats "机器人对接"
@@ -10509,6 +12139,8 @@ EOF
 			echo "========================================"
 			echo "            机器人连接对接            "
 			echo "========================================"
+			openclaw_show_bot_local_status_block
+			echo "----------------------------------------"
 			echo "1. Telegram 机器人对接"
 			echo "2. 飞书 (Lark) 机器人对接"
 			echo "3. WhatsApp 机器人对接"
@@ -10551,10 +12183,1494 @@ EOF
 	}
 
 
+	openclaw_backup_root() {
+		echo "${HOME}/.openclaw/backups"
+	}
+
+	openclaw_is_interactive_terminal() {
+		[ -t 0 ] && [ -t 1 ]
+	}
+
+	openclaw_has_command() {
+		command -v "$1" >/dev/null 2>&1
+	}
+
+
+	openclaw_is_safe_relpath() {
+		local rel="$1"
+		[ -z "$rel" ] && return 1
+		[[ "$rel" = /* ]] && return 1
+		[[ "$rel" == *"//"* ]] && return 1
+		[[ "$rel" == *$'\n'* ]] && return 1
+		[[ "$rel" == *$'\r'* ]] && return 1
+		case "$rel" in
+			../*|*/../*|*/..|..)
+				return 1
+				;;
+		esac
+		return 0
+	}
+
+	openclaw_restore_path_allowed() {
+		local mode="$1"
+		local rel="$2"
+		case "$mode" in
+			memory)
+				case "$rel" in
+					MEMORY.md|AGENTS.md|USER.md|SOUL.md|TOOLS.md|memory/*) return 0 ;;
+					*) return 1 ;;
+				esac
+				;;
+			project)
+				case "$rel" in
+					openclaw.json|workspace/*|extensions/*|skills/*|prompts/*|tools/*|telegram/*|feishu/*|whatsapp/*|discord/*|slack/*|qqbot/*|logs/*) return 0 ;;
+					*) return 1 ;;
+				esac
+				;;
+			*)
+				return 1
+				;;
+		esac
+	}
+
+	openclaw_pack_backup_archive() {
+		local backup_type="$1"
+		local export_mode="$2"
+		local payload_dir="$3"
+		local output_file="$4"
+
+		local tmp_root
+		tmp_root=$(mktemp -d) || return 1
+		local pack_dir="$tmp_root/package"
+		mkdir -p "$pack_dir"
+
+		cp -a "$payload_dir" "$pack_dir/payload"
+
+		(
+			cd "$pack_dir/payload" || exit 1
+			find . -type f | sed 's|^\./||' | sort > "$pack_dir/manifest.files"
+			: > "$pack_dir/manifest.sha256"
+			while IFS= read -r f; do
+				[ -z "$f" ] && continue
+				sha256sum "$f" >> "$pack_dir/manifest.sha256"
+			done < "$pack_dir/manifest.files"
+		) || { rm -rf "$tmp_root"; return 1; }
+
+		cat > "$pack_dir/backup.meta" <<EOF
+TYPE=$backup_type
+MODE=$export_mode
+CREATED_AT=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+HOST=$(hostname)
+EOF
+
+		mkdir -p "$(dirname "$output_file")"
+		tar -C "$pack_dir" -czf "$output_file" backup.meta manifest.files manifest.sha256 payload
+		local rc=$?
+		rm -rf "$tmp_root"
+		return $rc
+	}
+
+	openclaw_offer_transfer_hint() {
+		local file_path="$1"
+
+		echo "可使用以下方式下载备份文件："
+		echo "- 本地路径: $file_path"
+		echo "- scp 示例: scp root@你的服务器:$file_path ./"
+		echo "- 或使用 SFTP 客户端下载"
+	}
+
+	openclaw_prepare_import_archive() {
+		local expected_type="$1"
+		local archive_path="$2"
+		local unpack_root="$3"
+
+		[ ! -f "$archive_path" ] && { echo "❌ 文件不存在: $archive_path"; return 1; }
+		mkdir -p "$unpack_root"
+		tar -xzf "$archive_path" -C "$unpack_root" || { echo "❌ 备份包解压失败"; return 1; }
+
+		local pkg_dir="$unpack_root/package"
+		if [ -f "$unpack_root/backup.meta" ]; then
+			pkg_dir="$unpack_root"
+		fi
+
+		for required in backup.meta manifest.files manifest.sha256 payload; do
+			[ -e "$pkg_dir/$required" ] || { echo "❌ 备份包缺少必要文件: $required"; return 1; }
+		done
+
+		local real_type
+		real_type=$(grep '^TYPE=' "$pkg_dir/backup.meta" | head -n1 | cut -d'=' -f2-)
+		if [ "$real_type" != "$expected_type" ]; then
+			echo "❌ 备份类型不匹配，期望: $expected_type，实际: ${real_type:-未知}"
+			return 1
+		fi
+
+		(
+			cd "$pkg_dir/payload" || exit 1
+			sha256sum -c ../manifest.sha256 >/dev/null
+		) || { echo "❌ sha256 校验失败，拒绝还原"; return 1; }
+
+		echo "$pkg_dir"
+		return 0
+	}
+
+	openclaw_memory_backup_export() {
+		send_stats "OpenClaw记忆全量备份"
+		local workspace_dir="${HOME}/.openclaw/workspace"
+		local backup_root
+		backup_root=$(openclaw_backup_root)
+		local ts
+		ts=$(date +%Y%m%d-%H%M%S)
+		local out_file="$backup_root/openclaw-memory-full-${ts}.tar.gz"
+
+		mkdir -p "$backup_root"
+		if [ ! -d "$workspace_dir" ]; then
+			echo "❌ 未找到 workspace 目录: $workspace_dir"
+			break_end
+			return 1
+		fi
+
+		local tmp_payload
+		tmp_payload=$(mktemp -d) || return 1
+
+		[ -f "$workspace_dir/MEMORY.md" ] && cp -a "$workspace_dir/MEMORY.md" "$tmp_payload/"
+		[ -d "$workspace_dir/memory" ] && cp -a "$workspace_dir/memory" "$tmp_payload/"
+
+		read -e -p "是否附带 AGENTS/USER/SOUL/TOOLS 文件？(y/N): " include_optional
+		if [[ "$include_optional" =~ ^[Yy]$ ]]; then
+			for f in AGENTS.md USER.md SOUL.md TOOLS.md; do
+				[ -f "$workspace_dir/$f" ] && cp -a "$workspace_dir/$f" "$tmp_payload/"
+			done
+		fi
+
+		if ! find "$tmp_payload" -mindepth 1 -print -quit | grep -q .; then
+			echo "❌ 未找到可备份的记忆文件"
+			rm -rf "$tmp_payload"
+			break_end
+			return 1
+		fi
+
+		if openclaw_pack_backup_archive "memory-full" "default" "$tmp_payload" "$out_file"; then
+			echo "✅ 记忆全量备份完成: $out_file"
+			openclaw_offer_transfer_hint "$out_file"
+		else
+			echo "❌ 记忆全量备份失败"
+		fi
+
+		rm -rf "$tmp_payload"
+		break_end
+	}
+
+	openclaw_read_import_path() {
+		local prompt_text="$1"
+		local file_input file_path backup_root
+		echo "$prompt_text" >&2
+
+		echo "可先通过 scp/sftp 上传备份包到服务器，再输入路径。" >&2
+		echo "scp 示例: scp /本地/备份包.tar.gz root@你的服务器:/tmp/" >&2
+		echo "提示：输入文件名时默认在备份目录查找；输入含 / 的路径时按完整路径校验。" >&2
+		read -e -p "请输入备份文件名或路径: " file_input
+		[ -z "$file_input" ] && { echo ""; return 0; }
+
+		backup_root=$(openclaw_backup_root)
+		mkdir -p "$backup_root"
+
+		if [[ "$file_input" == */* ]]; then
+			file_path="$file_input"
+		else
+			file_path="$backup_root/$file_input"
+		fi
+
+		if [ ! -f "$file_path" ]; then
+			echo "❌ 备份文件不存在: $file_path" >&2
+			echo ""
+			return 1
+		fi
+
+		echo "$file_path"
+	}
+
+	openclaw_memory_backup_import() {
+		send_stats "OpenClaw记忆全量还原"
+		local workspace_dir="${HOME}/.openclaw/workspace"
+		mkdir -p "$workspace_dir"
+
+		local archive_path
+		archive_path=$(openclaw_read_import_path "还原前将执行：类型校验 + sha256 校验 + 路径白名单校验")
+		[ -z "$archive_path" ] && { echo "❌ 未输入备份路径"; break_end; return 1; }
+
+		local tmp_unpack
+		tmp_unpack=$(mktemp -d) || return 1
+		local pkg_dir
+		pkg_dir=$(openclaw_prepare_import_archive "memory-full" "$archive_path" "$tmp_unpack") || { rm -rf "$tmp_unpack"; break_end; return 1; }
+
+		local invalid=0
+		local valid_list
+		valid_list=$(mktemp)
+		while IFS= read -r rel; do
+			[ -z "$rel" ] && continue
+			if ! openclaw_is_safe_relpath "$rel" || ! openclaw_restore_path_allowed memory "$rel"; then
+				echo "❌ 检测到非法或越权路径: $rel"
+				invalid=1
+				break
+			fi
+			echo "$rel" >> "$valid_list"
+		done < "$pkg_dir/manifest.files"
+
+		if [ "$invalid" -ne 0 ]; then
+			rm -f "$valid_list"
+			rm -rf "$tmp_unpack"
+			echo "❌ 还原中止：存在不安全路径"
+			break_end
+			return 1
+		fi
+
+
+		while IFS= read -r rel; do
+			mkdir -p "$workspace_dir/$(dirname "$rel")"
+			cp -a "$pkg_dir/payload/$rel" "$workspace_dir/$rel"
+		done < "$valid_list"
+
+		rm -f "$valid_list"
+		rm -rf "$tmp_unpack"
+		echo "✅ 记忆全量还原完成"
+		break_end
+	}
+
+	openclaw_project_backup_export() {
+		send_stats "OpenClaw项目备份"
+		local openclaw_root="${HOME}/.openclaw"
+		if [ ! -d "$openclaw_root" ]; then
+			echo "❌ 未找到 OpenClaw 根目录: $openclaw_root"
+			break_end
+			return 1
+		fi
+
+		echo "备份模式："
+		echo "1. 安全模式（默认，推荐）：workspace + openclaw.json + extensions/skills/prompts/tools（如存在）"
+		echo "2. 完整模式（含更多状态，敏感风险更高）"
+		read -e -p "请选择备份模式（默认 1）: " export_mode
+		[ -z "$export_mode" ] && export_mode="1"
+
+		local mode_label="safe"
+		local tmp_payload
+		tmp_payload=$(mktemp -d) || return 1
+
+		if [ "$export_mode" = "2" ]; then
+			mode_label="full"
+			for d in workspace extensions skills prompts tools; do
+				[ -e "$openclaw_root/$d" ] && cp -a "$openclaw_root/$d" "$tmp_payload/"
+			done
+			[ -f "$openclaw_root/openclaw.json" ] && cp -a "$openclaw_root/openclaw.json" "$tmp_payload/"
+			for d in telegram feishu whatsapp discord slack qqbot logs; do
+				[ -e "$openclaw_root/$d" ] && cp -a "$openclaw_root/$d" "$tmp_payload/"
+			done
+		else
+			[ -d "$openclaw_root/workspace" ] && cp -a "$openclaw_root/workspace" "$tmp_payload/"
+			[ -f "$openclaw_root/openclaw.json" ] && cp -a "$openclaw_root/openclaw.json" "$tmp_payload/"
+			for d in extensions skills prompts tools; do
+				[ -e "$openclaw_root/$d" ] && cp -a "$openclaw_root/$d" "$tmp_payload/"
+			done
+		fi
+
+		if ! find "$tmp_payload" -mindepth 1 -print -quit | grep -q .; then
+			echo "❌ 未找到可备份的 OpenClaw 项目内容"
+			rm -rf "$tmp_payload"
+			break_end
+			return 1
+		fi
+
+		local backup_root
+		backup_root=$(openclaw_backup_root)
+		mkdir -p "$backup_root"
+		local out_file="$backup_root/openclaw-project-${mode_label}-$(date +%Y%m%d-%H%M%S).tar.gz"
+
+		if openclaw_pack_backup_archive "openclaw-project" "$mode_label" "$tmp_payload" "$out_file"; then
+			echo "✅ OpenClaw 项目备份完成 (${mode_label}): $out_file"
+			openclaw_offer_transfer_hint "$out_file"
+		else
+			echo "❌ OpenClaw 项目备份失败"
+		fi
+
+		rm -rf "$tmp_payload"
+		break_end
+	}
+
+	openclaw_project_backup_import() {
+		send_stats "OpenClaw项目还原"
+		local openclaw_root="${HOME}/.openclaw"
+		mkdir -p "$openclaw_root"
+
+		echo "⚠️ 高风险操作：项目还原会覆盖 OpenClaw 配置与工作区内容。"
+		echo "⚠️ 还原前将执行 manifest/sha256 校验、白名单恢复、gateway 停启与健康检查。"
+		read -e -p "请输入确认词【我已知晓高风险并继续还原】后继续: " confirm_text
+		if [ "$confirm_text" != "我已知晓高风险并继续还原" ]; then
+			echo "❌ 确认词不匹配，已取消还原"
+			break_end
+			return 1
+		fi
+
+		local archive_path
+		archive_path=$(openclaw_read_import_path "请输入 OpenClaw 项目备份包路径")
+		[ -z "$archive_path" ] && { echo "❌ 未输入备份路径"; break_end; return 1; }
+
+		local tmp_unpack
+		tmp_unpack=$(mktemp -d) || return 1
+		local pkg_dir
+		pkg_dir=$(openclaw_prepare_import_archive "openclaw-project" "$archive_path" "$tmp_unpack") || { rm -rf "$tmp_unpack"; break_end; return 1; }
+
+		local invalid=0
+		local valid_list
+		valid_list=$(mktemp)
+		while IFS= read -r rel; do
+			[ -z "$rel" ] && continue
+			if ! openclaw_is_safe_relpath "$rel" || ! openclaw_restore_path_allowed project "$rel"; then
+				echo "❌ 检测到非法或越权路径: $rel"
+				invalid=1
+				break
+			fi
+			echo "$rel" >> "$valid_list"
+		done < "$pkg_dir/manifest.files"
+
+		if [ "$invalid" -ne 0 ]; then
+			rm -f "$valid_list"
+			rm -rf "$tmp_unpack"
+			echo "❌ 还原中止：存在不安全路径"
+			break_end
+			return 1
+		fi
+
+
+		if command -v openclaw >/dev/null 2>&1; then
+			echo "⏸️ 还原前停止 OpenClaw gateway..."
+			openclaw gateway stop >/dev/null 2>&1
+		fi
+
+		while IFS= read -r rel; do
+			mkdir -p "$openclaw_root/$(dirname "$rel")"
+			cp -a "$pkg_dir/payload/$rel" "$openclaw_root/$rel"
+		done < "$valid_list"
+
+		if command -v openclaw >/dev/null 2>&1; then
+			echo "▶️ 还原后启动 OpenClaw gateway..."
+			openclaw gateway start >/dev/null 2>&1
+			sleep 2
+			echo "🩺 gateway 健康检查："
+			openclaw gateway status || true
+		fi
+
+		rm -f "$valid_list"
+		rm -rf "$tmp_unpack"
+		echo "✅ OpenClaw 项目还原完成"
+		break_end
+	}
+
+	openclaw_backup_detect_type() {
+		local file_name="$1"
+		if [[ "$file_name" == openclaw-memory-full-*.tar.gz ]]; then
+			echo "记忆备份文件"
+		elif [[ "$file_name" == openclaw-project-*.tar.gz ]]; then
+			echo "项目备份文件"
+		else
+			echo "其他备份文件"
+		fi
+	}
+
+	openclaw_backup_collect_files() {
+		local backup_root
+		backup_root=$(openclaw_backup_root)
+		mkdir -p "$backup_root"
+		mapfile -t OPENCLAW_BACKUP_FILES < <(find "$backup_root" -maxdepth 1 -type f -name '*.tar.gz' -printf '%f\n' | sort -r)
+	}
+
+
+	openclaw_backup_render_file_list() {
+		local backup_root i file_name file_path file_type file_size file_time
+		local has_memory=0 has_project=0 has_other=0
+		backup_root=$(openclaw_backup_root)
+		openclaw_backup_collect_files
+
+		echo "备份目录: $backup_root"
+		if [ ${#OPENCLAW_BACKUP_FILES[@]} -eq 0 ]; then
+			echo "暂无备份文件"
+			return 0
+		fi
+
+		for i in "${!OPENCLAW_BACKUP_FILES[@]}"; do
+			file_type=$(openclaw_backup_detect_type "${OPENCLAW_BACKUP_FILES[$i]}")
+			case "$file_type" in
+				"记忆备份文件") has_memory=1 ;;
+				"项目备份文件") has_project=1 ;;
+				"其他备份文件") has_other=1 ;;
+			esac
+		done
+
+		if [ "$has_memory" -eq 1 ]; then
+			echo "记忆备份文件"
+			for i in "${!OPENCLAW_BACKUP_FILES[@]}"; do
+				file_name="${OPENCLAW_BACKUP_FILES[$i]}"
+				file_type=$(openclaw_backup_detect_type "$file_name")
+				[ "$file_type" != "记忆备份文件" ] && continue
+				file_path="$backup_root/$file_name"
+				file_size=$(ls -lh "$file_path" | awk '{print $5}')
+				file_time=$(date -d "$(stat -c %y "$file_path")" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || stat -c %y "$file_path" | awk '{print $1" "$2}')
+				printf "%s | %s | %s\n" "$file_name" "$file_size" "$file_time"
+			done
+		fi
+
+		if [ "$has_project" -eq 1 ]; then
+			echo "项目备份文件"
+			for i in "${!OPENCLAW_BACKUP_FILES[@]}"; do
+				file_name="${OPENCLAW_BACKUP_FILES[$i]}"
+				file_type=$(openclaw_backup_detect_type "$file_name")
+				[ "$file_type" != "项目备份文件" ] && continue
+				file_path="$backup_root/$file_name"
+				file_size=$(ls -lh "$file_path" | awk '{print $5}')
+				file_time=$(date -d "$(stat -c %y "$file_path")" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || stat -c %y "$file_path" | awk '{print $1" "$2}')
+				printf "%s | %s | %s\n" "$file_name" "$file_size" "$file_time"
+			done
+		fi
+
+		if [ "$has_other" -eq 1 ]; then
+			echo "其他备份文件"
+			for i in "${!OPENCLAW_BACKUP_FILES[@]}"; do
+				file_name="${OPENCLAW_BACKUP_FILES[$i]}"
+				file_type=$(openclaw_backup_detect_type "$file_name")
+				[ "$file_type" != "其他备份文件" ] && continue
+				file_path="$backup_root/$file_name"
+				file_size=$(ls -lh "$file_path" | awk '{print $5}')
+				file_time=$(date -d "$(stat -c %y "$file_path")" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || stat -c %y "$file_path" | awk '{print $1" "$2}')
+				printf "%s | %s | %s\n" "$file_name" "$file_size" "$file_time"
+			done
+		fi
+	}
+
+	openclaw_backup_file_exists_in_list() {
+		local target_file="$1"
+		local item
+		for item in "${OPENCLAW_BACKUP_FILES[@]}"; do
+			[ "$item" = "$target_file" ] && return 0
+		done
+		return 1
+	}
+
+	openclaw_backup_delete_file() {
+		send_stats "OpenClaw删除备份文件"
+		local backup_root backup_root_real user_input target_file target_path target_type
+		backup_root=$(openclaw_backup_root)
+
+		openclaw_backup_render_file_list
+		if [ ${#OPENCLAW_BACKUP_FILES[@]} -eq 0 ]; then
+			break_end
+			return 0
+		fi
+
+		read -e -p "请输入要删除的文件名或完整路径（0 取消）: " user_input
+		if [ "$user_input" = "0" ]; then
+			echo "已取消删除。"
+			break_end
+			return 0
+		fi
+		if [ -z "$user_input" ]; then
+			echo "❌ 输入不能为空。"
+			break_end
+			return 1
+		fi
+
+		backup_root_real=$(realpath -m "$backup_root")
+		if [[ "$user_input" == /* ]]; then
+			target_path=$(realpath -m "$user_input")
+			case "$target_path" in
+				"$backup_root_real"/*) ;;
+				*)
+					echo "❌ 路径越界：仅允许删除备份根目录内的文件。"
+					break_end
+					return 1
+					;;
+			esac
+			target_file=$(basename "$target_path")
+		else
+			target_file=$(basename -- "$user_input")
+			target_path="$backup_root/$target_file"
+		fi
+
+		if [ ! -f "$target_path" ]; then
+			echo "❌ 目标文件不存在: $target_path"
+			break_end
+			return 1
+		fi
+
+		if ! openclaw_backup_file_exists_in_list "$target_file"; then
+			echo "❌ 目标文件不在当前备份列表中。"
+			break_end
+			return 1
+		fi
+
+		target_type=$(openclaw_backup_detect_type "$target_file")
+
+		echo "即将删除: [$target_type] $target_path"
+		read -e -p "第一次确认：输入 yes 确认继续: " confirm_step1
+		if [ "$confirm_step1" != "yes" ]; then
+			echo "已取消删除。"
+			break_end
+			return 0
+		fi
+		read -e -p "二次确认：输入 DELETE 执行删除: " confirm_step2
+		if [ "$confirm_step2" != "DELETE" ]; then
+			echo "已取消删除。"
+			break_end
+			return 0
+		fi
+
+		if rm -f -- "$target_path"; then
+			echo "✅ 删除成功: $target_file"
+		else
+			echo "❌ 删除失败: $target_file"
+		fi
+		break_end
+	}
+
+	openclaw_backup_list_files() {
+		openclaw_backup_render_file_list
+		break_end
+	}
+
+	openclaw_memory_config_file() {
+		echo "${HOME}/.openclaw/openclaw.json"
+	}
+
+	openclaw_memory_config_get() {
+		local key="$1"
+		local default_value="${2:-}"
+		local value
+		value=$(openclaw config get "$key" 2>/dev/null | head -n 1 | sed -e 's/^"//' -e 's/"$//')
+		if [ -z "$value" ] || [ "$value" = "null" ] || [ "$value" = "undefined" ]; then
+			echo "$default_value"
+			return 0
+		fi
+		echo "$value"
+	}
+
+	openclaw_memory_config_set() {
+		local key="$1"
+		shift
+		openclaw config set "$key" "$@" >/dev/null 2>&1
+	}
+
+	openclaw_memory_config_unset() {
+		local key="$1"
+		openclaw config unset "$key" >/dev/null 2>&1
+	}
+
+	openclaw_memory_cleanup_legacy_keys() {
+		openclaw_memory_config_unset "memory.local"
+	}
+
+	openclaw_memory_status_value() {
+		local key="$1"
+		openclaw memory status 2>/dev/null | awk -F': ' -v k="$key" '$1==k {print $2; exit}'
+	}
+
+	openclaw_memory_expand_path() {
+		local raw_path="$1"
+		if [ -z "$raw_path" ]; then
+			echo ""
+			return 0
+		fi
+		raw_path=$(echo "$raw_path" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+		if [[ "$raw_path" == ~* ]]; then
+			echo "${raw_path/#\~/$HOME}"
+		else
+			echo "$raw_path"
+		fi
+	}
+
+	openclaw_memory_rebuild_index_safe() {
+		local store_raw store_file ts backup_file
+		store_raw=$(openclaw_memory_status_value "Store")
+		store_file=$(openclaw_memory_expand_path "$store_raw")
+		if [ -z "$store_file" ] || [ ! -f "$store_file" ]; then
+			echo "⚠️ 未找到索引库文件，可能为空或不存在。"
+			echo "   Store 原始值: ${store_raw:-<空>}"
+			echo "   仍将执行重建索引。"
+		else
+			ts=$(date +%Y%m%d_%H%M%S)
+			backup_file="${store_file}.bak.${ts}"
+			if mv "$store_file" "$backup_file"; then
+				echo "✅ 已备份索引: $backup_file"
+			else
+				echo "⚠️ 索引备份失败，继续重建。"
+			fi
+		fi
+		openclaw memory index --force
+		openclaw gateway restart
+		echo "✅ 索引已重建并自动重启网关"
+		echo ""
+		openclaw_memory_render_status
+	}
+
+	openclaw_memory_prepare_workspace() {
+		local workspace memory_dir
+		workspace=$(openclaw_memory_status_value "Workspace")
+		if [ -z "$workspace" ]; then
+			echo "⚠️ 未能获取 Workspace 路径，跳过目录修复。"
+			return 1
+		fi
+		memory_dir="$workspace/memory"
+		if [ ! -d "$memory_dir" ]; then
+			echo "🔧 记忆目录不存在，已自动创建: $memory_dir"
+			mkdir -p "$memory_dir"
+		fi
+		return 0
+	}
+
+	openclaw_memory_render_status() {
+		local status_output status_lines config_file config_display
+		status_output=$(openclaw memory status 2>/dev/null)
+		if [ $? -ne 0 ] || [ -z "$status_output" ]; then
+			echo "获取状态失败"
+		else
+			status_lines=$(echo "$status_output" | grep -E "^(Provider|Vector|Indexed)" | head -n 3 | sed -e 's/^Provider: /底层方案: /' -e 's/^Vector: /向量库状态: /' -e 's/^Indexed: /已收录文件: /')
+			if [ -z "$status_lines" ]; then
+				echo "未安装/未启动"
+			else
+				echo "$status_lines"
+			fi
+		fi
+	}
+
+	openclaw_memory_get_backend() {
+		local backend
+		backend=$(openclaw_memory_config_get "memory.backend")
+		if [ "$backend" = "local" ]; then
+			echo "builtin"
+		else
+			echo "$backend"
+		fi
+	}
+
+	openclaw_memory_get_local_model_path() {
+		openclaw_memory_config_get "agents.defaults.memorySearch.local.modelPath"
+	}
+
+	openclaw_memory_local_model_status() {
+		local model_path="$1"
+		if [ -z "$model_path" ]; then
+			echo "missing"
+			return
+		fi
+		if [[ "$model_path" == hf:* ]]; then
+			echo "hf"
+			return
+		fi
+		if [ -f "$model_path" ]; then
+			echo "ok"
+		else
+			echo "missing"
+		fi
+	}
+
+	openclaw_memory_qmd_available() {
+		if command -v qmd >/dev/null 2>&1; then
+			echo "true"
+			return
+		fi
+		local backend
+		backend=$(openclaw_memory_config_get "memory.backend")
+		if [ "$backend" = "qmd" ]; then
+			echo "true"
+			return
+		fi
+		echo "false"
+	}
+
+	openclaw_memory_probe_url() {
+		local url="$1"
+		if ! command -v curl >/dev/null 2>&1; then
+			echo "unknown"
+			return
+		fi
+		if [ -z "$url" ]; then
+			echo "unknown"
+			return
+		fi
+		if curl -I -m 2 -s "$url" >/dev/null 2>&1; then
+			echo "ok"
+		else
+			echo "fail"
+		fi
+	}
+
+	openclaw_memory_recommend() {
+		local qmd_ok model_path model_status hf_ok mirror_ok
+		qmd_ok=$(openclaw_memory_qmd_available)
+		model_path=$(openclaw_memory_get_local_model_path)
+		model_status=$(openclaw_memory_local_model_status "$model_path")
+		hf_ok=$(openclaw_memory_probe_url "https://huggingface.co")
+		mirror_ok=$(openclaw_memory_probe_url "https://hf-mirror.com")
+
+		OPENCLAW_MEMORY_RECOMMEND_REASON=()
+		if [ "$qmd_ok" = "true" ]; then
+			OPENCLAW_MEMORY_RECOMMEND_REASON+=("QMD 可用")
+		else
+			OPENCLAW_MEMORY_RECOMMEND_REASON+=("未检测到 QMD")
+		fi
+		if [ -n "$model_path" ]; then
+			OPENCLAW_MEMORY_RECOMMEND_REASON+=("本地模型路径: $model_path")
+		else
+			OPENCLAW_MEMORY_RECOMMEND_REASON+=("未配置本地模型路径")
+		fi
+		case "$model_status" in
+			ok) OPENCLAW_MEMORY_RECOMMEND_REASON+=("本地模型文件存在") ;;
+			hf) OPENCLAW_MEMORY_RECOMMEND_REASON+=("模型来自 HF 下载源（国内可能慢/失败）") ;;
+			*) OPENCLAW_MEMORY_RECOMMEND_REASON+=("本地模型文件不存在或不可用") ;;
+		esac
+		if [ "$hf_ok" = "ok" ]; then
+			OPENCLAW_MEMORY_RECOMMEND_REASON+=("huggingface.co 可访问")
+		elif [ "$mirror_ok" = "ok" ]; then
+			OPENCLAW_MEMORY_RECOMMEND_REASON+=("hf-mirror.com 可访问")
+		else
+			OPENCLAW_MEMORY_RECOMMEND_REASON+=("huggingface.co / hf-mirror.com 可能不可达（疑似国内/受限网络）")
+		fi
+
+		if [ "$qmd_ok" = "true" ]; then
+			if [ "$model_status" = "ok" ]; then
+				OPENCLAW_MEMORY_RECOMMEND="local"
+			elif [ "$model_status" = "hf" ] && { [ "$hf_ok" = "ok" ] || [ "$mirror_ok" = "ok" ]; }; then
+				OPENCLAW_MEMORY_RECOMMEND="local"
+			elif [ "$model_status" = "hf" ] && [ "$hf_ok" = "fail" ] && [ "$mirror_ok" = "fail" ]; then
+				OPENCLAW_MEMORY_RECOMMEND="qmd"
+			else
+				OPENCLAW_MEMORY_RECOMMEND="qmd"
+			fi
+		else
+			if [ "$model_status" = "ok" ]; then
+				OPENCLAW_MEMORY_RECOMMEND="local"
+			else
+				OPENCLAW_MEMORY_RECOMMEND="qmd"
+			fi
+		fi
+	}
+
+
+	openclaw_memory_detect_region() {
+		OPENCLAW_MEMORY_COUNTRY="unknown"
+		OPENCLAW_MEMORY_USE_MIRROR="false"
+		if command -v curl >/dev/null 2>&1; then
+			OPENCLAW_MEMORY_COUNTRY=$(curl -s -m 2 ipinfo.io/country | tr -d '
+' | tr -d '
+')
+		fi
+		case "$OPENCLAW_MEMORY_COUNTRY" in
+			CN|HK)
+				OPENCLAW_MEMORY_USE_MIRROR="true"
+				;;
+		esac
+	}
+
+	openclaw_memory_select_sources() {
+		local hf_ok mirror_ok
+		hf_ok=$(openclaw_memory_probe_url "https://huggingface.co")
+		mirror_ok=$(openclaw_memory_probe_url "https://hf-mirror.com")
+		OPENCLAW_MEMORY_HF_OK="$hf_ok"
+		OPENCLAW_MEMORY_MIRROR_OK="$mirror_ok"
+		if [ "$OPENCLAW_MEMORY_USE_MIRROR" = "true" ]; then
+			if [ "$mirror_ok" = "ok" ]; then
+				OPENCLAW_MEMORY_HF_BASE="https://hf-mirror.com"
+			elif [ "$hf_ok" = "ok" ]; then
+				OPENCLAW_MEMORY_HF_BASE="https://huggingface.co"
+			else
+				OPENCLAW_MEMORY_HF_BASE="https://hf-mirror.com"
+			fi
+			OPENCLAW_MEMORY_GH_PROXY="https://gh.kejilion.pro/"
+		else
+			if [ "$hf_ok" = "ok" ]; then
+				OPENCLAW_MEMORY_HF_BASE="https://huggingface.co"
+			elif [ "$mirror_ok" = "ok" ]; then
+				OPENCLAW_MEMORY_HF_BASE="https://hf-mirror.com"
+			else
+				OPENCLAW_MEMORY_HF_BASE="https://huggingface.co"
+			fi
+			OPENCLAW_MEMORY_GH_PROXY="https://"
+		fi
+	}
+
+	openclaw_memory_download_file() {
+		local url="$1"
+		local dest="$2"
+		mkdir -p "$(dirname "$dest")"
+		if command -v curl >/dev/null 2>&1; then
+			curl -L --fail --retry 2 -o "$dest" "$url"
+			return $?
+		fi
+		if command -v wget >/dev/null 2>&1; then
+			wget -O "$dest" "$url"
+			return $?
+		fi
+		echo "❌ 未检测到 curl 或 wget，无法下载。"
+		return 1
+	}
+
+	openclaw_memory_check_sqlite() {
+		if ! command -v sqlite3 >/dev/null 2>&1; then
+			echo "⚠️ 未检测到 sqlite3，QMD 可能无法正常运行。"
+			return 1
+		fi
+		local ver
+		ver=$(sqlite3 --version 2>/dev/null | awk '{print $1}')
+		echo "✅ sqlite3 可用: ${ver:-unknown}"
+		echo "ℹ️ sqlite 扩展支持无法可靠检测，将继续。"
+		return 0
+	}
+
+	openclaw_memory_ensure_bun() {
+		if [ -x "$HOME/.bun/bin/bun" ]; then
+			export PATH="$HOME/.bun/bin:$PATH"
+		fi
+		if command -v bun >/dev/null 2>&1; then
+			echo "✅ bun 已存在"
+			return 0
+		fi
+		echo "⬇️ 安装 bun..."
+		if command -v curl >/dev/null 2>&1; then
+			curl -fsSL https://bun.sh/install | bash
+		elif command -v wget >/dev/null 2>&1; then
+			wget -qO- https://bun.sh/install | bash
+		else
+			echo "❌ 未检测到 curl 或 wget，无法安装 bun。"
+			return 1
+		fi
+		if [ -d "$HOME/.bun/bin" ]; then
+			export PATH="$HOME/.bun/bin:$PATH"
+		fi
+		if command -v bun >/dev/null 2>&1; then
+			echo "✅ bun 安装完成"
+			return 0
+		fi
+		echo "❌ bun 安装失败"
+		return 1
+	}
+
+	openclaw_memory_ensure_qmd() {
+		local qmd_path
+		qmd_path=$(command -v qmd 2>/dev/null || true)
+		if [ -n "$qmd_path" ]; then
+			echo "✅ qmd 已存在: $qmd_path"
+			OPENCLAW_MEMORY_QMD_PATH="$qmd_path"
+			return 0
+		fi
+		openclaw_memory_ensure_bun || return 1
+		local qmd_url="${OPENCLAW_MEMORY_GH_PROXY}github.com/tobi/qmd"
+		echo "⬇️ 通过 bun 安装 qmd: $qmd_url"
+		bun install -g "$qmd_url"
+		qmd_path=$(command -v qmd 2>/dev/null || true)
+		if [ -z "$qmd_path" ] && [ -x "$HOME/.bun/bin/qmd" ]; then
+			qmd_path="$HOME/.bun/bin/qmd"
+		fi
+		if [ -z "$qmd_path" ]; then
+			echo "❌ qmd 安装失败"
+			return 1
+		fi
+		OPENCLAW_MEMORY_QMD_PATH="$qmd_path"
+		echo "✅ qmd 安装完成: $qmd_path"
+		return 0
+	}
+
+	openclaw_memory_render_auto_summary() {
+		echo "---------------------------------------"
+		echo "✅ 环境就绪"
+		echo "方案: ${OPENCLAW_MEMORY_AUTO_SCHEME:-unknown}"
+		if [ "$OPENCLAW_MEMORY_CONFIG_ONLY" = "true" ]; then
+			echo "模式: 仅写配置（未安装/未下载）"
+		fi
+		if [ "$OPENCLAW_MEMORY_PREHEAT" = "true" ]; then
+			echo "索引: 已执行"
+		else
+			echo "索引: 已跳过"
+		fi
+		if [ "$OPENCLAW_MEMORY_RESTARTED" = "true" ]; then
+			echo "重启: 已执行"
+		else
+			echo "重启: 已跳过"
+		fi
+		if [ -n "$OPENCLAW_MEMORY_QMD_PATH" ]; then
+			echo "qmd: $OPENCLAW_MEMORY_QMD_PATH"
+		fi
+		if [ -n "$OPENCLAW_MEMORY_MODEL_PATH" ]; then
+			echo "模型: $OPENCLAW_MEMORY_MODEL_PATH"
+		fi
+		if [ -n "$OPENCLAW_MEMORY_COUNTRY" ]; then
+			echo "地区: $OPENCLAW_MEMORY_COUNTRY"
+		fi
+		if [ -n "$OPENCLAW_MEMORY_HF_BASE" ]; then
+			echo "下载源: $OPENCLAW_MEMORY_HF_BASE"
+		fi
+		echo "最终状态:"
+		openclaw_memory_render_status
+		echo "---------------------------------------"
+	}
+
+	openclaw_memory_auto_confirm() {
+		local scheme_label="$1"
+		OPENCLAW_MEMORY_PREHEAT="true"
+		OPENCLAW_MEMORY_RESTARTED="false"
+		OPENCLAW_MEMORY_CONFIG_ONLY="false"
+		echo "即将执行自动部署（详细模式）"
+		echo "目标方案: $scheme_label"
+		echo "地区: ${OPENCLAW_MEMORY_COUNTRY:-unknown}"
+		echo "镜像源探测: huggingface.co=${OPENCLAW_MEMORY_HF_OK:-unknown} hf-mirror.com=${OPENCLAW_MEMORY_MIRROR_OK:-unknown}"
+		echo "下载源: ${OPENCLAW_MEMORY_HF_BASE:-unknown}"
+		if [ -n "$OPENCLAW_MEMORY_EXPECT_PATH" ]; then
+			echo "预计下载路径: $OPENCLAW_MEMORY_EXPECT_PATH"
+		fi
+		if [ -n "$OPENCLAW_MEMORY_EXPECT_SIZE" ]; then
+			echo "可能流量/磁盘占用: $OPENCLAW_MEMORY_EXPECT_SIZE"
+		else
+			echo "可能流量/磁盘占用: 视实际情况而定"
+		fi
+		echo "确认后将自动安装/下载、写入配置、构建索引并重启网关"
+		echo "高级选项: 输入 config 仅写配置（不安装不下载、不索引、不重启）"
+		read -e -p "输入 yes 确认继续（默认 N）: " confirm_step
+		case "$confirm_step" in
+			yes|YES)
+				OPENCLAW_MEMORY_PREHEAT="true"
+				;;
+			config|CONFIG)
+				OPENCLAW_MEMORY_CONFIG_ONLY="true"
+				OPENCLAW_MEMORY_PREHEAT="false"
+				;;
+			*)
+				echo "已取消自动部署。"
+				return 1
+				;;
+		esac
+		if [ "$OPENCLAW_MEMORY_CONFIG_ONLY" = "true" ]; then
+			echo "⚠️ 已选择仅写配置，不安装不下载"
+		else
+			echo "✅ 将自动构建索引并重启网关"
+		fi
+		return 0
+	}
+
+	openclaw_memory_auto_setup_qmd() {
+		echo "🔍 检测 QMD 环境"
+		openclaw_memory_cleanup_legacy_keys
+		openclaw_memory_check_sqlite || true
+		if [ "$OPENCLAW_MEMORY_CONFIG_ONLY" = "true" ]; then
+			if command -v qmd >/dev/null 2>&1; then
+				OPENCLAW_MEMORY_QMD_PATH=$(command -v qmd)
+			else
+				OPENCLAW_MEMORY_QMD_PATH="qmd"
+			fi
+		else
+			openclaw_memory_ensure_qmd || return 1
+		fi
+		local backend
+		backend=$(openclaw_memory_get_backend)
+		if [ "$backend" = "qmd" ]; then
+			echo "✅ memory.backend 已是 qmd"
+		else
+			openclaw_memory_config_set "memory.backend" "qmd"
+			echo "✅ 已设置 memory.backend=qmd"
+		fi
+		local qmd_cmd
+		qmd_cmd=$(openclaw_memory_config_get "memory.qmd.command")
+		if [ -z "$qmd_cmd" ] || [[ "$qmd_cmd" != /* ]] || [ "$qmd_cmd" != "$OPENCLAW_MEMORY_QMD_PATH" ]; then
+			openclaw_memory_config_set "memory.qmd.command" "$OPENCLAW_MEMORY_QMD_PATH"
+			echo "✅ 已写入 memory.qmd.command: $OPENCLAW_MEMORY_QMD_PATH"
+		else
+			echo "✅ memory.qmd.command 已正确"
+		fi
+		if [ "$OPENCLAW_MEMORY_PREHEAT" = "true" ]; then
+			echo "🔥 预热索引（可能下载模型）"
+			openclaw_memory_prepare_workspace
+			openclaw memory index --force
+		else
+			echo "⏭️ 已跳过预热"
+		fi
+		echo "✅ QMD 自动部署完成"
+	}
+
+	openclaw_memory_auto_setup_local() {
+		echo "🔍 检测 Local 环境"
+		openclaw_memory_cleanup_legacy_keys
+		local backend provider
+		backend=$(openclaw_memory_get_backend)
+		if [ "$backend" = "builtin" ] || [ "$backend" = "local" ]; then
+			echo "✅ memory.backend 已是 builtin"
+		else
+			openclaw_memory_config_set "memory.backend" "builtin"
+			echo "✅ 已设置 memory.backend=builtin"
+		fi
+		provider=$(openclaw_memory_config_get "agents.defaults.memorySearch.provider")
+		if [ "$provider" = "local" ]; then
+			echo "✅ memorySearch.provider 已是 local"
+		else
+			openclaw_memory_config_set "agents.defaults.memorySearch.provider" "local"
+			echo "✅ 已设置 agents.defaults.memorySearch.provider=local"
+		fi
+
+		local model_path model_status
+		model_path=$(openclaw_memory_get_local_model_path)
+		model_path=$(openclaw_memory_expand_path "$model_path")
+		model_status=$(openclaw_memory_local_model_status "$model_path")
+		if [ "$model_status" = "ok" ]; then
+			echo "✅ 模型文件已存在: $model_path"
+			OPENCLAW_MEMORY_MODEL_PATH="$model_path"
+		else
+			local model_name="embeddinggemma-300M-Q8_0.gguf"
+			local model_dir="$HOME/.openclaw/models/embedding"
+			local model_dest="$model_dir/$model_name"
+			local model_url="${OPENCLAW_MEMORY_HF_BASE}/ggml-org/embeddinggemma-300M-GGUF/resolve/main/$model_name"
+			if [ "$OPENCLAW_MEMORY_CONFIG_ONLY" = "true" ]; then
+				echo "ℹ️ 仅写配置模式：跳过模型下载"
+				OPENCLAW_MEMORY_MODEL_PATH="$model_dest"
+			else
+				if [ -f "$model_dest" ]; then
+					echo "✅ 已发现默认模型文件: $model_dest"
+				else
+					echo "⬇️ 下载模型: $model_url"
+					openclaw_memory_download_file "$model_url" "$model_dest" || return 1
+					echo "✅ 模型已下载: $model_dest"
+				fi
+				OPENCLAW_MEMORY_MODEL_PATH="$model_dest"
+			fi
+			openclaw_memory_config_set "agents.defaults.memorySearch.local.modelPath" "$model_dest"
+			echo "✅ 已写入模型路径"
+		fi
+		if [ "$OPENCLAW_MEMORY_PREHEAT" = "true" ]; then
+			echo "🔥 预热索引（可能下载模型）"
+			openclaw_memory_prepare_workspace
+			openclaw memory index --force
+		else
+			echo "⏭️ 已跳过预热"
+		fi
+		echo "✅ Local 自动部署完成"
+	}
+
+	openclaw_memory_auto_setup_run() {
+		local scheme="$1"
+		local scheme_label
+		OPENCLAW_MEMORY_QMD_PATH=""
+		OPENCLAW_MEMORY_MODEL_PATH=""
+		OPENCLAW_MEMORY_EXPECT_PATH=""
+		OPENCLAW_MEMORY_EXPECT_SIZE=""
+		openclaw_memory_detect_region
+		openclaw_memory_select_sources
+		if [ "$scheme" = "auto" ]; then
+			openclaw_memory_recommend
+			scheme="$OPENCLAW_MEMORY_RECOMMEND"
+		fi
+		case "$scheme" in
+			qmd)
+				scheme_label="QMD"
+				OPENCLAW_MEMORY_EXPECT_PATH="$HOME/.bun (qmd 安装目录)"
+				OPENCLAW_MEMORY_EXPECT_SIZE="约 20-50MB"
+				;;
+			local)
+				scheme_label="Local"
+				OPENCLAW_MEMORY_EXPECT_PATH="$HOME/.openclaw/models/embedding/embeddinggemma-300M-Q8_0.gguf"
+				OPENCLAW_MEMORY_EXPECT_SIZE="约 350-600MB"
+				;;
+			*)
+				echo "❌ 未知方案: $scheme"
+				return 1
+				;;
+		esac
+		OPENCLAW_MEMORY_AUTO_SCHEME="$scheme_label"
+		openclaw_memory_auto_confirm "$scheme_label" || return 0
+		case "$scheme" in
+			qmd) openclaw_memory_auto_setup_qmd || return 1 ;;
+			local) openclaw_memory_auto_setup_local || return 1 ;;
+			*) return 1 ;;
+		esac
+		if [ "$OPENCLAW_MEMORY_CONFIG_ONLY" = "true" ]; then
+			OPENCLAW_MEMORY_RESTARTED="false"
+			openclaw_memory_render_auto_summary
+			return 0
+		fi
+		echo "♻️ 重启 OpenClaw 网关"
+		if declare -F start_gateway >/dev/null 2>&1; then
+			start_gateway
+		else
+			openclaw gateway restart
+		fi
+		OPENCLAW_MEMORY_RESTARTED="true"
+		openclaw_memory_render_auto_summary
+		return 0
+	}
+
+	openclaw_memory_auto_setup_menu() {
+		while true; do
+			clear
+			echo "======================================="
+			echo "记忆方案自动部署"
+			echo "======================================="
+			echo "1. QMD"
+			echo "2. Local"
+			echo "3. Auto（自动选择）"
+			echo "0. 返回上一级"
+			echo "---------------------------------------"
+			read -e -p "请输入你的选择: " auto_choice
+			case "$auto_choice" in
+				1)
+					openclaw_memory_auto_setup_run "qmd"
+					break_end
+					;;
+				2)
+					openclaw_memory_auto_setup_run "local"
+					break_end
+					;;
+				3)
+					openclaw_memory_auto_setup_run "auto"
+					break_end
+					;;
+				0)
+					return 0
+					;;
+				*)
+					echo "无效的选择，请重试。"
+					sleep 1
+					;;
+			esac
+		done
+	}
+
+	openclaw_memory_apply_scheme() {
+		local scheme="$1"
+		openclaw_memory_cleanup_legacy_keys
+		case "$scheme" in
+			qmd)
+				openclaw_memory_config_set "memory.backend" "qmd"
+				if [ $? -ne 0 ]; then
+					echo "❌ 写入配置失败"
+					return 1
+				fi
+				openclaw_memory_config_set "memory.qmd.command" "qmd" >/dev/null 2>&1
+				;;
+			local)
+				openclaw_memory_config_set "memory.backend" "builtin"
+				if [ $? -ne 0 ]; then
+					echo "❌ 写入配置失败"
+					return 1
+				fi
+				openclaw_memory_config_set "agents.defaults.memorySearch.provider" "local" >/dev/null 2>&1
+				;;
+			*)
+				echo "❌ 未知方案: $scheme"
+				return 1
+			esac
+		echo "✅ 已更新记忆方案配置"
+		return 0
+	}
+
+	openclaw_memory_offer_restart() {
+		echo "配置已写入，需要重启 OpenClaw 网关后生效。"
+		read -e -p "是否立即重启 OpenClaw 网关？(Y/n): " restart_choice
+		if [[ "$restart_choice" =~ ^[Nn]$ ]]; then
+			echo "已跳过重启，可稍后执行: openclaw gateway restart"
+			return 0
+		fi
+		if declare -F start_gateway >/dev/null 2>&1; then
+			start_gateway
+		else
+			openclaw gateway restart
+		fi
+	}
+
+	openclaw_memory_fix_index() {
+		local backend
+		backend=$(openclaw_memory_get_backend)
+		if [ "$backend" = "qmd" ] && ! command -v qmd >/dev/null 2>&1; then
+			echo "⚠️ 检测到当前方案为 QMD，但未安装 qmd 命令。"
+			echo "   可切换 Local，或安装 bun + qmd 后再试。"
+		fi
+		echo "适用场景：Indexed 分子 > 分母（重复 collection 导致计数异常）"
+		read -e -p "确认将 includeDefaultMemory 设为 false？(y/N): " confirm_fix
+		if [[ ! "$confirm_fix" =~ ^[Yy]$ ]]; then
+			echo "已取消。"
+			break_end
+			return 0
+		fi
+		openclaw_memory_config_set "memory.qmd.includeDefaultMemory" false
+		if [ $? -ne 0 ]; then
+			echo "❌ 写入配置失败"
+			break_end
+			return 1
+		fi
+		echo "✅ 已设置 includeDefaultMemory=false"
+		echo "推荐执行：清理并重建索引"
+		read -e -p "是否执行清理并重建索引（推荐）？(Y/n): " rebuild_choice
+		if [[ ! "$rebuild_choice" =~ ^[Nn]$ ]]; then
+			openclaw_memory_rebuild_index_safe
+		else
+			echo "可稍后在记忆管理中查看状态。"
+		fi
+		break_end
+	}
+
+	openclaw_memory_scheme_menu() {
+		while true; do
+			clear
+			echo "======================================="
+			echo "OpenClaw 记忆方案"
+			echo "======================================="
+			local backend current_label
+			backend=$(openclaw_memory_get_backend)
+			case "$backend" in
+				qmd) current_label="QMD" ;;
+				builtin|local) current_label="Local" ;;
+				*) current_label="未配置" ;;
+			esac
+			echo "当前方案: $current_label"
+			echo ""
+			echo "QMD  : 轻量索引，依赖 qmd 命令（适合网络受限）"
+			echo "Local: 本地向量检索，依赖 embedding 模型文件"
+			echo "Auto : 自动推荐（基于可用性 + 网络探测）"
+			echo "---------------------------------------"
+			echo "1. 切换 QMD（自动部署/已装则跳过）"
+			echo "2. 切换 Local（自动部署/已装则跳过）"
+			echo "3. Auto（自动推荐并自动部署）"
+			echo "0. 返回上一级"
+			echo "---------------------------------------"
+			read -e -p "请输入你的选择: " scheme_choice
+			case "$scheme_choice" in
+				1)
+					openclaw_memory_auto_setup_run "qmd"
+					break_end
+					;;
+				2)
+					openclaw_memory_auto_setup_run "local"
+					break_end
+					;;
+				3)
+					openclaw_memory_auto_setup_run "auto"
+					break_end
+					;;
+				0)
+					return 0
+					;;
+				*)
+					echo "无效的选择，请重试。"
+					sleep 1
+					;;
+			esac
+		done
+	}
+
+	openclaw_memory_file_collect() {
+		OPENCLAW_MEMORY_FILES=()
+		local base_dir="${HOME}/.openclaw/workspace"
+		local memory_dir="$base_dir/memory"
+		local memory_file="$base_dir/MEMORY.md"
+		[ -f "$memory_file" ] && OPENCLAW_MEMORY_FILES+=("$memory_file")
+		if [ -d "$memory_dir" ]; then
+			while IFS= read -r file; do
+				[ -f "$file" ] && OPENCLAW_MEMORY_FILES+=("$file")
+			done < <(find "$memory_dir" -type f -name '*.md' | sort)
+		fi
+	}
+
+	openclaw_memory_file_render_list() {
+		local base_dir="${HOME}/.openclaw/workspace"
+		openclaw_memory_file_collect
+		if [ ${#OPENCLAW_MEMORY_FILES[@]} -eq 0 ]; then
+			echo "未找到记忆文件。"
+			return 0
+		fi
+		echo "编号 | 相对路径 | 大小 | 修改时间"
+		echo "---------------------------------------"
+		local i file rel size mtime
+		for i in "${!OPENCLAW_MEMORY_FILES[@]}"; do
+			file="${OPENCLAW_MEMORY_FILES[$i]}"
+			rel="${file#$base_dir/}"
+			size=$(ls -lh "$file" | awk '{print $5}')
+			mtime=$(date -d "$(stat -c %y "$file")" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || stat -c %y "$file" | awk '{print $1" "$2}')
+			printf "%s | %s | %s | %s\\n" "$((i+1))" "$rel" "$size" "$mtime"
+		done
+	}
+
+	openclaw_memory_view_file() {
+		local file="$1"
+		[ -f "$file" ] || {
+			echo "❌ 文件不存在: $file"
+			return 1
+		}
+		local total_lines
+		total_lines=$(wc -l < "$file" 2>/dev/null || echo 0)
+		local default_lines=120
+		local start_line count
+		echo "文件: $file"
+		echo "总行数: $total_lines"
+		read -e -p "请输入起始行（回车默认末尾 $default_lines 行）: " start_line
+		read -e -p "请输入显示行数（回车默认 $default_lines）: " count
+		[ -z "$count" ] && count=$default_lines
+		if [ -z "$start_line" ]; then
+			if [ "$total_lines" -le "$count" ]; then
+				start_line=1
+			else
+				start_line=$((total_lines - count + 1))
+			fi
+		fi
+		if ! [[ "$start_line" =~ ^[0-9]+$ ]] || ! [[ "$count" =~ ^[0-9]+$ ]]; then
+			echo "❌ 请输入有效的数字。"
+			return 1
+		fi
+		if [ "$start_line" -lt 1 ]; then
+			start_line=1
+		fi
+		if [ "$count" -le 0 ]; then
+			echo "❌ 行数必须大于 0。"
+			return 1
+		fi
+		local end_line=$((start_line + count - 1))
+		if [ "$end_line" -gt "$total_lines" ]; then
+			end_line=$total_lines
+		fi
+		if [ "$total_lines" -eq 0 ]; then
+			echo "(空文件)"
+			return 0
+		fi
+		echo "---------------------------------------"
+		sed -n "${start_line},${end_line}p" "$file"
+		echo "---------------------------------------"
+	}
+
+	openclaw_memory_files_menu() {
+		while true; do
+			clear
+			echo "======================================="
+			echo "OpenClaw 记忆文件"
+			echo "======================================="
+			openclaw_memory_file_render_list
+			echo "---------------------------------------"
+			read -e -p "请输入文件编号查看（0 返回）: " file_choice
+			if [ "$file_choice" = "0" ]; then
+				return 0
+			fi
+			if ! [[ "$file_choice" =~ ^[0-9]+$ ]]; then
+				echo "无效的选择，请重试。"
+				sleep 1
+				continue
+			fi
+			openclaw_memory_file_collect
+			if [ ${#OPENCLAW_MEMORY_FILES[@]} -eq 0 ]; then
+				read -p "未找到记忆文件，按回车返回..."
+				return 0
+			fi
+			local idx=$((file_choice-1))
+			if [ "$idx" -lt 0 ] || [ "$idx" -ge ${#OPENCLAW_MEMORY_FILES[@]} ]; then
+				echo "无效的编号，请重试。"
+				sleep 1
+				continue
+			fi
+			openclaw_memory_view_file "${OPENCLAW_MEMORY_FILES[$idx]}"
+			read -p "按回车返回列表..."
+			done
+	}
+
+	openclaw_memory_menu() {
+		send_stats "OpenClaw记忆管理"
+		while true; do
+			clear
+			echo "======================================="
+			echo "OpenClaw 记忆管理"
+			echo "======================================="
+			openclaw_memory_render_status
+			echo "1. 更新记忆索引"
+			echo "2. 查看记忆文件"
+			echo "3. 索引修复（Indexed 异常）"
+			echo "4. 记忆方案（QMD/Local/Auto）"
+			echo "0. 返回上一级"
+			echo "---------------------------------------"
+			read -e -p "请输入你的选择: " memory_choice
+			case "$memory_choice" in
+				1)
+					echo "即将更新记忆索引。"
+					read -e -p "第一次确认：输入 yes 继续: " confirm_step1
+					if [ "$confirm_step1" != "yes" ]; then
+						echo "已取消。"
+						break_end
+						continue
+					fi
+				openclaw_memory_prepare_workspace
+				read -e -p "二次确认：输入 force 使用全量（留空为增量）: " confirm_step2
+				if [ "$confirm_step2" = "force" ]; then
+					echo "⚠️ 全量重建更彻底，但耗时更长。"
+					echo "推荐：输入 rebuild 进行安全重建（先备份索引库）。"
+					read -e -p "第三次确认：输入 rebuild 执行安全重建；直接回车继续普通 force: " confirm_step3
+					if [ "$confirm_step3" = "rebuild" ]; then
+						openclaw_memory_rebuild_index_safe
+					else
+						openclaw memory index --force
+						openclaw gateway restart
+						echo "✅ 索引已重建并自动重启网关"
+					fi
+				else
+					openclaw memory index
+				fi
+				break_end
+					;;
+				2)
+					openclaw_memory_files_menu
+					;;
+				3)
+					openclaw_memory_fix_index
+					;;
+				4)
+					openclaw_memory_scheme_menu
+					;;
+				0)
+					return 0
+					;;
+				*)
+					echo "无效的选择，请重试。"
+					sleep 1
+					;;
+			esac
+		done
+	}
+
+	openclaw_backup_restore_menu() {
+
+		send_stats "OpenClaw备份与还原"
+		while true; do
+			clear
+			echo "======================================="
+			echo "OpenClaw 备份与还原"
+			echo "======================================="
+			openclaw_backup_render_file_list
+			echo "---------------------------------------"
+			echo "1. 备份记忆全量"
+			echo "2. 还原记忆全量"
+			echo "3. 备份 OpenClaw 项目（默认安全模式）"
+			echo "4. 还原 OpenClaw 项目（高级/高风险）"
+			echo "5. 删除备份文件"
+			echo "0. 返回上一级"
+			echo "---------------------------------------"
+			read -e -p "请输入你的选择: " backup_choice
+
+			case "$backup_choice" in
+				1) openclaw_memory_backup_export ;;
+				2) openclaw_memory_backup_import ;;
+				3) openclaw_project_backup_export ;;
+				4) openclaw_project_backup_import ;;
+				5) openclaw_backup_delete_file ;;
+				0) return 0 ;;
+				*)
+					echo "无效的选择，请重试。"
+					sleep 1
+					;;
+			esac
+		done
+	}
+
+
 	update_moltbot() {
 		echo "更新 OpenClaw..."
 		send_stats "更新 OpenClaw..."
 		install_node_and_tools
+		git config --global url."${gh_proxy}github.com/".insteadOf ssh://git@github.com/
+		git config --global url."${gh_proxy}github.com/".insteadOf git@github.com:
 		npm install -g openclaw@latest
 		crontab -l 2>/dev/null | grep -v "s gateway" | crontab -
 		start_gateway
@@ -10734,7 +13850,7 @@ EOF
 			3) stop_bot ;;
 			4) view_logs ;;
 			5) change_model ;;
-			6) add-openclaw-provider-interactive ;;
+			6) openclaw_api_manage_menu ;;
 			7) change_tg_bot_code ;;
 			8) install_plugin ;;
 			9) install_skill ;;
@@ -10745,6 +13861,12 @@ EOF
 				;;
 			12) send_stats "健康检测与修复"
 				openclaw doctor --fix
+				send_stats "OpenClaw API同步触发"
+				if sync_openclaw_api_models; then
+					start_gateway
+				else
+					echo "❌ API 模型同步失败，已中止重启网关。请检查 provider /models 返回后重试。"
+				fi
 				break_end
 			 	;;
 			13) openclaw_webui_menu ;;
@@ -10752,8 +13874,10 @@ EOF
 				openclaw tui
 				break_end
 			 	;;
-			15) update_moltbot ;;
-			16) uninstall_moltbot ;;
+			15) openclaw_memory_menu ;;
+			16) openclaw_backup_restore_menu ;;
+			17) update_moltbot ;;
+			18) uninstall_moltbot ;;
 			*) break ;;
 		esac
 	done
@@ -10864,7 +13988,7 @@ while true; do
 	  echo -e "${gl_kjlan}109. ${color109}ZFile在线网盘                       ${gl_kjlan}110. ${color110}Karakeep书签管理"
 	  echo -e "${gl_kjlan}-------------------------"
 	  echo -e "${gl_kjlan}111. ${color111}多格式文件转换工具                  ${gl_kjlan}112. ${color112}Lucky大内网穿透工具"
-	  echo -e "${gl_kjlan}113. ${color113}Firefox浏览器                       ${gl_kjlan}114. ${color114}ClawdBot/Moltbot机器人${gl_huang}★${gl_bai}"
+	  echo -e "${gl_kjlan}113. ${color113}Firefox浏览器                       ${gl_kjlan}114. ${color114}OpenClaw机器人管理工具${gl_huang}★${gl_bai}"
 	  echo -e "${gl_kjlan}-------------------------"
 	  echo -e "${gl_kjlan}第三方应用列表"
   	  echo -e "${gl_kjlan}想要让你的应用出现在这里？查看开发者指南: ${gl_huang}https://dev.kejilion.sh/${gl_bai}"
@@ -14547,14 +17671,9 @@ discourse,yunsou,ahhhhfs,nsgame,gying" \
 			read -e -p "要传送备份数据到远程服务器吗？(Y/N): " choice
 			case "$choice" in
 			  [Yy])
-				read -e -p "请输入远端服务器IP:  " remote_ip
-				read -e -p "目标服务器SSH端口 [默认22]: " TARGET_PORT
-				local TARGET_PORT=${TARGET_PORT:-22}
-
-				if [ -z "$remote_ip" ]; then
-				  echo "错误: 请输入远端服务器IP。"
-				  continue
-				fi
+				kj_ssh_read_host_port "请输入远端服务器IP:  " "目标服务器SSH端口 [默认22]: " "22"
+				local remote_ip="$KJ_SSH_HOST"
+				local TARGET_PORT="$KJ_SSH_PORT"
 				local latest_tar=$(ls -t /app*.tar.gz | head -1)
 				if [ -n "$latest_tar" ]; then
 				  ssh-keygen -f "/root/.ssh/known_hosts" -R "$remote_ip"
@@ -16616,26 +19735,13 @@ linux_file() {
 					continue
 				fi
 
-				read -e -p "请输入远端服务器IP: " remote_ip
-				if [ -z "$remote_ip" ]; then
-					echo "错误: 请输入远端服务器IP。"
-					send_stats "传送文件失败: 未输入远端服务器IP"
-					continue
-				fi
+				kj_ssh_read_host_user_port "请输入远端服务器IP: " "请输入远端服务器用户名 (默认root): " "请输入登录端口 (默认22): " "root" "22"
+				local remote_ip="$KJ_SSH_HOST"
+				local remote_user="$KJ_SSH_USER"
+				local remote_port="$KJ_SSH_PORT"
 
-				read -e -p "请输入远端服务器用户名 (默认root): " remote_user
-				remote_user=${remote_user:-root}
-
-				read -e -p "请输入远端服务器密码: " -s remote_password
-				echo
-				if [ -z "$remote_password" ]; then
-					echo "错误: 请输入远端服务器密码。"
-					send_stats "传送文件失败: 未输入远端服务器密码"
-					continue
-				fi
-
-				read -e -p "请输入登录端口 (默认22): " remote_port
-				remote_port=${remote_port:-22}
+				kj_ssh_read_password "请输入远端服务器密码: "
+				local remote_password="$KJ_SSH_PASSWORD"
 
 				# 清除已知主机的旧条目
 				ssh-keygen -f "/root/.ssh/known_hosts" -R "$remote_ip"
