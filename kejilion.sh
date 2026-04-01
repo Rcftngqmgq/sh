@@ -10109,8 +10109,7 @@ with open(path, 'r', encoding='utf-8') as f:
     obj = json.load(f)
 
 session = obj.setdefault('session', {})
-session['dmScope'] = session.get('dmScope', 'per-channel-peer')
-session['resetTriggers'] = ['/new', '/reset']
+session.setdefault('dmScope', 'per-channel-peer')
 session['reset'] = {
     'mode': 'idle',
     'idleMinutes': 10080
@@ -22358,7 +22357,7 @@ while true; do
 			canshu_v6
 			CheckFirstRun_true
 			yinsiyuanquan2
-			cp -f ~/kejilion /usr/local/bin/x > /dev/null 2>&1
+			cp -f ~/kejilion /usr/local/bin/k > /dev/null 2>&1
 			echo -e "${gl_lv}脚本已更新到最新版本！${gl_huang}v$sh_v_new${gl_bai}"
 			send_stats "脚本已经最新$sh_v_new"
 			break_end
@@ -22416,9 +22415,9 @@ x_all_in_one() {
     echo "1. 优化系统更新源，更新系统到最新"
     echo "2. 清理系统垃圾文件"
     echo -e "3. 设置虚拟内存${gl_huang}1G${gl_bai}"
-    echo -e "4. 设置SSH端口号为${gl_huang}22${gl_bai}"
+    echo -e "4. 设置SSH端口号为${gl_huang}5522${gl_bai}"
     echo -e "5. 启动fail2ban防御SSH暴力破解"
-    echo -e "6. 开放主要端口：SSH(22), HTTP(80), HTTPS(443), 5522)"
+    echo -e "6. 开放主要端口：SSH(22), HTTP(80), HTTPS(443), SSH(5522)"
     echo -e "7. 开启${gl_huang}BBR${gl_bai}加速"
     echo -e "8. 设置时区到${gl_huang}上海${gl_bai}"
     echo -e "9. 自动优化DNS地址${gl_huang}海外: 1.1.1.1 8.8.8.8  国内: 223.5.5.5 ${gl_bai}"
