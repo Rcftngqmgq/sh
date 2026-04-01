@@ -551,7 +551,7 @@ while true; do
 			canshu_v6
 			CheckFirstRun_true
 			yinsiyuanquan2
-			cp -f ~/kejilion /usr/local/bin/x > /dev/null 2>&1
+			cp -f ~/kejilion /usr/local/bin/k > /dev/null 2>&1
 			echo -e "${gl_lv}脚本已更新到最新版本！${gl_huang}v$sh_v_new${gl_bai}"
 			send_stats "脚本已经最新$sh_v_new"
 			break_end
