@@ -19,7 +19,7 @@ echo -e "${gl_kjlan}6.   ${gl_bai}Docker管理			${gl_kjlan}13.  ${gl_bai}系统
 echo -e "${gl_kjlan}------------------------------------------------------------------------${gl_bai}"
 echo -e "${gl_kjlan}21.   ${gl_bai}安装Nginx容器		${gl_kjlan}31.	${gl_bai}ROOT私钥登录模式"
 echo -e "${gl_kjlan}22.   ${gl_bai}安装3X-UI容器		${gl_kjlan}66.  ${gl_bai}一条龙调优"
-echo -e "${gl_kjlan}23.   ${gl_bai}安装x-ui-yg容器	${gl_kjlan}77.  ${gl_bai}安装快捷键k"
+echo -e "${gl_kjlan}23.   ${gl_bai}安装x-ui-yg容器		${gl_kjlan}77.  ${gl_bai}安装快捷键k"
 echo -e "${gl_kjlan}24.   ${gl_bai}申请SSL证书"
 echo -e "${gl_kjlan}25.   ${gl_bai}查看容器状态"
 echo -e "${gl_kjlan}------------------------------------------------------------------------${gl_bai}"
