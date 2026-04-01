@@ -16,7 +16,10 @@ x_install_command() {
 
 
 x_new_rules_port() {
-    install iptables
+    apt update -y
+    apt purge -y ufw iptables-persistent
+
+    DEBIAN_FRONTEND=noninteractive apt install -y iptables-persistent
     
     if [ -f "/etc/iptables/rules.v4" ]; then
         cp /etc/iptables/rules.v4 /etc/iptables/rules.v4.bak
