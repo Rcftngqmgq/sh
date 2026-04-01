@@ -681,8 +681,7 @@ x_all_in_one() {
             echo -e "[${gl_lv}OK${gl_bai}] 3/12. 设置虚拟内存${gl_huang}1G${gl_bai}"
 
             echo "------------------------------------------------"
-			local new_port=5522
-			new_ssh_port
+			new_ssh_port 5522
 			echo -e "[${gl_lv}OK${gl_bai}] 4/12. 设置SSH端口号为${gl_huang}5522${gl_bai}"
 
             echo "------------------------------------------------"
