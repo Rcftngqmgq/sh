@@ -42,7 +42,7 @@ COMMIT
 EOF
 
     iptables-restore < /etc/iptables/rules.v4
-    
+    systemctl enable netfilter-persistent
     save_iptables_rules
 
     echo "防火墙策略已更新并持久化。仅开放主要端口: SSH(22), HTTP(80), HTTPS(443), SSH(5522)"
