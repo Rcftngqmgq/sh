@@ -10096,37 +10096,6 @@ moltbot_menu() {
 		fi
 	}
 
-	configure_openclaw_session_policy() {
-		local config_file
-		config_file=$(openclaw_get_config_file)
-
-		[ ! -f "$config_file" ] && return 1
-
-		python3 - "$config_file" <<'PY'
-import json, sys
-path = sys.argv[1]
-with open(path, 'r', encoding='utf-8') as f:
-    obj = json.load(f)
-
-session = obj.setdefault('session', {})
-session.setdefault('dmScope', 'per-channel-peer')
-session['reset'] = {
-    'mode': 'idle',
-    'idleMinutes': 10080
-}
-session['resetByType'] = {
-    'direct': {'mode': 'idle', 'idleMinutes': 10080},
-    'thread': {'mode': 'idle', 'idleMinutes': 1440},
-    'group': {'mode': 'idle', 'idleMinutes': 120}
-}
-
-with open(path, 'w', encoding='utf-8') as f:
-    json.dump(obj, f, ensure_ascii=False, indent=2)
-    f.write('\n')
-PY
-	}
-
-
 	sync_openclaw_api_models() {
 		local config_file
 		config_file=$(openclaw_get_config_file)
@@ -10498,10 +10467,6 @@ PY
 
 		npm install -g openclaw@latest
 		openclaw onboard --install-daemon
-		openclaw config set tools.profile full
-		openclaw config set tools.elevated.enabled true
-		# 提示：修改配置后如需立即生效，可重启 gateway：openclaw gateway restart
-		configure_openclaw_session_policy
 		start_gateway
 		add_app_id
 		break_end
@@ -14535,7 +14500,7 @@ print(json.dumps(data, indent=2))
 			current_mode="\033[1;31m完全开放模式\033[0m"
 		elif [ "$current_profile" = "coding" ] && [ "$current_sec" = "allowlist" ] && [ "$current_ask" = "on-miss" ] && [ "$current_elevated" = "true" ]; then
 			current_mode="\033[1;33m开发增强模式\033[0m"
-		elif [ "$current_profile" = "coding" ] && [ "$current_sec" = "allowlist" ] && [ "$current_ask" = "on-miss" ]; then
+		elif [ "$current_profile" = "coding" ] && [ "$current_sec" = "allowlist" ] && [ "$current_ask" = "on-miss" ] && [ "$current_elevated" != "true" ]; then
 			current_mode="\033[1;32m标准安全模式\033[0m"
 		elif [ -z "$current_profile" ] && [ -z "$current_sec" ]; then
 			current_mode="\033[1;36m官方沙盒兜底\033[0m"
@@ -14771,25 +14736,25 @@ except Exception as e:
 				1)
 					echo "准备应用：标准安全模式"
 					read -e -p "输入 yes 确认: " confirm
-					[ "$confirm" = "yes" ] && openclaw_permission_apply_standard || echo "已取消"
+					if [ "$confirm" = "yes" ]; then openclaw_permission_apply_standard; else echo "已取消"; fi
 					break_end
 					;;
 				2)
 					echo "准备应用：开发增强模式"
 					read -e -p "输入 yes 确认: " confirm
-					[ "$confirm" = "yes" ] && openclaw_permission_apply_developer || echo "已取消"
+					if [ "$confirm" = "yes" ]; then openclaw_permission_apply_developer; else echo "已取消"; fi
 					break_end
 					;;
 				3)
 					echo -e "${gl_hong}⚠️ 完全开放模式会彻底瓦解 exec 审批并自动放行高危代码。${gl_bai}"
 					read -e -p "输入 FULL 确认继续: " confirm
-					[ "$confirm" = "FULL" ] && openclaw_permission_apply_full || echo "已取消"
+					if [ "$confirm" = "FULL" ]; then openclaw_permission_apply_full; else echo "已取消"; fi
 					break_end
 					;;
 				4)
 					echo "将清除所有定制覆盖，恢复 OpenClaw 刚安装时的严格沙盒状态。"
 					read -e -p "输入 yes 确认: " confirm
-					[ "$confirm" = "yes" ] && openclaw_permission_restore_official_defaults || echo "已取消"
+					if [ "$confirm" = "yes" ]; then openclaw_permission_restore_official_defaults; else echo "已取消"; fi
 					break_end
 					;;
 				5)
@@ -21822,7 +21787,10 @@ x_install_command() {
 
 
 x_new_rules_port() {
-    install iptables
+    apt update -y
+    apt purge -y ufw iptables-persistent
+
+    DEBIAN_FRONTEND=noninteractive apt install -y iptables-persistent
     
     if [ -f "/etc/iptables/rules.v4" ]; then
         cp /etc/iptables/rules.v4 /etc/iptables/rules.v4.bak
@@ -21845,7 +21813,7 @@ COMMIT
 EOF
 
     iptables-restore < /etc/iptables/rules.v4
-    
+    systemctl enable netfilter-persistent
     save_iptables_rules
 
     echo "防火墙策略已更新并持久化。仅开放主要端口: SSH(22), HTTP(80), HTTPS(443), SSH(5522)"
