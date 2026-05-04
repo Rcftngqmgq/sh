@@ -1,5 +1,5 @@
 #!/bin/bash
-sh_v="4.4.10"
+sh_v="4.5.0"
 
 
 gl_hui='\e[37m'
@@ -12,7 +12,7 @@ gl_zi='\033[35m'
 gl_kjlan='\033[96m'
 
 
-canshu="CN"
+canshu="default"
 permission_granted="false"
 ENABLE_STATS="false"
 
@@ -5597,6 +5597,146 @@ bbrv3() {
 		  root_use
 		  send_stats "bbrv3管理"
 
+		  xanmod_add_repo() {
+				local keyring="/usr/share/keyrings/xanmod-archive-keyring.gpg"
+				local list_file="/etc/apt/sources.list.d/xanmod-release.list"
+				local key_url="https://dl.xanmod.org/archive.key"
+				local fallback_key_url="${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/archive.key"
+				local os_codename=""
+
+				if command -v lsb_release >/dev/null 2>&1; then
+					os_codename=$(lsb_release -sc)
+				elif [ -r /etc/os-release ]; then
+					os_codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
+				fi
+				
+				# 兼容官方已移除的老系统代号（回退使用 releases 尝试旧包库）
+				if ! echo "bookworm trixie forky sid noble plucky questing resolute faye gigi wilma xia zara zena" | grep -qw "$os_codename"; then
+					os_codename="releases"
+				fi
+				
+				# 官方已彻底移除对 jammy, focal, bullseye 等老系统的 apt 支持
+				if echo "jammy focal bullseye buster" | grep -qw "$os_codename" || [ "$os_codename" = "releases" ]; then
+					echo -e "${gl_hong}XanMod 官方已停止对当前系统($os_codename)的 APT 源支持，请升级至 Debian12 / Ubuntu24 或更高版本。${gl_bai}"
+					return 1
+				fi
+
+				if [ -z "$os_codename" ]; then
+					echo "无法获取系统代号，无法配置XanMod源"
+					return 1
+				fi
+
+				install wget gnupg ca-certificates
+				mkdir -p /usr/share/keyrings /etc/apt/sources.list.d
+				if ! wget -qO - "$key_url" | gpg --dearmor -o "$keyring" --yes; then
+					echo "官方密钥下载失败，尝试备用下载源..."
+					wget -qO - "$fallback_key_url" | gpg --dearmor -o "$keyring" --yes || return 1
+				fi
+				chmod 644 "$keyring"
+				echo "deb [signed-by=$keyring] http://deb.xanmod.org $os_codename main" > "$list_file"
+		  }
+
+		  xanmod_detect_psabi_level() {
+				local psabi_output=""
+				psabi_output=$(awk 'BEGIN {
+					while (!/flags/) if (getline < "/proc/cpuinfo" != 1) exit 1
+					if (/lm/&&/cmov/&&/cx8/&&/fpu/&&/fxsr/&&/mmx/&&/syscall/&&/sse2/) level = 1
+					if (level == 1 && /cx16/&&/lahf/&&/popcnt/&&/sse4_1/&&/sse4_2/&&/ssse3/) level = 2
+					if (level == 2 && /avx/&&/avx2/&&/bmi1/&&/bmi2/&&/f16c/&&/fma/&&/abm/&&/movbe/&&/xsave/) level = 3
+					if (level == 3 && /avx512f/&&/avx512bw/&&/avx512cd/&&/avx512dq/&&/avx512vl/) level = 4
+					if (level > 0) { print level; exit }
+					exit 1
+				}' /proc/cpuinfo 2>/dev/null) || return 1
+				printf '%s' "$psabi_output" | tr -dc '0-9' | head -c 1
+		  }
+
+		  xanmod_package_available() {
+				local package="$1"
+				apt-cache policy "$package" 2>/dev/null | grep -q 'Candidate: [^ ]'
+		  }
+
+		  xanmod_detect_package() {
+				local psabi_level=""
+				local level=""
+				local package=""
+				local prefix_list="linux-xanmod linux-xanmod-lts"
+
+				psabi_level=$(xanmod_detect_psabi_level) || return 1
+				[ -n "$psabi_level" ] || return 1
+				[ "$psabi_level" -gt 3 ] && psabi_level=3
+
+				apt update -y >/dev/null 2>&1
+
+				for prefix in $prefix_list; do
+					level="$psabi_level"
+					while [ "$level" -ge 1 ]; do
+						package="${prefix}-x64v${level}"
+						if xanmod_package_available "$package"; then
+							if [ "$level" != "$psabi_level" ] || [ "$prefix" = "linux-xanmod-lts" ]; then
+								echo "已自动匹配合适安装包: $package" >&2
+							fi
+							printf '%s\n' "$package"
+							return 0
+						fi
+						level=$((level - 1))
+					done
+				done
+
+				echo "软件源中未找到适配此CPU的XanMod内核包" >&2
+				return 1
+		  }
+
+		  xanmod_installed() {
+				dpkg-query -W -f='${Package}\n' 'linux-*xanmod*' 2>/dev/null | grep -q '^linux-.*xanmod'
+		  }
+
+		  xanmod_install_or_update() {
+				local action="$1"
+				local package=""
+
+				check_disk_space 3
+				check_swap
+				xanmod_add_repo || {
+					echo "XanMod官方仓库配置失败，请稍后重试"
+					return 1
+				}
+
+				package=$(xanmod_detect_package) || {
+					echo "无法识别当前CPU或找不到匹配内核包，已取消安装"
+					return 1
+				}
+
+				apt update -y
+				if [ "$action" = "update" ]; then
+					apt install -y --only-upgrade "$package" || apt install -y "$package" || {
+						echo "XanMod内核更新失败，请检查软件源或稍后重试"
+						return 1
+					}
+				else
+					apt install -y "$package" || {
+						echo "XanMod内核安装失败，请检查软件源或稍后重试"
+						return 1
+					}
+				fi
+
+				bbr_on || {
+					echo "BBR3参数写入失败，请检查系统配置"
+					return 1
+				}
+				echo "XanMod BBRv3内核处理完成。重启后生效"
+				server_reboot
+		  }
+
+		  xanmod_uninstall() {
+				apt purge -y 'linux-*xanmod*'
+				apt autoremove -y
+				update-grub 2>/dev/null || true
+				rm -f /etc/apt/sources.list.d/xanmod-release.list
+				rm -f /usr/share/keyrings/xanmod-archive-keyring.gpg
+				echo "XanMod内核已卸载。重启后生效"
+				server_reboot
+		  }
+
 		  local cpu_arch=$(uname -m)
 		  if [ "$cpu_arch" = "aarch64" ]; then
 			bash <(curl -sL jhb.ovh/jb/bbrv3arm.sh)
@@ -5604,7 +5744,20 @@ bbrv3() {
 			linux_Settings
 		  fi
 
-		  if dpkg -l | grep -q 'linux-xanmod'; then
+		  if [ -r /etc/os-release ]; then
+			. /etc/os-release
+			if [ "$ID" != "debian" ] && [ "$ID" != "ubuntu" ]; then
+				echo "当前环境不支持，仅支持Debian和Ubuntu系统"
+				break_end
+				linux_Settings
+			fi
+		  else
+			echo "无法确定操作系统类型"
+			break_end
+			linux_Settings
+		  fi
+
+		  if xanmod_installed; then
 			while true; do
 				  clear
 				  local kernel_version=$(uname -r)
@@ -5622,38 +5775,14 @@ bbrv3() {
 
 				  case $sub_choice in
 					  1)
-						apt purge -y 'linux-*xanmod1*'
-						update-grub
-
-						# wget -qO - https://dl.xanmod.org/archive.key | gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg --yes
-						wget -qO - ${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/archive.key | gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg --yes
-
-						# 步骤3：添加存储库
-						echo 'deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org releases main' | tee /etc/apt/sources.list.d/xanmod-release.list
-
-						# version=$(wget -q https://dl.xanmod.org/check_x86-64_psabi.sh && chmod +x check_x86-64_psabi.sh && ./check_x86-64_psabi.sh | grep -oP 'x86-64-v\K\d+|x86-64-v\d+')
-						local version=$(wget -q ${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/check_x86-64_psabi.sh && chmod +x check_x86-64_psabi.sh && ./check_x86-64_psabi.sh | grep -oP 'x86-64-v\K\d+|x86-64-v\d+')
-
-						apt update -y
-						apt install -y linux-xanmod-x64v$version
-
-						echo "XanMod内核已更新。重启后生效"
-						rm -f /etc/apt/sources.list.d/xanmod-release.list
-						rm -f check_x86-64_psabi.sh*
-
-						server_reboot
-
-						  ;;
+						xanmod_install_or_update update
+						;;
 					  2)
-						apt purge -y 'linux-*xanmod1*'
-						update-grub
-						echo "XanMod内核已卸载。重启后生效"
-						server_reboot
-						  ;;
-
+						xanmod_uninstall
+						;;
 					  *)
-						  break  # 跳出循环，退出菜单
-						  ;;
+						break
+						;;
 
 				  esac
 			done
@@ -5670,42 +5799,7 @@ bbrv3() {
 
 		  case "$choice" in
 			[Yy])
-			check_disk_space 3
-			if [ -r /etc/os-release ]; then
-				. /etc/os-release
-				if [ "$ID" != "debian" ] && [ "$ID" != "ubuntu" ]; then
-					echo "当前环境不支持，仅支持Debian和Ubuntu系统"
-					break_end
-					linux_Settings
-				fi
-			else
-				echo "无法确定操作系统类型"
-				break_end
-				linux_Settings
-			fi
-
-			check_swap
-			install wget gnupg
-
-			# wget -qO - https://dl.xanmod.org/archive.key | gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg --yes
-			wget -qO - ${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/archive.key | gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg --yes
-
-			# 步骤3：添加存储库
-			echo 'deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org releases main' | tee /etc/apt/sources.list.d/xanmod-release.list
-
-			# version=$(wget -q https://dl.xanmod.org/check_x86-64_psabi.sh && chmod +x check_x86-64_psabi.sh && ./check_x86-64_psabi.sh | grep -oP 'x86-64-v\K\d+|x86-64-v\d+')
-			local version=$(wget -q ${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/check_x86-64_psabi.sh && chmod +x check_x86-64_psabi.sh && ./check_x86-64_psabi.sh | grep -oP 'x86-64-v\K\d+|x86-64-v\d+')
-
-			apt update -y
-			apt install -y linux-xanmod-x64v$version
-
-			bbr_on
-
-			echo "XanMod内核安装并BBR3启用成功。重启后生效"
-			rm -f /etc/apt/sources.list.d/xanmod-release.list
-			rm -f check_x86-64_psabi.sh*
-			server_reboot
-
+			xanmod_install_or_update install
 			  ;;
 			[Nn])
 			  echo "已取消"
@@ -5717,7 +5811,6 @@ bbrv3() {
 		fi
 
 }
-
 
 elrepo_install() {
 	# 导入 ELRepo GPG 公钥
@@ -10022,8 +10115,8 @@ moltbot_menu() {
 		fi
 	}
 
-	get_running_status() {
-		if pgrep -f "openclaw-gatewa" >/dev/null 2>&1; then
+	get_running_status() {		
+		if pgrep -f "openclaw.*gateway" >/dev/null 2>&1; then
 			echo "${gl_lv}运行中${gl_bai}"
 		else
 			echo "${gl_hui}未运行${gl_bai}"
