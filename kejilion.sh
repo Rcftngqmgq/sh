@@ -5318,13 +5318,13 @@ dd_xitong() {
 			echo "1. Debian 13                  2. Debian 12"
 			echo "3. Debian 11                  4. Debian 10"
 			echo "------------------------"
-			echo "11. Ubuntu 24.04              12. Ubuntu 22.04"
-			echo "13. Ubuntu 20.04              14. Ubuntu 18.04"
+			echo "11. Ubuntu 26.04              12. Ubuntu 24.04"
+			echo "13. Ubuntu 22.04              14. Ubuntu 20.04"
 			echo "------------------------"
 			echo "21. Rocky Linux 10            22. Rocky Linux 9"
 			echo "23. Alma Linux 10             24. Alma Linux 9"
 			echo "25. oracle Linux 10           26. oracle Linux 9"
-			echo "27. Fedora Linux 42           28. Fedora Linux 41"
+			echo "27. Fedora Linux 44           28. Fedora Linux 43"
 			echo "29. CentOS 10                 30. CentOS 9"
 			echo "------------------------"
 			echo "31. Alpine Linux              32. Arch Linux"
@@ -5372,34 +5372,33 @@ dd_xitong() {
 				exit
 				;;
 			  11)
+				send_stats "重装ubuntu 26.04"
+				dd_xitong_3
+				bash reinstall.sh ubuntu 26.04
+				reboot
+				exit
+				;;
+			  12)
 				send_stats "重装ubuntu 24.04"
 				dd_xitong_1
 				bash InstallNET.sh -ubuntu 24.04
 				reboot
 				exit
 				;;
-			  12)
+			  13)
 				send_stats "重装ubuntu 22.04"
 				dd_xitong_1
 				bash InstallNET.sh -ubuntu 22.04
 				reboot
 				exit
 				;;
-			  13)
+			  14)
 				send_stats "重装ubuntu 20.04"
 				dd_xitong_1
 				bash InstallNET.sh -ubuntu 20.04
 				reboot
 				exit
 				;;
-			  14)
-				send_stats "重装ubuntu 18.04"
-				dd_xitong_1
-				bash InstallNET.sh -ubuntu 18.04
-				reboot
-				exit
-				;;
-
 
 			  21)
 				send_stats "重装rockylinux10"
@@ -5450,17 +5449,17 @@ dd_xitong() {
 				;;
 
 			  27)
-				send_stats "重装fedora42"
+				send_stats "重装fedora44"
 				dd_xitong_3
-				bash reinstall.sh fedora
+				bash reinstall.sh fedora 44
 				reboot
 				exit
 				;;
 
 			  28)
-				send_stats "重装fedora41"
+				send_stats "重装fedora43"
 				dd_xitong_3
-				bash reinstall.sh fedora 41
+				bash reinstall.sh fedora 43
 				reboot
 				exit
 				;;
