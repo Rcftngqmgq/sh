@@ -1540,6 +1540,10 @@ certs_status() {
 		send_stats "域名证书申请成功"
 	else
 		send_stats "域名证书申请失败"
+		if [ "${KJ_WEB_NONINTERACTIVE:-0}" = "1" ]; then
+			echo "KPANEL_PROGRESS 100 域名证书申请失败，请检查 DNS、80/443 端口和签发限额"
+			return 1
+		fi
 		echo -e "${gl_hong}注意: ${gl_bai}证书申请失败，请检查以下可能原因并重试："
 		echo -e "1. 域名拼写错误 ➠ 请检查域名输入是否正确"
 		echo -e "2. DNS解析问题 ➠ 确认域名已正确解析到本服务器IP"
@@ -1618,6 +1622,10 @@ certs_status() {
 repeat_add_yuming() {
 if [ -e /home/web/conf.d/$yuming.conf ]; then
   send_stats "域名重复使用"
+  if [ "${KJ_WEB_NONINTERACTIVE:-0}" = "1" ]; then
+	echo "KPANEL_PROGRESS 100 域名已存在，拒绝覆盖 kejilion.sh 或 KPanel 的现有产物"
+	return 1
+  fi
   web_del "${yuming}" > /dev/null 2>&1
 fi
 
@@ -1625,6 +1633,15 @@ fi
 
 
 add_yuming() {
+	  if [ "${KJ_WEB_NONINTERACTIVE:-0}" = "1" ]; then
+		  yuming="${KJ_WEB_DOMAIN:-}"
+		  if [ -z "$yuming" ] || [ ${#yuming} -gt 253 ] ||
+			  ! printf '%s' "$yuming" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$'; then
+			  echo "KPANEL_PROGRESS 100 KJ_WEB_DOMAIN 不是有效的域名"
+			  return 1
+		  fi
+		  return 0
+	  fi
 	  ip_address
 	  echo -e "先将域名解析到本机IP: ${gl_huang}$ipv4_address  $ipv6_address${gl_bai}"
 	  read -e -p "请输入你的IP或者解析过的域名: " yuming
@@ -2857,10 +2874,304 @@ grep -qxF "${app_id}" /home/docker/appno.txt || echo "${app_id}" >> /home/docker
 
 }
 
+kpanel_app_progress() {
+	[ "${KJ_APP_NONINTERACTIVE:-}" = "1" ] || return 0
+	printf 'KPANEL_PROGRESS %s %s\n' "$1" "$2"
+}
+
+kpanel_app_service_name() {
+	local service_name="${docker_app_service:-${docker_name:-}}"
+
+	if [[ ! "$service_name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]]; then
+		echo "错误: 应用主容器名称无效" >&2
+		return 1
+	fi
+	printf '%s\n' "$service_name"
+}
+
+kpanel_app_verified_service() {
+	local verify_expected="${1:-true}"
+	local service_name=""
+	local container_id=""
+	local expected_id="${KJ_APP_EXPECTED_CONTAINER_ID:-}"
+
+	service_name="$(kpanel_app_service_name)" || return 1
+	container_id="$(docker inspect --format '{{.Id}}' "$service_name" 2>/dev/null)" || {
+		echo "错误: 未发现应用主容器 ${service_name}" >&2
+		return 1
+	}
+	[ -n "$container_id" ] || {
+		echo "错误: 无法确认应用主容器 ${service_name}" >&2
+		return 1
+	}
+	if [ "$verify_expected" = "true" ] && [ -n "$expected_id" ] &&
+		[ "$container_id" != "$expected_id" ]; then
+		echo "错误: 应用主容器已变化，请刷新面板后重试" >&2
+		return 1
+	fi
+	printf '%s\n' "$service_name"
+}
+
+kpanel_app_access_path() {
+	if [[ ! "${docker_name:-}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]]; then
+		echo "错误: 应用状态文件名称无效" >&2
+		return 1
+	fi
+	printf '/home/docker/%s_access.conf\n' "$docker_name"
+}
+
+kpanel_app_read_access_mode() {
+	local access_path=""
+	local access_mode=""
+	local service_name=""
+	local container_ip=""
+
+	access_path="$(kpanel_app_access_path)" || return 1
+	if [ -f "$access_path" ] && [ ! -L "$access_path" ]; then
+		access_mode="$(tr -d '\r\n' < "$access_path" 2>/dev/null)"
+	fi
+	case "$access_mode" in
+		direct|domain_only)
+			printf '%s\n' "$access_mode"
+			return 0
+			;;
+	esac
+	service_name="$(kpanel_app_service_name)" || return 1
+	container_ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$service_name" 2>/dev/null)"
+	if [ -n "$container_ip" ] && command -v iptables >/dev/null 2>&1 &&
+		iptables -C DOCKER-USER -p tcp -d "$container_ip" -j DROP >/dev/null 2>&1; then
+		printf '%s\n' "domain_only"
+	else
+		printf '%s\n' "direct"
+	fi
+}
+
+kpanel_app_write_access_mode() {
+	local access_mode="$1"
+	local access_path=""
+	local temporary=""
+
+	case "$access_mode" in
+		direct|domain_only) ;;
+		*)
+			echo "错误: 不支持的应用访问模式" >&2
+			return 1
+			;;
+	esac
+	setup_docker_dir || return 1
+	access_path="$(kpanel_app_access_path)" || return 1
+	temporary="$(mktemp "/home/docker/.${docker_name}_access.XXXXXX")" || return 1
+	if ! printf '%s\n' "$access_mode" > "$temporary" ||
+		! chmod 0644 "$temporary" ||
+		! mv -f "$temporary" "$access_path"; then
+		rm -f "$temporary"
+		return 1
+	fi
+}
+
+kpanel_app_apply_access_mode() {
+	local access_mode="$1"
+	local verify_expected="${2:-true}"
+	local service_name=""
+
+	service_name="$(kpanel_app_verified_service "$verify_expected")" || return 1
+	ip_address
+	case "$access_mode" in
+		direct)
+			clear_container_rules "$service_name" "$ipv4_address" || return 1
+			;;
+		domain_only)
+			block_container_port "$service_name" "$ipv4_address" || return 1
+			;;
+		*)
+			echo "错误: 不支持的应用访问模式" >&2
+			return 1
+			;;
+	esac
+	kpanel_app_write_access_mode "$access_mode"
+}
+
+kpanel_app_restore_access_mode() {
+	local access_mode="$1"
+
+	if [ "$access_mode" = "domain_only" ]; then
+		kpanel_app_apply_access_mode domain_only false
+	else
+		kpanel_app_write_access_mode direct
+	fi
+}
+
+kpanel_app_remove_compatibility_state() {
+	local access_path=""
+
+	access_path="$(kpanel_app_access_path)" || return 1
+	rm -f "/home/docker/${docker_name}_port.conf" "$access_path" || return 1
+	if [ -f /home/docker/appno.txt ]; then
+		sed -i "/\b${app_id}\b/d" /home/docker/appno.txt || return 1
+	fi
+}
+
+kpanel_app_install_port() {
+	local requested_port="${KJ_APP_PORT:-${docker_port:-}}"
+
+	case "$requested_port" in
+		''|*[!0-9]*)
+			echo "错误: KPanel 未提供有效的应用端口"
+			return 1
+			;;
+	esac
+	if [ "$requested_port" -lt 1 ] || [ "$requested_port" -gt 65535 ]; then
+		echo "错误: KPanel 应用端口必须在 1-65535 之间"
+		return 1
+	fi
+	if ss -tuln 2>/dev/null | grep -q ":${requested_port} "; then
+		echo "错误: 端口 ${requested_port} 已被占用"
+		return 1
+	fi
+	docker_port="$requested_port"
+	return 0
+}
+
+kpanel_run_docker_app_install() {
+	local adapter="$1"
+
+	[ "${KJ_APP_NONINTERACTIVE:-}" = "1" ] || return 2
+	if [ "${KJ_APP_ACTION:-}" != "install" ]; then
+		echo "错误: KPanel 当前仅允许非交互安装"
+		return 1
+	fi
+
+	kpanel_app_progress 5 "正在校验端口与宿主机环境"
+	kpanel_app_install_port || return 1
+	setup_docker_dir || return 1
+	check_disk_space "${app_size:-1}" /home/docker || return 1
+	kpanel_app_progress 15 "正在准备 Docker 运行环境"
+	install jq || return 1
+	install_docker || return 1
+	kpanel_app_progress 30 "正在执行 kejilion.sh 应用安装函数"
+
+	if [ "$adapter" = "plus" ]; then
+		if ! docker_app_install; then
+			echo "安装失败: 未登记应用状态"
+			return 1
+		fi
+	else
+		if ! docker_rum; then
+			echo "安装失败: 未登记应用状态"
+			return 1
+		fi
+	fi
+
+	kpanel_app_progress 90 "正在写入 kejilion.sh 兼容状态"
+	echo "$docker_port" > "/home/docker/${docker_name}_port.conf"
+	add_app_id
+	if [ "${KJ_APP_ACCESS_MODE:-direct}" = "domain_only" ]; then
+		kpanel_app_apply_access_mode domain_only false || return 1
+	else
+		kpanel_app_write_access_mode direct || return 1
+	fi
+	if [ "$adapter" = "standard" ]; then
+		[ -n "${docker_use:-}" ] && $docker_use
+		[ -n "${docker_passwd:-}" ] && $docker_passwd
+	fi
+	kpanel_app_progress 100 "应用安装完成"
+	echo "$docker_name 已经安装完成"
+	return 0
+}
+
+kpanel_run_docker_app_action() {
+	local adapter="$1"
+	local action="${KJ_APP_ACTION:-}"
+	local service_name=""
+	local access_mode=""
+
+	[ "${KJ_APP_NONINTERACTIVE:-}" = "1" ] || return 2
+	case "$action" in
+		install)
+			kpanel_run_docker_app_install "$adapter"
+			return $?
+			;;
+		update|uninstall|direct_access) ;;
+		*)
+			echo "错误: KPanel 不支持此应用操作"
+			return 1
+			;;
+	esac
+
+	kpanel_app_progress 5 "正在核对 kejilion.sh 安装标记与主容器"
+	service_name="$(kpanel_app_verified_service true)" || return 1
+	grep -qxF "${app_id}" /home/docker/appno.txt 2>/dev/null || {
+		echo "错误: 未发现 kejilion.sh 应用安装标记"
+		return 1
+	}
+
+	case "$action" in
+		update)
+			access_mode="$(kpanel_app_read_access_mode)" || return 1
+			kpanel_app_verified_service true >/dev/null || return 1
+			kpanel_app_progress 25 "正在执行 kejilion.sh 原生更新函数"
+			if [ "$adapter" = "plus" ]; then
+				docker_app_update || return 1
+			else
+				docker rm -f "$docker_name" || return 1
+				docker rmi -f "$docker_img" >/dev/null 2>&1 || true
+				docker_rum || return 1
+			fi
+			kpanel_app_verified_service false >/dev/null || return 1
+			add_app_id
+			kpanel_app_progress 80 "正在恢复应用访问策略"
+			kpanel_app_restore_access_mode "$access_mode" || return 1
+			if [ "$adapter" = "standard" ]; then
+				[ -n "${docker_use:-}" ] && $docker_use
+				[ -n "${docker_passwd:-}" ] && $docker_passwd
+			fi
+			kpanel_app_progress 100 "应用更新完成"
+			echo "$service_name 已经更新完成"
+			;;
+		uninstall)
+			kpanel_app_verified_service true >/dev/null || return 1
+			kpanel_app_progress 25 "正在执行 kejilion.sh 原生卸载函数"
+			if [ "$adapter" = "plus" ]; then
+				docker_app_uninstall || return 1
+			else
+				docker rm -f "$docker_name" || return 1
+				docker rmi -f "$docker_img" >/dev/null 2>&1 || true
+				rm -rf "/home/docker/$docker_name" || return 1
+			fi
+			if docker inspect "$service_name" >/dev/null 2>&1; then
+				echo "错误: 卸载函数完成后主容器仍然存在"
+				return 1
+			fi
+			kpanel_app_remove_compatibility_state || return 1
+			kpanel_app_progress 100 "应用卸载完成"
+			echo "$service_name 已经卸载完成"
+			;;
+		direct_access)
+			access_mode="${KJ_APP_ACCESS_MODE:-}"
+			case "$access_mode" in
+				direct|domain_only) ;;
+				*)
+					echo "错误: KPanel 未提供有效的应用访问模式"
+					return 1
+					;;
+			esac
+			kpanel_app_progress 40 "正在执行 kejilion.sh IP+端口访问策略"
+			kpanel_app_apply_access_mode "$access_mode" true || return 1
+			kpanel_app_progress 100 "应用访问策略更新完成"
+			;;
+	esac
+	return 0
+}
+
 
 
 docker_app() {
 send_stats "${docker_name}管理"
+
+if [ "${KJ_APP_NONINTERACTIVE:-}" = "1" ]; then
+	kpanel_run_docker_app_action standard
+	return $?
+fi
 
 while true; do
 	clear
@@ -2911,6 +3222,7 @@ while true; do
 			echo "$docker_port" > "/home/docker/${docker_name}_port.conf"
 
 			add_app_id
+			kpanel_app_write_access_mode direct
 
 			clear
 			echo "$docker_name 已经安装完成"
@@ -2926,6 +3238,7 @@ while true; do
 			docker_rum
 
 			add_app_id
+			kpanel_app_restore_access_mode "$(kpanel_app_read_access_mode)"
 
 			clear
 			echo "$docker_name 已经安装完成"
@@ -2940,6 +3253,7 @@ while true; do
 			docker rmi -f "$docker_img"
 			rm -rf "/home/docker/$docker_name"
 			rm -f /home/docker/${docker_name}_port.conf
+			rm -f /home/docker/${docker_name}_access.conf
 
 			sed -i "/\b${app_id}\b/d" /home/docker/appno.txt
 			echo "应用已卸载"
@@ -2952,6 +3266,7 @@ while true; do
 			add_yuming
 			ldnmp_Proxy ${yuming} 127.0.0.1 ${docker_port}
 			block_container_port "$docker_name" "$ipv4_address"
+			kpanel_app_write_access_mode domain_only
 			;;
 
 		6)
@@ -2962,11 +3277,13 @@ while true; do
 		7)
 			send_stats "允许IP访问 ${docker_name}"
 			clear_container_rules "$docker_name" "$ipv4_address"
+			kpanel_app_write_access_mode direct
 			;;
 
 		8)
 			send_stats "阻止IP访问 ${docker_name}"
 			block_container_port "$docker_name" "$ipv4_address"
+			kpanel_app_write_access_mode domain_only
 			;;
 
 		*)
@@ -2984,6 +3301,10 @@ done
 
 docker_app_plus() {
 	send_stats "$app_name"
+	if [ "${KJ_APP_NONINTERACTIVE:-}" = "1" ]; then
+		kpanel_run_docker_app_action plus
+		return $?
+	fi
 	while true; do
 		clear
 		check_docker_app
@@ -3031,25 +3352,35 @@ docker_app_plus() {
 
 				install jq
 				install_docker
-				docker_app_install
-				echo "$docker_port" > "/home/docker/${docker_name}_port.conf"
-
-				add_app_id
-				send_stats "$app_name 安装"
+				if docker_app_install; then
+					echo "$docker_port" > "/home/docker/${docker_name}_port.conf"
+					add_app_id
+					kpanel_app_write_access_mode direct
+					send_stats "$app_name 安装"
+				else
+					echo -e "${gl_hong}安装失败: ${gl_bai}未登记应用状态，请根据上方错误修复后重试。"
+				fi
 				;;
 
 			2)
-				docker_app_update
-				add_app_id
-				send_stats "$app_name 更新"
+				if docker_app_update; then
+					add_app_id
+					kpanel_app_restore_access_mode "$(kpanel_app_read_access_mode)"
+					send_stats "$app_name 更新"
+				else
+					echo -e "${gl_hong}更新失败: ${gl_bai}已保留原应用登记状态。"
+				fi
 				;;
 
 			3)
-				docker_app_uninstall
-				rm -f /home/docker/${docker_name}_port.conf
-
-				sed -i "/\b${app_id}\b/d" /home/docker/appno.txt
-				send_stats "$app_name 卸载"
+				if docker_app_uninstall; then
+					rm -f /home/docker/${docker_name}_port.conf
+					rm -f /home/docker/${docker_name}_access.conf
+					sed -i "/\b${app_id}\b/d" /home/docker/appno.txt
+					send_stats "$app_name 卸载"
+				else
+					echo -e "${gl_hong}卸载失败: ${gl_bai}已保留应用登记状态。"
+				fi
 				;;
 
 			5)
@@ -3059,6 +3390,7 @@ docker_app_plus() {
 				ldnmp_Proxy ${yuming} 127.0.0.1 ${docker_port}
 				local docker_check_name="${docker_app_service:-$docker_name}"
 				block_container_port "$docker_check_name" "$ipv4_address"
+				kpanel_app_write_access_mode domain_only
 
 				;;
 			6)
@@ -3067,12 +3399,15 @@ docker_app_plus() {
 				;;
 			7)
 				send_stats "允许IP访问 ${docker_name}"
-				clear_container_rules "$docker_name" "$ipv4_address"
+				local docker_check_name="${docker_app_service:-$docker_name}"
+				clear_container_rules "$docker_check_name" "$ipv4_address"
+				kpanel_app_write_access_mode direct
 				;;
 			8)
 				send_stats "阻止IP访问 ${docker_name}"
 				local docker_check_name="${docker_app_service:-$docker_name}"
 				block_container_port "$docker_check_name" "$ipv4_address"
+				kpanel_app_write_access_mode domain_only
 				;;
 			*)
 				break
@@ -9103,7 +9438,29 @@ linux_ldnmp() {
 	echo -e "${gl_huang}------------------------"
 	echo -e "${gl_huang}0.   ${gl_bai}返回主菜单"
 	echo -e "${gl_huang}------------------------${gl_bai}"
-	read -e -p "请输入你的选择: " sub_choice
+	if [ "${KJ_WEB_NONINTERACTIVE:-0}" = "1" ]; then
+		sub_choice="${KJ_WEB_RECIPE:-}"
+		case "$sub_choice" in
+			3|4|5|6|7|8|9|27) ;;
+			*)
+				echo "KPANEL_PROGRESS 100 不支持的 KJ_WEB_RECIPE"
+				return 1
+				;;
+		esac
+		if [ -z "${KJ_WEB_DOMAIN:-}" ] || [ ${#KJ_WEB_DOMAIN} -gt 253 ] ||
+			! printf '%s' "$KJ_WEB_DOMAIN" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$'; then
+			echo "KPANEL_PROGRESS 100 KJ_WEB_DOMAIN 不是有效的域名"
+			return 1
+		fi
+		if [ -e "/home/web/conf.d/${KJ_WEB_DOMAIN}.conf" ] ||
+			[ -e "/home/web/html/${KJ_WEB_DOMAIN}" ]; then
+			echo "KPANEL_PROGRESS 100 域名已存在，拒绝覆盖现有产物"
+			return 1
+		fi
+		echo "KPANEL_PROGRESS 5 正在启动 kejilion.sh 原生一键建站流程"
+	else
+		read -e -p "请输入你的选择: " sub_choice
+	fi
 
 
 	case $sub_choice in
@@ -10078,6 +10435,19 @@ linux_ldnmp() {
 	*)
 		echo "无效的输入!"
 	esac
+	if [ "${KJ_WEB_NONINTERACTIVE:-0}" = "1" ]; then
+		if [ ! -f "/home/web/conf.d/${KJ_WEB_DOMAIN}.conf" ] ||
+			[ ! -d "/home/web/html/${KJ_WEB_DOMAIN}" ]; then
+			echo "KPANEL_PROGRESS 100 kejilion.sh 建站产物不完整"
+			return 1
+		fi
+		if ! docker exec nginx nginx -t >/dev/null 2>&1; then
+			echo "KPANEL_PROGRESS 100 Nginx 配置校验失败"
+			return 1
+		fi
+		echo "KPANEL_PROGRESS 100 kejilion.sh 原生建站产物已完成"
+		return 0
+	fi
 	break_end
 
   done
@@ -19452,6 +19822,9 @@ discourse,yunsou,ahhhhfs,nsgame,gying" \
 		fi
 		  ;;
 	esac
+	if [ "${KJ_APP_NONINTERACTIVE:-}" = "1" ]; then
+		return
+	fi
 	break_end
 	sub_choice=""
 
