@@ -1,5 +1,5 @@
 #!/bin/bash
-sh_v="4.5.4"
+sh_v="4.5.5"
 
 
 gl_hui='\e[37m'
@@ -22,6 +22,7 @@ fi
 
 kpanel_protocol_active() {
 	[ "${KJ_LIGHT_NODE_PROTOCOL:-}" = "1" ] ||
+	[ "${KJ_SSH_PORT_NONINTERACTIVE:-}" = "1" ] ||
 	[ "${KJ_DNS_NONINTERACTIVE:-}" = "1" ] ||
 	[ "${KJ_F2B_NONINTERACTIVE:-}" = "1" ] ||
 	[ "${KJ_BBRV3_NONINTERACTIVE:-}" = "1" ] ||
@@ -2719,56 +2720,50 @@ check_docker_image_update() {
 
 
 
+get_container_ipv4_addresses() {
+	local container_name_or_id=$1
+	local container_ips
+
+	container_ips=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{if .IPAddress}}{{println .IPAddress}}{{end}}{{end}}' "$container_name_or_id" 2>/dev/null) || return 1
+	printf '%s\n' "$container_ips" | awk 'NF && !seen[$0]++'
+}
+
+ensure_docker_user_rule() {
+	if ! iptables -C DOCKER-USER "$@" &>/dev/null; then
+		iptables -I DOCKER-USER "$@"
+	fi
+}
+
+remove_docker_user_rule() {
+	if iptables -C DOCKER-USER "$@" &>/dev/null; then
+		iptables -D DOCKER-USER "$@"
+	fi
+}
+
 block_container_port() {
 	local container_name_or_id=$1
 	local allowed_ip=$2
+	local container_ips
+	local container_ip
 
-	# 获取容器的 IP 地址
-	local container_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$container_name_or_id")
-
-	if [ -z "$container_ip" ]; then
+	# 获取容器在所有 Docker 网络中的 IPv4 地址，逐个应用规则。
+	container_ips=$(get_container_ipv4_addresses "$container_name_or_id")
+	if [ -z "$container_ips" ]; then
+		echo "错误：无法获取容器 ${container_name_or_id} 的 IPv4 地址。" >&2
 		return 1
 	fi
 
 	install iptables
 
-
-	# 检查并封禁其他所有 IP
-	if ! iptables -C DOCKER-USER -p tcp -d "$container_ip" -j DROP &>/dev/null; then
-		iptables -I DOCKER-USER -p tcp -d "$container_ip" -j DROP
-	fi
-
-	# 检查并放行指定 IP
-	if ! iptables -C DOCKER-USER -p tcp -s "$allowed_ip" -d "$container_ip" -j ACCEPT &>/dev/null; then
-		iptables -I DOCKER-USER -p tcp -s "$allowed_ip" -d "$container_ip" -j ACCEPT
-	fi
-
-	# 检查并放行本地网络 127.0.0.0/8
-	if ! iptables -C DOCKER-USER -p tcp -s 127.0.0.0/8 -d "$container_ip" -j ACCEPT &>/dev/null; then
-		iptables -I DOCKER-USER -p tcp -s 127.0.0.0/8 -d "$container_ip" -j ACCEPT
-	fi
-
-
-
-	# 检查并封禁其他所有 IP
-	if ! iptables -C DOCKER-USER -p udp -d "$container_ip" -j DROP &>/dev/null; then
-		iptables -I DOCKER-USER -p udp -d "$container_ip" -j DROP
-	fi
-
-	# 检查并放行指定 IP
-	if ! iptables -C DOCKER-USER -p udp -s "$allowed_ip" -d "$container_ip" -j ACCEPT &>/dev/null; then
-		iptables -I DOCKER-USER -p udp -s "$allowed_ip" -d "$container_ip" -j ACCEPT
-	fi
-
-	# 检查并放行本地网络 127.0.0.0/8
-	if ! iptables -C DOCKER-USER -p udp -s 127.0.0.0/8 -d "$container_ip" -j ACCEPT &>/dev/null; then
-		iptables -I DOCKER-USER -p udp -s 127.0.0.0/8 -d "$container_ip" -j ACCEPT
-	fi
-
-	if ! iptables -C DOCKER-USER -m state --state ESTABLISHED,RELATED -d "$container_ip" -j ACCEPT &>/dev/null; then
-		iptables -I DOCKER-USER -m state --state ESTABLISHED,RELATED -d "$container_ip" -j ACCEPT
-	fi
-
+	while IFS= read -r container_ip; do
+		ensure_docker_user_rule -p tcp -d "$container_ip" -j DROP || return 1
+		ensure_docker_user_rule -p tcp -s "$allowed_ip" -d "$container_ip" -j ACCEPT || return 1
+		ensure_docker_user_rule -p tcp -s 127.0.0.0/8 -d "$container_ip" -j ACCEPT || return 1
+		ensure_docker_user_rule -p udp -d "$container_ip" -j DROP || return 1
+		ensure_docker_user_rule -p udp -s "$allowed_ip" -d "$container_ip" -j ACCEPT || return 1
+		ensure_docker_user_rule -p udp -s 127.0.0.0/8 -d "$container_ip" -j ACCEPT || return 1
+		ensure_docker_user_rule -m state --state ESTABLISHED,RELATED -d "$container_ip" -j ACCEPT || return 1
+	done <<< "$container_ips"
 
 	echo "已阻止IP+端口访问该服务"
 	save_iptables_rules
@@ -2780,56 +2775,27 @@ block_container_port() {
 clear_container_rules() {
 	local container_name_or_id=$1
 	local allowed_ip=$2
+	local container_ips
+	local container_ip
 
-	# 获取容器的 IP 地址
-	local container_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$container_name_or_id")
-
-	if [ -z "$container_ip" ]; then
+	# 获取容器在所有 Docker 网络中的 IPv4 地址，逐个清除规则。
+	container_ips=$(get_container_ipv4_addresses "$container_name_or_id")
+	if [ -z "$container_ips" ]; then
+		echo "错误：无法获取容器 ${container_name_or_id} 的 IPv4 地址。" >&2
 		return 1
 	fi
 
 	install iptables
 
-
-	# 清除封禁其他所有 IP 的规则
-	if iptables -C DOCKER-USER -p tcp -d "$container_ip" -j DROP &>/dev/null; then
-		iptables -D DOCKER-USER -p tcp -d "$container_ip" -j DROP
-	fi
-
-	# 清除放行指定 IP 的规则
-	if iptables -C DOCKER-USER -p tcp -s "$allowed_ip" -d "$container_ip" -j ACCEPT &>/dev/null; then
-		iptables -D DOCKER-USER -p tcp -s "$allowed_ip" -d "$container_ip" -j ACCEPT
-	fi
-
-	# 清除放行本地网络 127.0.0.0/8 的规则
-	if iptables -C DOCKER-USER -p tcp -s 127.0.0.0/8 -d "$container_ip" -j ACCEPT &>/dev/null; then
-		iptables -D DOCKER-USER -p tcp -s 127.0.0.0/8 -d "$container_ip" -j ACCEPT
-	fi
-
-
-
-
-
-	# 清除封禁其他所有 IP 的规则
-	if iptables -C DOCKER-USER -p udp -d "$container_ip" -j DROP &>/dev/null; then
-		iptables -D DOCKER-USER -p udp -d "$container_ip" -j DROP
-	fi
-
-	# 清除放行指定 IP 的规则
-	if iptables -C DOCKER-USER -p udp -s "$allowed_ip" -d "$container_ip" -j ACCEPT &>/dev/null; then
-		iptables -D DOCKER-USER -p udp -s "$allowed_ip" -d "$container_ip" -j ACCEPT
-	fi
-
-	# 清除放行本地网络 127.0.0.0/8 的规则
-	if iptables -C DOCKER-USER -p udp -s 127.0.0.0/8 -d "$container_ip" -j ACCEPT &>/dev/null; then
-		iptables -D DOCKER-USER -p udp -s 127.0.0.0/8 -d "$container_ip" -j ACCEPT
-	fi
-
-
-	if iptables -C DOCKER-USER -m state --state ESTABLISHED,RELATED -d "$container_ip" -j ACCEPT &>/dev/null; then
-		iptables -D DOCKER-USER -m state --state ESTABLISHED,RELATED -d "$container_ip" -j ACCEPT
-	fi
-
+	while IFS= read -r container_ip; do
+		remove_docker_user_rule -p tcp -d "$container_ip" -j DROP || return 1
+		remove_docker_user_rule -p tcp -s "$allowed_ip" -d "$container_ip" -j ACCEPT || return 1
+		remove_docker_user_rule -p tcp -s 127.0.0.0/8 -d "$container_ip" -j ACCEPT || return 1
+		remove_docker_user_rule -p udp -d "$container_ip" -j DROP || return 1
+		remove_docker_user_rule -p udp -s "$allowed_ip" -d "$container_ip" -j ACCEPT || return 1
+		remove_docker_user_rule -p udp -s 127.0.0.0/8 -d "$container_ip" -j ACCEPT || return 1
+		remove_docker_user_rule -m state --state ESTABLISHED,RELATED -d "$container_ip" -j ACCEPT || return 1
+	done <<< "$container_ips"
 
 	echo "已允许IP+端口访问该服务"
 	save_iptables_rules
@@ -3096,7 +3062,9 @@ kpanel_app_read_access_mode() {
 	local access_path=""
 	local access_mode=""
 	local service_name=""
+	local container_ips=""
 	local container_ip=""
+	local all_blocked="true"
 
 	access_path="$(kpanel_app_access_path)" || return 1
 	if [ -f "$access_path" ] && [ ! -L "$access_path" ]; then
@@ -3109,9 +3077,18 @@ kpanel_app_read_access_mode() {
 			;;
 	esac
 	service_name="$(kpanel_app_service_name)" || return 1
-	container_ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$service_name" 2>/dev/null)"
-	if [ -n "$container_ip" ] && command -v iptables >/dev/null 2>&1 &&
-		iptables -C DOCKER-USER -p tcp -d "$container_ip" -j DROP >/dev/null 2>&1; then
+	container_ips="$(get_container_ipv4_addresses "$service_name")"
+	if [ -n "$container_ips" ] && command -v iptables >/dev/null 2>&1; then
+		while IFS= read -r container_ip; do
+			if ! iptables -C DOCKER-USER -p tcp -d "$container_ip" -j DROP >/dev/null 2>&1; then
+				all_blocked="false"
+				break
+			fi
+		done <<< "$container_ips"
+	else
+		all_blocked="false"
+	fi
+	if [ "$all_blocked" = "true" ]; then
 		printf '%s\n' "domain_only"
 	else
 		printf '%s\n' "direct"
@@ -5841,6 +5818,82 @@ new_ssh_port() {
 
   sleep 1
 
+}
+
+
+kpanel_ssh_port_noninteractive() {
+	[ "${KJ_SSH_PORT_NONINTERACTIVE:-}" = "1" ] || return 2
+	[ "$EUID" -eq 0 ] || {
+		echo "错误: KPanel SSH 端口协议必须以 root 运行"
+		return 1
+	}
+	[ "$#" -eq 1 ] || {
+		echo "错误: SSH 端口协议需要一个端口号"
+		return 1
+	}
+
+	local new_port="$1"
+	[[ "$new_port" =~ ^[0-9]{1,5}$ ]] && [ "$new_port" -ge 1 ] && [ "$new_port" -le 65535 ] || {
+		echo "错误: SSH 端口必须为 1-65535"
+		return 1
+	}
+	[ -f /etc/ssh/sshd_config ] && [ ! -L /etc/ssh/sshd_config ] || {
+		echo "错误: 未找到可管理的 OpenSSH 配置"
+		return 1
+	}
+	command -v sshd >/dev/null 2>&1 && command -v ss >/dev/null 2>&1 || {
+		echo "错误: SSH 配置校验或监听检查工具不可用"
+		return 1
+	}
+	sshd -t || {
+		echo "错误: 当前 SSH 配置语法验证失败"
+		return 1
+	}
+
+	local configured_ports
+	configured_ports="$({
+		grep -Eh '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config 2>/dev/null
+		grep -Eh '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config.d/*.conf 2>/dev/null
+	} | awk '{print $2}' | sort -nu)"
+	if [ "$configured_ports" = "$new_port" ]; then
+		echo "KPANEL_SSH_PORT $new_port"
+		echo "KPANEL_SSH_RESULT unchanged"
+		return 0
+	fi
+
+	# 复用现有 SSH 修改主业务；适配层只负责非交互校验和机器可读结果。
+	new_ssh_port "$new_port" || return 1
+	if ! grep -Eq "^[[:space:]]*Port[[:space:]]+${new_port}([[:space:]]|$)" /etc/ssh/sshd_config; then
+		echo "错误: SSH 端口修改后回读验证失败"
+		return 1
+	fi
+	if ! sshd -t; then
+		echo "错误: SSH 配置语法验证失败"
+		return 1
+	fi
+	local listening="false"
+	local attempt
+	for attempt in {1..10}; do
+		if ss -H -ltn 2>/dev/null | awk -v port="${new_port}" '
+			{
+				address=$4
+				sub(/^.*:/, "", address)
+				if (address == port) found=1
+			}
+			END { exit(found ? 0 : 1) }
+		'; then
+			listening="true"
+			break
+		fi
+		sleep 0.2
+	done
+	[ "${listening}" = "true" ] || {
+		echo "错误: SSH 新端口未进入监听状态"
+		return 1
+	}
+
+	echo "KPANEL_SSH_PORT $new_port"
+	echo "KPANEL_SSH_RESULT applied"
 }
 
 
@@ -25139,6 +25192,11 @@ else
 		dns)
 			shift
 			kpanel_set_dns_noninteractive "$@"
+			;;
+
+		ssh-port)
+			shift
+			kpanel_ssh_port_noninteractive "$@"
 			;;
 
 		test|check|体检|测试)
