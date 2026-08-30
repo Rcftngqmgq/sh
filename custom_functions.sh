@@ -20,7 +20,7 @@ x_new_rules_port() {
     apt purge -y ufw iptables-persistent
 
     DEBIAN_FRONTEND=noninteractive apt install -y iptables-persistent
-    
+
     if [ -f "/etc/iptables/rules.v4" ]; then
         cp /etc/iptables/rules.v4 /etc/iptables/rules.v4.bak
         echo "当前防火墙规则已备份到 /etc/iptables/rules.v4.bak"
@@ -646,92 +646,63 @@ send_stats() {
 
 
 x_all_in_one() {
-    root_use
-    send_stats "一条龙调优"
-    echo "一条龙系统调优"
-    echo "------------------------------------------------"
-    echo "将对以下内容进行操作与优化"
-    echo "1. 优化系统更新源，更新系统到最新"
-    echo "2. 清理系统垃圾文件"
-    echo -e "3. 设置虚拟内存${gl_huang}1G${gl_bai}"
-    echo -e "4. 设置SSH端口号为${gl_huang}5522${gl_bai}"
-    echo -e "5. 启动fail2ban防御SSH暴力破解"
-    echo -e "6. 开放主要端口：SSH(22), HTTP(80), HTTPS(443), SSH(5522)"
-    echo -e "7. 开启${gl_huang}BBR${gl_bai}加速"
-    echo -e "8. 设置时区到${gl_huang}上海${gl_bai}"
-    echo -e "9. 自动优化DNS地址${gl_huang}海外: 1.1.1.1 8.8.8.8  国内: 223.5.5.5 ${gl_bai}"
-    echo -e "10. 设置网络为${gl_huang}ipv4优先${gl_bai}"
-    echo -e "11. 安装基础工具${gl_huang}docker wget sudo tar unzip socat btop nano vim${gl_bai}"
-    echo -e "12. Linux系统内核参数优化切换到${gl_huang}均衡优化模式${gl_bai}"
-    echo "------------------------------------------------"
-    read -e -p "确定一键保养吗？(Y/N): " choice
+	root_use
+	send_stats "一条龙调优"
+	echo "一条龙系统调优"
+	echo "------------------------------------------------"
+	echo "将对以下内容进行操作与优化"
+	echo "1. 优化系统更新源，更新系统到最新"
+	echo "2. 清理系统垃圾文件"
+	echo -e "3. 设置虚拟内存${gl_huang}1G${gl_bai}"
+	echo -e "4. 设置SSH端口号为${gl_huang}5522${gl_bai}"
+	echo -e "5. 启动fail2ban防御SSH暴力破解"
+	echo -e "6. 开放主要端口：SSH(22), HTTP(80), HTTPS(443), SSH(5522)"
+	echo -e "7. 开启${gl_huang}BBR${gl_bai}加速"
+	echo -e "8. 设置时区到${gl_huang}上海${gl_bai}"
+	echo -e "9. 自动优化DNS地址${gl_huang}海外: 1.1.1.1 8.8.8.8  国内: 223.5.5.5 ${gl_bai}"
+	echo -e "10. 设置网络为${gl_huang}ipv4优先${gl_bai}"
+	echo -e "11. 安装基础工具${gl_huang}docker wget sudo tar unzip socat btop nano vim${gl_bai}"
+	echo -e "12. Linux系统内核参数优化${gl_huang}自动根据网络环境调优${gl_bai}"
+	echo "------------------------------------------------"
+	read -e -p "确定一键保养吗？(Y/N): " choice
 
-    case "$choice" in
-        [Yy])
-            clear
-            send_stats "一条龙调优启动"
-            echo "------------------------------------------------"
-            switch_mirror false true
-            linux_update
-            echo -e "[${gl_lv}OK${gl_bai}] 1/12. 更新系统到最新"
+	case "$choice" in
+		[Yy])
+			clear
+			send_stats "一条龙调优启动"
+			kpanel_system_tuning_menu_item system-update 1 "更新系统到最新" || return 1
+			kpanel_system_tuning_menu_item system-cleanup 2 "清理系统垃圾文件" || return 1
+			kpanel_system_tuning_menu_item swap-1g 3 "设置虚拟内存${gl_huang}1G${gl_bai}" || return 1
+			kpanel_system_tuning_menu_item ssh-port-5522 4 "设置SSH端口号为${gl_huang}5522${gl_bai}" || return 1
+			kpanel_system_tuning_menu_item ssh-defense 5 "启动fail2ban防御SSH暴力破解" || return 1
+			cd ~
+			f2b_status
 
-            echo "------------------------------------------------"
-            linux_clean
-            echo -e "[${gl_lv}OK${gl_bai}] 2/12. 清理系统垃圾文件"
+			echo "------------------------------------------------"
+			if ! x_new_rules_port; then
+				echo -e "[${gl_hong}FAIL${gl_bai}] 6/12. 开放主要端口，一条龙调优已停止"
+				return 1
+			fi
+			echo -e "[${gl_lv}OK${gl_bai}] 6/12. 开放主要端口: SSH(22), HTTP(80), HTTPS(443), SSH(5522)"
 
-            echo "------------------------------------------------"
-            add_swap 1024
-            echo -e "[${gl_lv}OK${gl_bai}] 3/12. 设置虚拟内存${gl_huang}1G${gl_bai}"
+			kpanel_system_tuning_menu_item bbr 7 "开启${gl_huang}BBR${gl_bai}加速" || return 1
+			kpanel_system_tuning_menu_item timezone-shanghai 8 "设置时区到${gl_huang}上海${gl_bai}" || return 1
+			kpanel_system_tuning_menu_item dns-auto 9 "自动优化DNS地址" || return 1
+			kpanel_system_tuning_menu_item ipv4-preferred 10 "设置网络为${gl_huang}IPv4优先${gl_bai}" || return 1
+			kpanel_system_tuning_menu_item basic-tools 11 "安装基础工具${gl_huang}docker wget sudo tar unzip socat btop nano vim${gl_bai}" || return 1
+			kpanel_system_tuning_menu_item kernel-auto 12 "Linux系统内核参数优化" || return 1
+			echo -e "${gl_lv}一条龙系统调优已完成${gl_bai}"
 
-            echo "------------------------------------------------"
-			new_ssh_port 5522
-			echo -e "[${gl_lv}OK${gl_bai}] 4/12. 设置SSH端口号为${gl_huang}5522${gl_bai}"
-
-            echo "------------------------------------------------"
-            f2b_install_sshd
-            cd ~
-            f2b_status
-            echo -e "[${gl_lv}OK${gl_bai}] 5/12. 启动fail2ban防御SSH暴力破解"
-
-            echo "------------------------------------------------"
-            x_new_rules_port
-            echo -e "[${gl_lv}OK${gl_bai}] 6/12. 开放主要端口: SSH(22), HTTP(80), HTTPS(443), SSH(5522)"
-
-            echo "------------------------------------------------"
-            bbr_on
-            echo -e "[${gl_lv}OK${gl_bai}] 7/12. 开启${gl_huang}BBR${gl_bai}加速"
-
-            echo "------------------------------------------------"
-            set_timedate Asia/Shanghai
-            echo -e "[${gl_lv}OK${gl_bai}] 8/12. 设置时区到${gl_huang}上海${gl_bai}"
-
-            echo "------------------------------------------------"
-            auto_optimize_dns
-            echo -e "[${gl_lv}OK${gl_bai}] 9/12. 自动优化DNS地址"
-
-            echo "------------------------------------------------"
-            prefer_ipv4
-            echo -e "[${gl_lv}OK${gl_bai}] 10/12. 设置网络为${gl_huang}ipv4优先${gl_bai}"
-
-            echo "------------------------------------------------"
-            install_docker
-            install wget sudo tar unzip socat btop nano vim
-            echo -e "[${gl_lv}OK${gl_bai}] 11/12. 安装基础工具"
-
-            echo "------------------------------------------------"
-            optimize_balanced
-            echo -e "[${gl_lv}OK${gl_bai}] 12/12. Linux系统内核参数优化"
-            echo -e "${gl_lv}一条龙系统调优已全部完成！${gl_bai}"
-
-            ;;
-        [Nn])
-            echo "已取消"
-            ;;
-        *)
-            echo "无效的选择，请输入 Y 或 N。"
-            ;;
-    esac
+			;;
+		[Nn])
+			echo "已取消"
+			;;
+		*)
+			echo "无效的选择，请输入 Y 或 N。"
+			;;
+	esac
 }
+
 
 
 # =================================================================
