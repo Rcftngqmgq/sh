@@ -1,5 +1,5 @@
 #!/bin/bash
-sh_v="4.5.7"
+sh_v="4.5.8"
 
 
 gl_hui='\e[37m'
@@ -10681,6 +10681,7 @@ kpanel_node_paths() {
 	KPANEL_NODE_UPDATER="${KPANEL_NODE_HOME}/update.sh"
 	KPANEL_NODE_CONFIG_DIR="/etc/kejilion-node"
 	KPANEL_NODE_CONFIG="${KPANEL_NODE_CONFIG_DIR}/node.json"
+	KPANEL_NODE_TERMINAL_CONFIG="${KPANEL_NODE_CONFIG_DIR}/terminal.json"
 	KPANEL_NODE_SYSTEMCTL="$(type -P systemctl 2>/dev/null || true)"
 }
 
@@ -10836,9 +10837,18 @@ fi
 mv -f -- "${binary_path}.new" "$binary_path"
 
 if [ "$mode" = "update" ] && systemctl cat kejilion-node.service >/dev/null 2>&1; then
-	if ! systemctl restart kejilion-node.service || ! systemctl is-active --quiet kejilion-node.service; then
+	has_terminal_broker=false
+	if systemctl cat kejilion-node-terminal.service >/dev/null 2>&1 && [ -f /etc/kejilion-node/terminal.json ]; then
+		has_terminal_broker=true
+	fi
+	if { [ "$has_terminal_broker" != "true" ] || systemctl restart kejilion-node-terminal.service; } &&
+		systemctl restart kejilion-node.service && systemctl is-active --quiet kejilion-node.service &&
+		{ [ "$has_terminal_broker" != "true" ] || systemctl is-active --quiet kejilion-node-terminal.service; }; then
+		:
+	else
 		if [ "$had_previous" = "true" ] && [ -f "${binary_path}.previous" ]; then
 			mv -f -- "${binary_path}.previous" "$binary_path"
+			[ "$has_terminal_broker" != "true" ] || systemctl restart kejilion-node-terminal.service || true
 			systemctl restart kejilion-node.service || true
 		fi
 		echo "KPanel lightweight node update failed and was rolled back." >&2
@@ -10855,7 +10865,8 @@ kpanel_node_write_units() {
 	cat >/etc/systemd/system/kejilion-node.service <<'KPANEL_NODE_SERVICE'
 [Unit]
 Description=KPanel Lightweight Monitoring Node
-After=network-online.target
+Wants=kejilion-node-terminal.service
+After=kejilion-node-terminal.service network-online.target
 Wants=network-online.target
 
 [Service]
@@ -10890,6 +10901,43 @@ UMask=0077
 WantedBy=multi-user.target
 KPANEL_NODE_SERVICE
 
+	cat >/etc/systemd/system/kejilion-node-terminal.service <<'KPANEL_NODE_TERMINAL_SERVICE'
+[Unit]
+Description=KPanel Lightweight Node Root PTY Broker
+ConditionPathExists=/etc/kejilion-node/terminal.json
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/local/lib/kejilion-node/kejilion-node terminal-broker --config /etc/kejilion-node/node.json --terminal-config /etc/kejilion-node/terminal.json
+Restart=on-failure
+RestartSec=5s
+PrivateTmp=true
+PrivateDevices=false
+ProtectSystem=false
+ProtectHome=false
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+NoNewPrivileges=false
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+KPANEL_NODE_TERMINAL_SERVICE
+
 	cat >/etc/systemd/system/kejilion-node-update.service <<'KPANEL_NODE_UPDATE_SERVICE'
 [Unit]
 Description=Update KPanel Lightweight Monitoring Node
@@ -10919,6 +10967,7 @@ Persistent=true
 WantedBy=timers.target
 KPANEL_NODE_UPDATE_TIMER
 	chmod 0644 /etc/systemd/system/kejilion-node.service \
+		/etc/systemd/system/kejilion-node-terminal.service \
 		/etc/systemd/system/kejilion-node-update.service \
 		/etc/systemd/system/kejilion-node-update.timer
 }
@@ -10926,11 +10975,14 @@ KPANEL_NODE_UPDATE_TIMER
 kpanel_node_cleanup_failed_join() {
 	if [ -x "$KPANEL_NODE_SYSTEMCTL" ]; then
 		"$KPANEL_NODE_SYSTEMCTL" stop kejilion-node.service >/dev/null 2>&1 || true
+		"$KPANEL_NODE_SYSTEMCTL" stop kejilion-node-terminal.service >/dev/null 2>&1 || true
 		"$KPANEL_NODE_SYSTEMCTL" stop kejilion-node-update.timer >/dev/null 2>&1 || true
 		"$KPANEL_NODE_SYSTEMCTL" disable kejilion-node.service >/dev/null 2>&1 || true
+		"$KPANEL_NODE_SYSTEMCTL" disable kejilion-node-terminal.service >/dev/null 2>&1 || true
 		"$KPANEL_NODE_SYSTEMCTL" disable kejilion-node-update.timer >/dev/null 2>&1 || true
 	fi
 	rm -f -- /etc/systemd/system/kejilion-node.service \
+		/etc/systemd/system/kejilion-node-terminal.service \
 		/etc/systemd/system/kejilion-node-update.service \
 		/etc/systemd/system/kejilion-node-update.timer
 	rm -rf -- "$KPANEL_NODE_HOME" "$KPANEL_NODE_CONFIG_DIR"
@@ -10939,10 +10991,13 @@ kpanel_node_cleanup_failed_join() {
 
 kpanel_node_activate() {
 	"$KPANEL_NODE_SYSTEMCTL" daemon-reload &&
+		"$KPANEL_NODE_SYSTEMCTL" enable kejilion-node-terminal.service &&
 		"$KPANEL_NODE_SYSTEMCTL" enable kejilion-node.service &&
 		"$KPANEL_NODE_SYSTEMCTL" enable kejilion-node-update.timer &&
+		{ "$KPANEL_NODE_SYSTEMCTL" start kejilion-node-terminal.service || echo "KPanel 轻量节点终端 broker 启动失败；遥测服务仍将继续。" >&2; } &&
 		"$KPANEL_NODE_SYSTEMCTL" start kejilion-node.service &&
 		"$KPANEL_NODE_SYSTEMCTL" start kejilion-node-update.timer &&
+		{ "$KPANEL_NODE_SYSTEMCTL" is-active kejilion-node-terminal.service >/dev/null || echo "KPanel 轻量节点终端 broker 当前不可用；遥测服务仍在运行。" >&2; } &&
 		"$KPANEL_NODE_SYSTEMCTL" is-active kejilion-node.service >/dev/null
 }
 
@@ -10985,6 +11040,14 @@ kpanel_node_join() {
 		return 1
 	}
 	chmod 0640 "$KPANEL_NODE_CONFIG"
+	if [ -e "$KPANEL_NODE_TERMINAL_CONFIG" ] || [ -L "$KPANEL_NODE_TERMINAL_CONFIG" ]; then
+		[ -f "$KPANEL_NODE_TERMINAL_CONFIG" ] && [ ! -L "$KPANEL_NODE_TERMINAL_CONFIG" ] || {
+			echo "终端身份配置不是普通文件，拒绝继续。" >&2
+			return 1
+		}
+		chown root:root "$KPANEL_NODE_TERMINAL_CONFIG" || return 1
+		chmod 0600 "$KPANEL_NODE_TERMINAL_CONFIG" || return 1
+	fi
 	if ! kpanel_node_write_units; then
 		echo "节点授权已保存，但 systemd 单元写入失败；再次执行接入命令可继续。" >&2
 		return 1
@@ -11013,7 +11076,9 @@ kpanel_node_update() {
 		echo "KPanel 轻量节点未安装。" >&2
 		return 1
 	}
-	"$KPANEL_NODE_UPDATER" update
+	"$KPANEL_NODE_UPDATER" update || return 1
+	kpanel_node_write_units || return 1
+	kpanel_node_activate
 }
 
 kpanel_node_uninstall() {
@@ -11024,11 +11089,14 @@ kpanel_node_uninstall() {
 	}
 	if [ -x "$KPANEL_NODE_SYSTEMCTL" ]; then
 		"$KPANEL_NODE_SYSTEMCTL" stop kejilion-node.service >/dev/null 2>&1 || true
+		"$KPANEL_NODE_SYSTEMCTL" stop kejilion-node-terminal.service >/dev/null 2>&1 || true
 		"$KPANEL_NODE_SYSTEMCTL" stop kejilion-node-update.timer >/dev/null 2>&1 || true
 		"$KPANEL_NODE_SYSTEMCTL" disable kejilion-node.service >/dev/null 2>&1 || true
+		"$KPANEL_NODE_SYSTEMCTL" disable kejilion-node-terminal.service >/dev/null 2>&1 || true
 		"$KPANEL_NODE_SYSTEMCTL" disable kejilion-node-update.timer >/dev/null 2>&1 || true
 	fi
 	rm -f -- /etc/systemd/system/kejilion-node.service \
+		/etc/systemd/system/kejilion-node-terminal.service \
 		/etc/systemd/system/kejilion-node-update.service \
 		/etc/systemd/system/kejilion-node-update.timer
 	rm -rf -- "$KPANEL_NODE_HOME" "$KPANEL_NODE_CONFIG_DIR"
@@ -18864,6 +18932,7 @@ while true; do
 	  echo -e "${gl_kjlan}111. ${color111}多格式文件转换工具                  ${gl_kjlan}112. ${color112}Lucky大内网穿透工具"
 	  echo -e "${gl_kjlan}113. ${color113}Firefox浏览器                       ${gl_kjlan}114. ${color114}OpenClaw机器人管理工具${gl_huang}★${gl_bai}"
 	  echo -e "${gl_kjlan}115. ${color115}Hermes机器人管理工具${gl_huang}★${gl_bai}               ${gl_kjlan}116. ${color116}DeepSeek Harness管理工具${gl_huang}★${gl_bai}"
+	  echo -e "${gl_kjlan}117. ${color117}99CDN自建CDN管理平台                ${gl_kjlan}118. ${color118}99DNS智能调度服务"
 	  echo -e "${gl_kjlan}-------------------------"
 	  echo -e "${gl_kjlan}第三方应用列表"
   	  echo -e "${gl_kjlan}想要让你的应用出现在这里？查看开发者指南: ${gl_huang}https://dev.kejilion.sh/${gl_bai}"
@@ -22549,6 +22618,62 @@ discourse,yunsou,ahhhhfs,nsgame,gying" \
 
 	  116|deepseek-harness|DeepSeek-Harness|dsh)
 		  bash <(curl -fsSL ${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/deepseek_harness_manager.sh)
+		  ;;
+
+	  117|99cdn)
+
+		local app_id="117"
+		local lujing="[ -x /opt/srv-biz/srv-biz ]"
+		local panelname="99CDN"
+		local panelurl="https://www.99cdn.com/"
+
+		panel_app_install() {
+			install curl
+			curl -fsSL https://install.99cdn.com | bash
+		}
+
+		panel_app_manage() {
+			systemctl status srv-biz
+		}
+
+		panel_app_uninstall() {
+			systemctl stop srv-biz 2>/dev/null || true
+			systemctl disable srv-biz 2>/dev/null || true
+			rm -rf -- /opt/srv-biz
+			rm -f -- /etc/systemd/system/srv-biz.service /usr/lib/systemd/system/srv-biz.service
+			/bin/systemctl daemon-reload 2>/dev/null || true
+		}
+
+		install_panel
+
+		  ;;
+
+	  118|99dns)
+
+		local app_id="118"
+		local lujing="[ -x /opt/srv-dns/srv-dns ]"
+		local panelname="99DNS"
+		local panelurl="https://www.99cdn.com/"
+
+		panel_app_install() {
+			install curl
+			curl -fsSL https://install.99cdn.com/dns | bash
+		}
+
+		panel_app_manage() {
+			systemctl status srv-dns
+		}
+
+		panel_app_uninstall() {
+			systemctl stop srv-dns 2>/dev/null || true
+			systemctl disable srv-dns 2>/dev/null || true
+			rm -rf -- /opt/srv-dns
+			rm -f -- /etc/systemd/system/srv-dns.service /usr/lib/systemd/system/srv-dns.service
+			/bin/systemctl daemon-reload 2>/dev/null || true
+		}
+
+		install_panel
+
 		  ;;
 
 	  b)
@@ -29383,7 +29508,7 @@ x_new_rules_port() {
     apt purge -y ufw iptables-persistent
 
     DEBIAN_FRONTEND=noninteractive apt install -y iptables-persistent
-    
+
     if [ -f "/etc/iptables/rules.v4" ]; then
         cp /etc/iptables/rules.v4 /etc/iptables/rules.v4.bak
         echo "当前防火墙规则已备份到 /etc/iptables/rules.v4.bak"
@@ -30009,92 +30134,63 @@ send_stats() {
 
 
 x_all_in_one() {
-    root_use
-    send_stats "一条龙调优"
-    echo "一条龙系统调优"
-    echo "------------------------------------------------"
-    echo "将对以下内容进行操作与优化"
-    echo "1. 优化系统更新源，更新系统到最新"
-    echo "2. 清理系统垃圾文件"
-    echo -e "3. 设置虚拟内存${gl_huang}1G${gl_bai}"
-    echo -e "4. 设置SSH端口号为${gl_huang}5522${gl_bai}"
-    echo -e "5. 启动fail2ban防御SSH暴力破解"
-    echo -e "6. 开放主要端口：SSH(22), HTTP(80), HTTPS(443), SSH(5522)"
-    echo -e "7. 开启${gl_huang}BBR${gl_bai}加速"
-    echo -e "8. 设置时区到${gl_huang}上海${gl_bai}"
-    echo -e "9. 自动优化DNS地址${gl_huang}海外: 1.1.1.1 8.8.8.8  国内: 223.5.5.5 ${gl_bai}"
-    echo -e "10. 设置网络为${gl_huang}ipv4优先${gl_bai}"
-    echo -e "11. 安装基础工具${gl_huang}docker wget sudo tar unzip socat btop nano vim${gl_bai}"
-    echo -e "12. Linux系统内核参数优化切换到${gl_huang}均衡优化模式${gl_bai}"
-    echo "------------------------------------------------"
-    read -e -p "确定一键保养吗？(Y/N): " choice
+	root_use
+	send_stats "一条龙调优"
+	echo "一条龙系统调优"
+	echo "------------------------------------------------"
+	echo "将对以下内容进行操作与优化"
+	echo "1. 优化系统更新源，更新系统到最新"
+	echo "2. 清理系统垃圾文件"
+	echo -e "3. 设置虚拟内存${gl_huang}1G${gl_bai}"
+	echo -e "4. 设置SSH端口号为${gl_huang}5522${gl_bai}"
+	echo -e "5. 启动fail2ban防御SSH暴力破解"
+	echo -e "6. 开放主要端口：SSH(22), HTTP(80), HTTPS(443), SSH(5522)"
+	echo -e "7. 开启${gl_huang}BBR${gl_bai}加速"
+	echo -e "8. 设置时区到${gl_huang}上海${gl_bai}"
+	echo -e "9. 自动优化DNS地址${gl_huang}海外: 1.1.1.1 8.8.8.8  国内: 223.5.5.5 ${gl_bai}"
+	echo -e "10. 设置网络为${gl_huang}ipv4优先${gl_bai}"
+	echo -e "11. 安装基础工具${gl_huang}docker wget sudo tar unzip socat btop nano vim${gl_bai}"
+	echo -e "12. Linux系统内核参数优化${gl_huang}自动根据网络环境调优${gl_bai}"
+	echo "------------------------------------------------"
+	read -e -p "确定一键保养吗？(Y/N): " choice
 
-    case "$choice" in
-        [Yy])
-            clear
-            send_stats "一条龙调优启动"
-            echo "------------------------------------------------"
-            switch_mirror false true
-            linux_update
-            echo -e "[${gl_lv}OK${gl_bai}] 1/12. 更新系统到最新"
+	case "$choice" in
+		[Yy])
+			clear
+			send_stats "一条龙调优启动"
+			kpanel_system_tuning_menu_item system-update 1 "更新系统到最新" || return 1
+			kpanel_system_tuning_menu_item system-cleanup 2 "清理系统垃圾文件" || return 1
+			kpanel_system_tuning_menu_item swap-1g 3 "设置虚拟内存${gl_huang}1G${gl_bai}" || return 1
+			kpanel_system_tuning_menu_item ssh-port-5522 4 "设置SSH端口号为${gl_huang}5522${gl_bai}" || return 1
+			kpanel_system_tuning_menu_item ssh-defense 5 "启动fail2ban防御SSH暴力破解" || return 1
+			cd ~
+			f2b_status
 
-            echo "------------------------------------------------"
-            linux_clean
-            echo -e "[${gl_lv}OK${gl_bai}] 2/12. 清理系统垃圾文件"
+			echo "------------------------------------------------"
+			if ! x_new_rules_port; then
+				echo -e "[${gl_hong}FAIL${gl_bai}] 6/12. 开放主要端口，一条龙调优已停止"
+				return 1
+			fi
+			echo -e "[${gl_lv}OK${gl_bai}] 6/12. 开放主要端口: SSH(22), HTTP(80), HTTPS(443), SSH(5522)"
 
-            echo "------------------------------------------------"
-            add_swap 1024
-            echo -e "[${gl_lv}OK${gl_bai}] 3/12. 设置虚拟内存${gl_huang}1G${gl_bai}"
+			kpanel_system_tuning_menu_item bbr 7 "开启${gl_huang}BBR${gl_bai}加速" || return 1
+			kpanel_system_tuning_menu_item timezone-shanghai 8 "设置时区到${gl_huang}上海${gl_bai}" || return 1
+			kpanel_system_tuning_menu_item dns-auto 9 "自动优化DNS地址" || return 1
+			kpanel_system_tuning_menu_item ipv4-preferred 10 "设置网络为${gl_huang}IPv4优先${gl_bai}" || return 1
+			kpanel_system_tuning_menu_item basic-tools 11 "安装基础工具${gl_huang}docker wget sudo tar unzip socat btop nano vim${gl_bai}" || return 1
+			kpanel_system_tuning_menu_item kernel-auto 12 "Linux系统内核参数优化" || return 1
+			echo -e "${gl_lv}一条龙系统调优已完成${gl_bai}"
 
-            echo "------------------------------------------------"
-			new_ssh_port 5522
-			echo -e "[${gl_lv}OK${gl_bai}] 4/12. 设置SSH端口号为${gl_huang}5522${gl_bai}"
-
-            echo "------------------------------------------------"
-            f2b_install_sshd
-            cd ~
-            f2b_status
-            echo -e "[${gl_lv}OK${gl_bai}] 5/12. 启动fail2ban防御SSH暴力破解"
-
-            echo "------------------------------------------------"
-            x_new_rules_port
-            echo -e "[${gl_lv}OK${gl_bai}] 6/12. 开放主要端口: SSH(22), HTTP(80), HTTPS(443), SSH(5522)"
-
-            echo "------------------------------------------------"
-            bbr_on
-            echo -e "[${gl_lv}OK${gl_bai}] 7/12. 开启${gl_huang}BBR${gl_bai}加速"
-
-            echo "------------------------------------------------"
-            set_timedate Asia/Shanghai
-            echo -e "[${gl_lv}OK${gl_bai}] 8/12. 设置时区到${gl_huang}上海${gl_bai}"
-
-            echo "------------------------------------------------"
-            auto_optimize_dns
-            echo -e "[${gl_lv}OK${gl_bai}] 9/12. 自动优化DNS地址"
-
-            echo "------------------------------------------------"
-            prefer_ipv4
-            echo -e "[${gl_lv}OK${gl_bai}] 10/12. 设置网络为${gl_huang}ipv4优先${gl_bai}"
-
-            echo "------------------------------------------------"
-            install_docker
-            install wget sudo tar unzip socat btop nano vim
-            echo -e "[${gl_lv}OK${gl_bai}] 11/12. 安装基础工具"
-
-            echo "------------------------------------------------"
-            optimize_balanced
-            echo -e "[${gl_lv}OK${gl_bai}] 12/12. Linux系统内核参数优化"
-            echo -e "${gl_lv}一条龙系统调优已全部完成！${gl_bai}"
-
-            ;;
-        [Nn])
-            echo "已取消"
-            ;;
-        *)
-            echo "无效的选择，请输入 Y 或 N。"
-            ;;
-    esac
+			;;
+		[Nn])
+			echo "已取消"
+			;;
+		*)
+			echo "无效的选择，请输入 Y 或 N。"
+			;;
+	esac
 }
+
 
 
 # =================================================================
