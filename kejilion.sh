@@ -15,6 +15,8 @@ gl_kjlan='\033[96m'
 canshu="default"
 permission_granted="false"
 ENABLE_STATS="false"
+KPANEL_WEB_CERTIFICATE_PROTOCOL_VERSION="1"
+KPANEL_WEB_CERTIFICATE_REPLACE_PROTOCOL_VERSION="1"
 
 if [ "${1:-}" = "kpanel" ] && [ "${2:-}" = "node" ]; then
 	KJ_LIGHT_NODE_PROTOCOL=1
@@ -1460,8 +1462,24 @@ install_ldnmp() {
 install_certbot() {
 
 	cd ~
-	curl -sS -O ${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/auto_cert_renewal.sh
-	chmod +x auto_cert_renewal.sh
+	# Never overwrite an unknown installed renewal script before checking it.
+	if [ ! -e auto_cert_renewal.sh ] && [ ! -L auto_cert_renewal.sh ]; then
+		local renewal_download renewal_digest
+		renewal_download=$(mktemp ./auto_cert_renewal.sh.XXXXXX) || return 1
+		if ! curl -fsS --max-time 30 -o "$renewal_download" "${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/auto_cert_renewal.sh"; then
+			rm -f "$renewal_download"
+			return 1
+		fi
+		renewal_digest=$(sha256sum "$renewal_download" | awk '{print $1}')
+		if [ "$renewal_digest" != ffc714440b503d5f8ee082006f31cc0b59b1c3fd8a1d015257a6cf5944153e83 ] &&
+		   [ "$renewal_digest" != 3a63b9e0c1557fae9e18983a8eee284476a946a811c11b3076535aab1432e0d0 ]; then
+			rm -f "$renewal_download"
+			return 1
+		fi
+		chmod 700 "$renewal_download" && ln "$renewal_download" auto_cert_renewal.sh || { rm -f "$renewal_download"; return 1; }
+		rm -f "$renewal_download"
+	fi
+	kpanel_web_upgrade_certificate_renewal || return 1
 
 	check_crontab_installed
 	local cron_job="0 0 * * * ~/auto_cert_renewal.sh"
@@ -1471,31 +1489,371 @@ install_certbot() {
 }
 
 
+kpanel_web_certificate_renewal_header() {
+	cat <<'KPANEL_RENEWAL_HEADER'
+#!/bin/bash
+# KPANEL_WEB_CERTIFICATE_RENEWAL_PROTOCOL_VERSION=1
+[ -d /home/web/certs ] && [ ! -L /home/web/certs ] || exit 1
+[ ! -L /home/web/certs/.kpanel-certificate.lock ] || exit 1
+exec 9>/home/web/certs/.kpanel-certificate.lock || exit 1
+flock -w 30 9 || exit 1
+
+# Remember only a pair previously observed in this host's Certbot lineage.
+# Certbot's legacy delete-before-issue flow may temporarily remove that lineage.
+kpanel_certificate_automatic() (
+    local cert="$1" key="$2" proof="${certs_directory}${yuming}.auto-renewal"
+    local pair temporary=""
+    [ -f "$cert" ] && [ ! -L "$cert" ] && [ -f "$key" ] && [ ! -L "$key" ] || return 1
+    [ ! -L "$proof" ] && { [ ! -e "$proof" ] || { [ -f "$proof" ] && [ "$(stat -c %u "$proof")" = 0 ] && [ "$(stat -c %a "$proof")" = 600 ]; }; } || return 1
+    pair="$(sha256sum "$cert" | awk '{print $1}') $(sha256sum "$key" | awk '{print $1}')"
+    [[ "$pair" =~ ^[a-f0-9]{64}\ [a-f0-9]{64}$ ]] || return 1
+    if cmp -s "/etc/letsencrypt/live/$yuming/fullchain.pem" "$cert" && cmp -s "/etc/letsencrypt/live/$yuming/privkey.pem" "$key"; then
+        umask 077
+        trap 'rm -f -- "$temporary"' EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        temporary=$(mktemp "${proof}.XXXXXX") || return 1
+        printf '%s\n' "$pair" > "$temporary" && chmod 600 "$temporary" && mv -f -- "$temporary" "$proof"
+    else
+        [ -f "$proof" ] && [ "$(wc -c < "$proof")" = 130 ] && [ "$(cat "$proof")" = "$pair" ]
+    fi
+)
+
+KPANEL_RENEWAL_HEADER
+}
+
+# Upgrade only the exact official legacy script. Preserve unknown local edits.
+kpanel_web_upgrade_certificate_renewal() (
+	local renewal=~root/auto_cert_renewal.sh
+	[ -e "$renewal" ] || return 0
+	command -v pgrep >/dev/null 2>&1 || return 1
+	[ -f "$renewal" ] && [ ! -L "$renewal" ] && [ "$(stat -c %u "$renewal")" = 0 ] || return 1
+	local mode
+	mode=$(stat -c %a "$renewal") || return 1
+	(( (8#$mode & 022) == 0 )) || return 1
+	local digest
+	digest=$(sha256sum "$renewal" | awk '{print $1}')
+	if [ "$digest" = 3a63b9e0c1557fae9e18983a8eee284476a946a811c11b3076535aab1432e0d0 ]; then
+		! pgrep -f -- "$renewal" >/dev/null 2>&1
+		return $?
+	fi
+	[ "$digest" = ffc714440b503d5f8ee082006f31cc0b59b1c3fd8a1d015257a6cf5944153e83 ] || return 1
+	local temporary
+	temporary=$(mktemp "${renewal}.XXXXXX") || return 1
+	trap 'rm -f -- "$temporary"' EXIT
+	{
+		kpanel_web_certificate_renewal_header
+		awk '
+			{ print }
+			$0 == "    yuming=$(basename \"$cert_file\" \"_cert.pem\")" {
+				print "    # Custom material is renewed by its owner; the PEM files remain the truth."
+				print "    if [ -e \"${certs_directory}${yuming}.custom\" ] || [ -L \"${certs_directory}${yuming}.custom\" ]; then"
+				print "        continue"
+				print "    fi"
+				print "    if ! kpanel_certificate_automatic \"$cert_file\" \"${certs_directory}${yuming}_key.pem\"; then"
+				print "        continue"
+				print "    fi"
+			}
+		' "$renewal"
+	} > "$temporary" || return 1
+	[ "$(sha256sum "$temporary" | awk '{print $1}')" = 3a63b9e0c1557fae9e18983a8eee284476a946a811c11b3076535aab1432e0d0 ] || return 1
+	chmod 700 "$temporary" || return 1
+	[ "$(sha256sum "$renewal" | awk '{print $1}')" = "$digest" ] || return 1
+	mv -f "$temporary" "$renewal" || return 1
+	# An already-running legacy process did not take the new lock. Fail closed
+	# before touching certificates; a later attempt can use the upgraded entry.
+	if pgrep -f -- "$renewal" >/dev/null 2>&1; then return 1; fi
+)
+
+kpanel_web_certificate_pair_valid() {
+	local cert_file="${1:-}"
+	local key_file="${2:-}"
+	local host="${3:-}"
+	if [ -z "$cert_file" ] || [ -z "$key_file" ] || [ ! -f "$cert_file" ] || [ ! -f "$key_file" ] ||
+		! command -v openssl >/dev/null 2>&1; then
+		return 1
+	fi
+	if ! openssl x509 -in "$cert_file" -noout >/dev/null 2>&1 ||
+		! openssl x509 -in "$cert_file" -noout -checkend 0 >/dev/null 2>&1 ||
+		! openssl pkey -in "$key_file" -noout -passin pass: >/dev/null 2>&1; then
+		return 1
+	fi
+	local starts
+	starts=$(openssl x509 -in "$cert_file" -noout -startdate 2>/dev/null) || return 1
+	starts=$(date -u -d "${starts#notBefore=}" +%s 2>/dev/null) || return 1
+	[ "$starts" -le "$(date -u +%s)" ] || return 1
+	local ipv4_pattern='^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+	local ipv6_pattern='^(([0-9A-Fa-f]{1,4}:){1,7}:|([0-9A-Fa-f]{1,4}:){7,7}[0-9A-Fa-f]{1,4}|::1)$'
+	if [ -n "$host" ] && [[ ! "$host" =~ $ipv4_pattern && ! "$host" =~ $ipv6_pattern ]]; then
+		local host_match
+		host_match=$(openssl x509 -in "$cert_file" -noout -checkhost "$host" 2>/dev/null) || return 1
+		[[ "$host_match" == *"does match"* ]] || return 1
+	fi
+	local cert_pub_pem=""
+	local cert_pub_der=""
+	local key_pub_der=""
+	cert_pub_pem=$(mktemp) || return 1
+	cert_pub_der=$(mktemp) || { rm -f "$cert_pub_pem"; return 1; }
+	key_pub_der=$(mktemp) || { rm -f "$cert_pub_pem" "$cert_pub_der"; return 1; }
+	if ! openssl x509 -in "$cert_file" -pubkey -noout >"$cert_pub_pem" 2>/dev/null ||
+		! openssl pkey -pubin -in "$cert_pub_pem" -outform DER >"$cert_pub_der" 2>/dev/null ||
+		! openssl pkey -in "$key_file" -pubout -outform DER >"$key_pub_der" 2>/dev/null; then
+		rm -f "$cert_pub_pem" "$cert_pub_der" "$key_pub_der"
+		return 1
+	fi
+	cmp -s "$cert_pub_der" "$key_pub_der"
+	local matched=$?
+	rm -f "$cert_pub_pem" "$cert_pub_der" "$key_pub_der"
+	return $matched
+}
+
+kpanel_web_certificate_available() {
+	local live_cert="/etc/letsencrypt/live/$yuming/fullchain.pem"
+	local live_key="/etc/letsencrypt/live/$yuming/privkey.pem"
+	if kpanel_web_certificate_pair_valid "$live_cert" "$live_key" "$yuming"; then
+		return 0
+	fi
+	kpanel_web_certificate_pair_valid \
+		"/home/web/certs/${yuming}_cert.pem" \
+		"/home/web/certs/${yuming}_key.pem" \
+		"$yuming"
+}
+
+kpanel_web_prepare_custom_certificate() (
+	set +x
+	umask 077
+	[[ "${yuming:-}" =~ ^[a-z0-9][a-z0-9.-]*\.[a-z0-9]+$ && "$yuming" != *..* ]] || return 1
+	local cert_file="${KJ_WEB_CERTIFICATE_FILE:-}"
+	local key_file="${KJ_WEB_PRIVATE_KEY_FILE:-}"
+	if [ -z "$cert_file" ] || [ -z "$key_file" ] || [ -L "$cert_file" ] || [ -L "$key_file" ] ||
+		[[ "$cert_file" != /* || "$key_file" != /* || "$cert_file" == *..* || "$key_file" == *..* ]]; then
+		echo "KPANEL_PROGRESS 100 自定义证书输入路径无效"
+		return 1
+	fi
+	[ -f "$cert_file" ] && [ -f "$key_file" ] &&
+	[ "$(wc -c < "$cert_file")" -le 16384 ] && [ "$(wc -c < "$key_file")" -le 8192 ] || return 1
+	if ! kpanel_web_certificate_pair_valid "$cert_file" "$key_file" "$yuming"; then
+		echo "KPANEL_PROGRESS 100 自定义证书无效或与域名、私钥不匹配"
+		return 1
+	fi
+	local target_dir="/home/web/certs"
+	local cert_target="$target_dir/${yuming}_cert.pem"
+	local key_target="$target_dir/${yuming}_key.pem"
+	if [ -L "$target_dir" ] || { [ -e "$target_dir" ] && [ ! -d "$target_dir" ]; } ||
+		[ -L "$cert_target" ] || [ -L "$key_target" ]; then
+		echo "KPANEL_PROGRESS 100 目标证书路径不安全"
+		return 1
+	fi
+	mkdir -p "$target_dir" || return 1
+	kpanel_web_upgrade_certificate_renewal || return 1
+	[ ! -L "$target_dir/.kpanel-certificate.lock" ] || return 1
+	exec 9>"$target_dir/.kpanel-certificate.lock" || return 1
+	flock -w 10 9 || return 1
+	# Creation must not overwrite an existing serving pair. Existing TLS sites use
+	# the versioned replacement transaction instead.
+	[ ! -e "$cert_target" ] && [ ! -e "$key_target" ] && [ ! -e "$target_dir/${yuming}.custom" ] && [ ! -L "$target_dir/${yuming}.custom" ] || return 1
+	local cert_tmp=""
+	local key_tmp=""
+	local policy_tmp="" committed=0
+	kpanel_web_cleanup_created_certificate() {
+		local status=$?
+		trap - EXIT INT TERM
+		if [ "$committed" = 0 ]; then
+			# Links identify this transaction's files even if interrupted inside ln.
+			if [ -n "$cert_tmp" ] && [ ! -L "$cert_target" ] && [ "$cert_tmp" -ef "$cert_target" ]; then rm -f -- "$cert_target" || status=1; fi
+			if [ -n "$key_tmp" ] && [ ! -L "$key_target" ] && [ "$key_tmp" -ef "$key_target" ]; then rm -f -- "$key_target" || status=1; fi
+			if [ -n "$policy_tmp" ] && [ ! -L "$target_dir/${yuming}.custom" ] && [ "$policy_tmp" -ef "$target_dir/${yuming}.custom" ]; then rm -f -- "$target_dir/${yuming}.custom" || status=1; fi
+		fi
+		rm -f -- "$cert_tmp" "$key_tmp" "$policy_tmp" || status=1
+		exit "$status"
+	}
+	trap kpanel_web_cleanup_created_certificate EXIT
+	trap 'exit 130' INT
+	trap 'exit 143' TERM
+	cert_tmp=$(mktemp "$target_dir/.kpanel-${yuming}.cert.XXXXXX") || return 1
+	key_tmp=$(mktemp "$target_dir/.kpanel-${yuming}.key.XXXXXX") || return 1
+	chmod 600 "$cert_tmp" "$key_tmp" || return 1
+	if ! cp "$cert_file" "$cert_tmp" || ! cp "$key_file" "$key_tmp" ||
+		! chmod 644 "$cert_tmp" || ! chmod 600 "$key_tmp" ||
+		! ln "$cert_tmp" "$cert_target"; then
+		echo "KPANEL_PROGRESS 100 写入自定义证书失败"
+		return 1
+	fi
+	ln "$key_tmp" "$key_target" || return 1
+	policy_tmp=$(mktemp "$target_dir/.kpanel-policy.XXXXXX") || return 1
+	if ! printf 'custom-v1\n' > "$policy_tmp" || ! ln "$policy_tmp" "$target_dir/${yuming}.custom"; then
+		return 1
+	fi
+	committed=1
+	return 0
+)
+
+# Fixed machine protocol: no config generation, no arbitrary target paths.
+# EXIT/TERM recovery restores only files still owned by this transaction.
+kpanel_web_replace_certificate_transaction() (
+	set +x
+	umask 077
+	local domain="${1:-}" config_hash="${2:-}" cert_hash="${3:-}" key_hash="${4:-}"
+	[[ $# == 4 && "$domain" =~ ^[a-z0-9][a-z0-9.-]*\.[a-z0-9]+$ && "$domain" != *..* ]] || exit 2
+	[[ "$config_hash" =~ ^[a-f0-9]{64}$ && "$cert_hash" =~ ^[a-f0-9]{64}$ && "$key_hash" =~ ^[a-f0-9]{64}$ ]] || exit 2
+	local dir=/home/web/certs config="/home/web/conf.d/$domain.conf"
+	local cert="$dir/${domain}_cert.pem" key="$dir/${domain}_key.pem"
+	local policy="$dir/${domain}.custom" had_policy=0
+	if [ -e "$policy" ] || [ -L "$policy" ]; then
+		[ -f "$policy" ] && [ ! -L "$policy" ] && [ "$(cat "$policy")" = custom-v1 ] || exit 2
+		had_policy=1
+	fi
+	local source_cert="${KJ_WEB_CERTIFICATE_FILE:-}" source_key="${KJ_WEB_PRIVATE_KEY_FILE:-}"
+	local path
+	for path in /home /home/web /home/web/conf.d "$dir"; do
+		[ -d "$path" ] && [ ! -L "$path" ] || exit 2
+	done
+	for path in "$config" "$cert" "$key" "$source_cert" "$source_key"; do
+		[[ "$path" == /* ]] && [ -f "$path" ] && [ ! -L "$path" ] || exit 2
+	done
+	[ "$(wc -c < "$source_cert")" -le 16384 ] && [ "$(wc -c < "$source_key")" -le 8192 ] || exit 2
+	kpanel_web_certificate_pair_valid "$source_cert" "$source_key" "$domain" || exit 2
+	# Existing script TLS directives must already refer to this exact pair.
+	awk -v cert="/etc/nginx/certs/${domain}_cert.pem;" -v key="/etc/nginx/certs/${domain}_key.pem;" '
+		$1 == "ssl_certificate" { if ($2 != cert || NF != 2) bad=1; c++ }
+		$1 == "ssl_certificate_key" { if ($2 != key || NF != 2) bad=1; k++ }
+		END { exit (bad || !c || !k) }
+	' "$config" || exit 2
+	kpanel_web_upgrade_certificate_renewal || { echo 'KPANEL_CERTIFICATE renewal_adapter_unavailable'; exit 2; }
+	[ ! -L "$dir/.kpanel-certificate.lock" ] || exit 2
+	exec 9>"$dir/.kpanel-certificate.lock" || exit 1
+	flock -w 10 9 || exit 1
+	local expected new_cert_hash new_key_hash
+	expected=$(printf '%s\n%s\n%s' "$config_hash" "$cert_hash" "$key_hash")
+	local actual
+	actual=$(sha256sum "$config" "$cert" "$key" | awk '{print $1}')
+	[ "$actual" = "$expected" ] || { echo 'KPANEL_CERTIFICATE conflict'; exit 3; }
+	docker exec nginx nginx -t >/dev/null 2>&1 || exit 1
+	local work
+	work=$(mktemp -d "$dir/.kpanel-certificate.XXXXXX") || exit 1
+	local published=0 committed=0 retain=0
+	cleanup_certificate_transaction() {
+		local status=$?
+		trap - EXIT INT TERM
+		if [ "$published" = 1 ] && [ "$committed" = 0 ]; then
+			if { [ "$(sha256sum "$cert" | awk '{print $1}')" = "$new_cert_hash" ] || [ "$(sha256sum "$cert" | awk '{print $1}')" = "$cert_hash" ]; } &&
+			   { [ "$(sha256sum "$key" | awk '{print $1}')" = "$new_key_hash" ] || [ "$(sha256sum "$key" | awk '{print $1}')" = "$key_hash" ]; } &&
+			   [ ! -L "$cert" ] && [ ! -L "$key" ]; then
+				if ! mv -f "$work/old-cert" "$cert" || ! mv -f "$work/old-key" "$key" ||
+				   ! docker exec nginx nginx -t >/dev/null 2>&1 || ! docker exec nginx nginx -s reload >/dev/null 2>&1; then
+					retain=1
+				fi
+				if [ "$had_policy" = 0 ] && [ ! -L "$policy" ] && [ "$(cat "$policy" 2>/dev/null)" = custom-v1 ] &&
+				   [ "$(sha256sum "$cert" | awk '{print $1}')" = "$cert_hash" ] && [ "$(sha256sum "$key" | awk '{print $1}')" = "$key_hash" ]; then rm -f "$policy"; fi
+			else
+				retain=1
+			fi
+		fi
+		if [ "$retain" = 1 ]; then
+			echo 'KPANEL_CERTIFICATE needs_attention'
+			status=4
+		else
+			rm -rf -- "$work"
+		fi
+		exit "$status"
+	}
+	trap cleanup_certificate_transaction EXIT
+	trap 'exit 1' INT TERM
+	cp -p "$cert" "$work/old-cert" && cp -p "$key" "$work/old-key" || exit 1
+	cp "$source_cert" "$work/new-cert" && cp "$source_key" "$work/new-key" || exit 1
+	chmod 644 "$work/new-cert" && chmod 600 "$work/new-key" || exit 1
+	new_cert_hash=$(sha256sum "$work/new-cert" | awk '{print $1}')
+	new_key_hash=$(sha256sum "$work/new-key" | awk '{print $1}')
+	actual=$(sha256sum "$config" "$cert" "$key" | awk '{print $1}')
+	[ "$actual" = "$expected" ] || { echo 'KPANEL_CERTIFICATE conflict'; exit 3; }
+	published=1
+	if [ "$had_policy" = 0 ]; then
+		printf 'custom-v1\n' > "$work/policy" && mv -n "$work/policy" "$policy" || exit 1
+	fi
+	mv -f "$work/new-cert" "$cert" && mv -f "$work/new-key" "$key" || exit 1
+	docker exec nginx nginx -t >/dev/null 2>&1 && docker exec nginx nginx -s reload >/dev/null 2>&1 || exit 1
+	[ "$(sha256sum "$config" | awk '{print $1}')" = "$config_hash" ] &&
+	[ "$(sha256sum "$cert" | awk '{print $1}')" = "$new_cert_hash" ] &&
+	[ "$(sha256sum "$key" | awk '{print $1}')" = "$new_key_hash" ] &&
+	[ ! -L "$policy" ] && [ "$(cat "$policy")" = custom-v1 ] || exit 1
+	committed=1
+	echo "KPANEL_CERTIFICATE replaced $domain"
+)
+
+kpanel_web_replace_certificate() (
+	# Only the Agent opts in to disposal of its dedicated staging directory.
+	local ephemeral=""
+	trap 'exit 1' INT TERM
+	if [ "${KJ_WEB_CERTIFICATE_EPHEMERAL:-0}" = 1 ]; then
+		ephemeral=$(dirname "${KJ_WEB_CERTIFICATE_FILE:-}")
+		[[ "$ephemeral" == /*/certificate-replace-* && "${KJ_WEB_CERTIFICATE_FILE:-}" = "$ephemeral/certificate.pem" && "${KJ_WEB_PRIVATE_KEY_FILE:-}" = "$ephemeral/private-key.pem" ]] || exit 2
+		[ -d "$ephemeral" ] && [ ! -L "$ephemeral" ] && [ "$(stat -c %u "$ephemeral")" = 0 ] && [ "$(stat -c %a "$ephemeral")" = 700 ] || exit 2
+		trap 'rm -f -- "$ephemeral/certificate.pem" "$ephemeral/private-key.pem"; rmdir -- "$ephemeral" 2>/dev/null || true' EXIT
+	fi
+	kpanel_web_replace_certificate_transaction "$@"
+)
+
 install_ssltls() {
 	  docker stop nginx > /dev/null 2>&1
 	  cd ~
 
-	  local file_path="/etc/letsencrypt/live/$yuming/fullchain.pem"
-	  if [ ! -f "$file_path" ]; then
-		 	local ipv4_pattern='^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
-			local ipv6_pattern='^(([0-9A-Fa-f]{1,4}:){1,7}:|([0-9A-Fa-f]{1,4}:){7,7}[0-9A-Fa-f]{1,4}|::1)$'
-			if [[ ($yuming =~ $ipv4_pattern || $yuming =~ $ipv6_pattern) ]]; then
-				mkdir -p /etc/letsencrypt/live/$yuming/
-				if command -v dnf &>/dev/null || command -v yum &>/dev/null; then
-					openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -keyout /etc/letsencrypt/live/$yuming/privkey.pem -out /etc/letsencrypt/live/$yuming/fullchain.pem -days 5475 -subj "/C=US/ST=State/L=City/O=Organization/OU=Organizational Unit/CN=Common Name"
-				else
-					openssl genpkey -algorithm Ed25519 -out /etc/letsencrypt/live/$yuming/privkey.pem
-					openssl req -x509 -key /etc/letsencrypt/live/$yuming/privkey.pem -out /etc/letsencrypt/live/$yuming/fullchain.pem -days 5475 -subj "/C=US/ST=State/L=City/O=Organization/OU=Organizational Unit/CN=Common Name"
-				fi
-			else
-				docker run --rm -p 80:80 -v /etc/letsencrypt/:/etc/letsencrypt certbot/certbot certonly --standalone -d "$yuming" --email your@email.com --agree-tos --no-eff-email --force-renewal --key-type ecdsa
-			fi
+	  if [ -n "${KJ_WEB_CERTIFICATE_FILE:-}" ] || [ -n "${KJ_WEB_PRIVATE_KEY_FILE:-}" ]; then
+		  if ! kpanel_web_prepare_custom_certificate; then
+			  docker start nginx > /dev/null 2>&1
+			  if [ "${KJ_WEB_NONINTERACTIVE:-0}" = "1" ]; then
+				  exit 1
+			  fi
+			  return 1
+		  fi
+		  docker start nginx > /dev/null 2>&1 || return 1
+		  return 0
 	  fi
-	  mkdir -p /home/web/certs/
-	  cp /etc/letsencrypt/live/$yuming/fullchain.pem /home/web/certs/${yuming}_cert.pem > /dev/null 2>&1
-	  cp /etc/letsencrypt/live/$yuming/privkey.pem /home/web/certs/${yuming}_key.pem > /dev/null 2>&1
 
-	  docker start nginx > /dev/null 2>&1
+	  local live_cert="/etc/letsencrypt/live/$yuming/fullchain.pem"
+	  local live_key="/etc/letsencrypt/live/$yuming/privkey.pem"
+	  local source_cert=""
+	  local source_key=""
+	  if kpanel_web_certificate_pair_valid "/home/web/certs/${yuming}_cert.pem" "/home/web/certs/${yuming}_key.pem" "$yuming"; then
+		  docker start nginx > /dev/null 2>&1 || return 1
+		  return 0
+	  elif [ -e "/home/web/certs/${yuming}.custom" ]; then
+		  echo "自定义证书已失效，请提供新的证书材料"
+		  docker start nginx > /dev/null 2>&1
+		  return 1
+	  elif kpanel_web_certificate_pair_valid "$live_cert" "$live_key" "$yuming"; then
+		  source_cert="$live_cert"
+		  source_key="$live_key"
+	  else
+		  local ipv4_pattern='^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+		  local ipv6_pattern='^(([0-9A-Fa-f]{1,4}:){1,7}:|([0-9A-Fa-f]{1,4}:){7,7}[0-9A-Fa-f]{1,4}|::1)$'
+		  if [[ ($yuming =~ $ipv4_pattern || $yuming =~ $ipv6_pattern) ]]; then
+			  mkdir -p "/etc/letsencrypt/live/$yuming/" || return 1
+			  if command -v dnf &>/dev/null || command -v yum &>/dev/null; then
+				  openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -keyout "/etc/letsencrypt/live/$yuming/privkey.pem" -out "/etc/letsencrypt/live/$yuming/fullchain.pem" -days 5475 -subj "/C=US/ST=State/L=City/O=Organization/OU=Organizational Unit/CN=Common Name"
+			  else
+				  openssl genpkey -algorithm Ed25519 -out "/etc/letsencrypt/live/$yuming/privkey.pem"
+				openssl req -x509 -key "/etc/letsencrypt/live/$yuming/privkey.pem" -out "/etc/letsencrypt/live/$yuming/fullchain.pem" -days 5475 -subj "/C=US/ST=State/L=City/O=Organization/OU=Organizational Unit/CN=Common Name"
+			  fi
+		  else
+			  docker run --rm -p 80:80 -v /etc/letsencrypt/:/etc/letsencrypt certbot/certbot certonly --standalone -d "$yuming" --email your@email.com --agree-tos --no-eff-email --force-renewal --key-type ecdsa
+		  fi
+		  if kpanel_web_certificate_pair_valid "$live_cert" "$live_key" "$yuming"; then
+			  source_cert="$live_cert"
+			  source_key="$live_key"
+		  fi
+	  fi
+	  if [ -z "$source_cert" ] || [ -z "$source_key" ]; then
+		  docker start nginx > /dev/null 2>&1
+		  return 1
+	  fi
+	  mkdir -p /home/web/certs/ || { docker start nginx > /dev/null 2>&1; return 1; }
+	  if ! cp "$source_cert" "/home/web/certs/${yuming}_cert.pem" > /dev/null 2>&1 ||
+		  ! cp "$source_key" "/home/web/certs/${yuming}_key.pem" > /dev/null 2>&1; then
+		  docker start nginx > /dev/null 2>&1
+		  return 1
+	  fi
+
+	  docker start nginx > /dev/null 2>&1 || return 1
 }
 
 
@@ -1572,9 +1930,8 @@ certs_status() {
 
 	sleep 1
 
-	local file_path="/etc/letsencrypt/live/$yuming/fullchain.pem"
-	if [ -f "$file_path" ]; then
-		send_stats "域名证书申请成功"
+	if kpanel_web_certificate_available; then
+		send_stats "域名证书可用"
 	else
 		send_stats "域名证书申请失败"
 		if [ "${KJ_WEB_NONINTERACTIVE:-0}" = "1" ] &&
@@ -1901,6 +2258,8 @@ web_del() {
 		rm -f -- "/home/web/conf.d/$yuming.conf" > /dev/null 2>&1
 		rm -f -- "/home/web/certs/${yuming}_key.pem" > /dev/null 2>&1
 		rm -f -- "/home/web/certs/${yuming}_cert.pem" > /dev/null 2>&1
+		rm -f -- "/home/web/certs/${yuming}.custom" > /dev/null 2>&1
+		rm -f -- "/home/web/certs/${yuming}.auto-renewal" > /dev/null 2>&1
 
 		# 将域名转换为数据库名
 		dbname=$(echo "$yuming" | sed -e 's/[^A-Za-z0-9]/_/g')
@@ -5583,153 +5942,6 @@ EOF
 
 
 
-configure_frpc() {
-	send_stats "安装frp客户端"
-	read -e -p "请输入外网对接IP: " server_addr
-	read -e -p "请输入外网对接token: " token
-	echo
-
-	mkdir -p /home/frp
-	touch /home/frp/frpc.toml
-	cat <<EOF > /home/frp/frpc.toml
-[common]
-server_addr = ${server_addr}
-server_port = 8055
-token = ${token}
-
-EOF
-
-	donlond_frp frpc
-
-	open_port 8055
-
-}
-
-add_forwarding_service() {
-	send_stats "添加frp内网服务"
-	# 提示用户输入服务名称和转发信息
-	read -e -p "请输入服务名称: " service_name
-	read -e -p "请输入转发类型 (tcp/udp) [回车默认tcp]: " service_type
-	local service_type=${service_type:-tcp}
-	read -e -p "请输入内网IP [回车默认127.0.0.1]: " local_ip
-	local local_ip=${local_ip:-127.0.0.1}
-	read -e -p "请输入内网端口: " local_port
-	read -e -p "请输入外网端口: " remote_port
-
-	# 将用户输入写入配置文件
-	cat <<EOF >> /home/frp/frpc.toml
-[$service_name]
-type = ${service_type}
-local_ip = ${local_ip}
-local_port = ${local_port}
-remote_port = ${remote_port}
-
-EOF
-
-	# 输出生成的信息
-	echo "服务 $service_name 已成功添加到 frpc.toml"
-
-	docker restart frpc
-
-	open_port $local_port
-
-}
-
-
-
-delete_forwarding_service() {
-	send_stats "删除frp内网服务"
-	# 提示用户输入需要删除的服务名称
-	read -e -p "请输入需要删除的服务名称: " service_name
-	# 使用 sed 删除该服务及其相关配置
-	sed -i "/\[$service_name\]/,/^$/d" /home/frp/frpc.toml
-	echo "服务 $service_name 已成功从 frpc.toml 删除"
-
-	docker restart frpc
-
-}
-
-
-list_forwarding_services() {
-	local config_file="$1"
-
-	# 打印表头
-	printf "%-20s %-25s %-30s %-10s\n" "服务名称" "内网地址" "外网地址" "协议"
-
-	awk '
-	BEGIN {
-		server_addr=""
-		server_port=""
-		current_service=""
-	}
-
-	/^server_addr = / {
-		gsub(/"|'"'"'/, "", $3)
-		server_addr=$3
-	}
-
-	/^server_port = / {
-		gsub(/"|'"'"'/, "", $3)
-		server_port=$3
-	}
-
-	/^\[.*\]/ {
-		# 如果已有服务信息，在处理新服务之前打印当前服务
-		if (current_service != "" && current_service != "common" && local_ip != "" && local_port != "") {
-			printf "%-16s %-21s %-26s %-10s\n", \
-				current_service, \
-				local_ip ":" local_port, \
-				server_addr ":" remote_port, \
-				type
-		}
-
-		# 更新当前服务名称
-		if ($1 != "[common]") {
-			gsub(/[\[\]]/, "", $1)
-			current_service=$1
-			# 清除之前的值
-			local_ip=""
-			local_port=""
-			remote_port=""
-			type=""
-		}
-	}
-
-	/^local_ip = / {
-		gsub(/"|'"'"'/, "", $3)
-		local_ip=$3
-	}
-
-	/^local_port = / {
-		gsub(/"|'"'"'/, "", $3)
-		local_port=$3
-	}
-
-	/^remote_port = / {
-		gsub(/"|'"'"'/, "", $3)
-		remote_port=$3
-	}
-
-	/^type = / {
-		gsub(/"|'"'"'/, "", $3)
-		type=$3
-	}
-
-	END {
-		# 打印最后一个服务的信息
-		if (current_service != "" && current_service != "common" && local_ip != "" && local_port != "") {
-			printf "%-16s %-21s %-26s %-10s\n", \
-				current_service, \
-				local_ip ":" local_port, \
-				server_addr ":" remote_port, \
-				type
-		}
-	}' "$config_file"
-}
-
-
-
-# 获取 FRP 服务端端口
 get_frp_ports() {
 	mapfile -t ports < <(ss -tulnape | grep frps | awk '{print $5}' | awk -F':' '{print $NF}' | sort -u)
 }
@@ -5790,6 +6002,519 @@ frps_main_ports() {
 	ip_address
 	generate_access_urls
 }
+
+
+
+
+#!/bin/bash
+# frpc 增强功能模块 - 从 kejilion.sh 4.4.10-cong86.1 提取
+# 包含: configure_frpc, 辅助校验函数, add_forwarding_service,
+#       delete_forwarding_service, list_forwarding_services,
+#       sort_forwarding_services_by_remote_port, frpc_panel
+
+# ===== 第一部分: configure_frpc + 辅助 + 添加/删除/列表/排序 (行4129-4542) =====
+configure_frpc() {
+	send_stats "安装frp客户端"
+	read -e -p "请输入外网对接IP: " server_addr
+	read -e -p "请输入外网对接token: " token
+	echo
+
+	mkdir -p /home/frp
+	touch /home/frp/frpc.toml
+	cat <<EOF > /home/frp/frpc.toml
+[common]
+server_addr = ${server_addr}
+server_port = 8055
+token = ${token}
+
+EOF
+
+	donlond_frp frpc
+
+	open_port 8055
+
+}
+
+is_valid_port() {
+	local port="$1"
+	[[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
+}
+
+is_valid_service_name() {
+	local name="$1"
+	[[ "$name" =~ ^[A-Za-z0-9_-]+$ ]]
+}
+
+is_valid_domain() {
+	local domain="$1"
+	if [ -z "$domain" ]; then
+		return 1
+	fi
+	if [[ "$domain" == http://* ]] || [[ "$domain" == https://* ]] || [[ "$domain" == *:* ]] || [[ "$domain" == */* ]]; then
+		return 1
+	fi
+	[[ "$domain" =~ ^[A-Za-z0-9.-]+$ ]] && [[ "$domain" == *.* ]]
+}
+
+remote_port_exists() {
+	local protocol="$1"
+	local port="$2"
+	[ ! -f /home/frp/frpc.toml ] && return 1
+	awk -v proto="$protocol" -v port="$port" '
+		BEGIN { in_section=0; current_type=""; current_remote="" }
+		/^\[.*\]$/ {
+			if (in_section && current_type == proto && current_remote == port) exit 0
+			in_section=1
+			current_type=""
+			current_remote=""
+			next
+		}
+		/^type = / {
+			gsub(/[" ]/, "", $3)
+			current_type=$3
+		}
+		/^remote_port = / {
+			gsub(/[" ]/, "", $3)
+			current_remote=$3
+		}
+		END {
+			if (in_section && current_type == proto && current_remote == port) exit 0
+			exit 1
+		}
+	' /home/frp/frpc.toml
+}
+
+add_forwarding_service() {
+	send_stats "添加frp内网服务"
+
+	while true; do
+		read -e -p "请输入服务名称: " service_name
+		service_name=$(echo "$service_name" | xargs)
+		if [ -z "$service_name" ]; then
+			echo "添加失败：服务名称不能为空，请重新输入。"
+			continue
+		fi
+		if ! is_valid_service_name "$service_name"; then
+			echo "添加失败：服务名称仅允许字母、数字、下划线和中划线，请重新输入。"
+			continue
+		fi
+		if [ -f /home/frp/frpc.toml ] && grep -qE "^\[$service_name\]$" /home/frp/frpc.toml; then
+			echo "添加失败：服务名称 $service_name 已存在，请重新输入其他名称。"
+			continue
+		fi
+		break
+	done
+
+	while true; do
+		read -e -p "请输入转发类型 (tcp/udp/http/https) [回车默认tcp]: " service_type
+		service_type=${service_type:-tcp}
+		service_type=$(echo "$service_type" | tr '[:upper:]' '[:lower:]' | xargs)
+		case "$service_type" in
+			tcp|udp|http|https) break ;;
+			*) echo "添加失败：转发类型仅支持 tcp/udp/http/https，请重新输入。" ;;
+		esac
+	done
+
+	read -e -p "请输入内网IP [回车默认127.0.0.1]: " local_ip
+	local_ip=${local_ip:-127.0.0.1}
+	local_ip=$(echo "$local_ip" | xargs)
+
+	while true; do
+		read -e -p "请输入内网端口: " local_port
+		local_port=$(echo "$local_port" | xargs)
+		if ! is_valid_port "$local_port"; then
+			echo "添加失败：内网端口必须是 1-65535 的数字，请重新输入。"
+			continue
+		fi
+		break
+	done
+
+	case "$service_type" in
+		tcp|udp)
+			while true; do
+				read -e -p "请输入外网端口: " remote_port
+				remote_port=$(echo "$remote_port" | xargs)
+				if ! is_valid_port "$remote_port"; then
+					echo "添加失败：外网端口必须是 1-65535 的数字，请重新输入。"
+					continue
+				fi
+				if remote_port_exists "$service_type" "$remote_port"; then
+					echo "添加失败：$service_type 端口 $remote_port 已存在，请重新输入其他外网端口。"
+					continue
+				fi
+				break
+			done
+			cp -f /home/frp/frpc.toml /home/frp/frpc.toml.bak 2>/dev/null || true
+			cat <<EOF >> /home/frp/frpc.toml
+[$service_name]
+type = ${service_type}
+local_ip = ${local_ip}
+local_port = ${local_port}
+remote_port = ${remote_port}
+
+EOF
+			;;
+		http|https)
+			while true; do
+				read -e -p "请输入绑定域名(如 www.cong86.cn): " custom_domains
+				custom_domains=$(echo "$custom_domains" | xargs)
+				if [ -z "$custom_domains" ]; then
+					echo "添加失败：域名不能为空，请重新输入。"
+					continue
+				fi
+				if ! is_valid_domain "$custom_domains"; then
+					echo "添加失败：域名格式不正确，请输入纯域名，不要带 http://、https://、端口或路径。"
+					continue
+				fi
+				duplicate_domain=0
+				if [ -f /home/frp/frpc.toml ]; then
+					while IFS= read -r existing_domain; do
+						[ -z "$existing_domain" ] && continue
+						if [ "$existing_domain" = "$custom_domains" ]; then
+							duplicate_domain=1
+							break
+						fi
+					done < <(awk -F= '/^custom_domains = / {gsub(/[" ]/, "", $2); gsub(/,/, "\n", $2); print $2}' /home/frp/frpc.toml)
+				fi
+				if [ "$duplicate_domain" -eq 1 ]; then
+					echo "添加失败：域名 $custom_domains 已存在，请重新输入其他域名。"
+					continue
+				fi
+				break
+			done
+			cp -f /home/frp/frpc.toml /home/frp/frpc.toml.bak 2>/dev/null || true
+			cat <<EOF >> /home/frp/frpc.toml
+[$service_name]
+type = ${service_type}
+local_ip = ${local_ip}
+local_port = ${local_port}
+custom_domains = ${custom_domains}
+
+EOF
+			;;
+	esac
+
+	echo "服务 $service_name 已成功添加到 frpc.toml"
+	if docker restart frpc >/dev/null 2>&1; then
+		echo "frpc 已重启。"
+	else
+		echo "警告：frpc 重启失败，请检查 /home/frp/frpc.toml 配置。"
+		return 1
+	fi
+}
+
+
+delete_forwarding_service() {
+	send_stats "删除frp内网服务"
+	read -e -p "请输入需要删除的服务名称: " service_name
+	service_name=$(echo "$service_name" | xargs)
+	if [ -z "$service_name" ]; then
+		echo "删除失败：服务名称不能为空。"
+		return 1
+	fi
+	if [ ! -f /home/frp/frpc.toml ] || ! grep -qE "^\[$service_name\]$" /home/frp/frpc.toml; then
+		echo "删除失败：服务 $service_name 不存在。"
+		return 1
+	fi
+
+	echo "即将删除服务：$service_name"
+	awk -v svc="$service_name" '
+		BEGIN { in_section=0 }
+		$0 == "[" svc "]" { in_section=1; print; next }
+		/^\[.*\]$/ && in_section { exit }
+		in_section { print }
+	' /home/frp/frpc.toml
+
+	read -e -p "确认删除服务 $service_name 吗？(y/N): " confirm_delete
+	confirm_delete=$(echo "$confirm_delete" | tr '[:upper:]' '[:lower:]' | xargs)
+	if [ "$confirm_delete" != "y" ] && [ "$confirm_delete" != "yes" ]; then
+		echo "已取消删除。"
+		return 0
+	fi
+
+	cp -f /home/frp/frpc.toml /home/frp/frpc.toml.bak 2>/dev/null || true
+	sed -i "/\[$service_name\]/,/^$/d" /home/frp/frpc.toml
+	echo "服务 $service_name 已成功从 frpc.toml 删除"
+	if docker restart frpc >/dev/null 2>&1; then
+		echo "frpc 已重启。"
+	else
+		echo "警告：frpc 重启失败，请检查 /home/frp/frpc.toml 配置。"
+		return 1
+	fi
+}
+
+
+list_forwarding_services() {
+	local config_file="$1"
+
+	# 打印表头
+	printf "%-20s %-25s %-40s %-10s\n" "服务名称" "内网地址" "外网地址/域名" "协议"
+
+	awk '
+	function trim_value(s) {
+		gsub(/"|'"'"'/, "", s)
+		gsub(/^ +| +$/, "", s)
+		return s
+	}
+
+	function print_service() {
+		if (current_service != "" && current_service != "common" && local_ip != "" && local_port != "") {
+			if (type == "http" || type == "https") {
+				if (custom_domains != "") {
+					printf "%-16s %-21s %-36s %-10s\n", current_service, local_ip ":" local_port, custom_domains, type
+				} else {
+					printf "%-16s %-21s %-36s %-10s\n", current_service, local_ip ":" local_port, "(未设置域名)", type
+				}
+			} else {
+				printf "%-16s %-21s %-36s %-10s\n", current_service, local_ip ":" local_port, server_addr ":" remote_port, type
+			}
+		}
+	}
+
+	BEGIN {
+		server_addr=""
+		server_port=""
+		current_service=""
+		local_ip=""
+		local_port=""
+		remote_port=""
+		custom_domains=""
+		type=""
+	}
+
+	/^server_addr = / {
+		server_addr=trim_value($3)
+	}
+
+	/^server_port = / {
+		server_port=trim_value($3)
+	}
+
+	/^\[.*\]/ {
+		print_service()
+		if ($1 != "[common]") {
+			gsub(/[\[\]]/, "", $1)
+			current_service=$1
+			local_ip=""
+			local_port=""
+			remote_port=""
+			custom_domains=""
+			type=""
+		}
+	}
+
+	/^local_ip = / {
+		local_ip=trim_value($3)
+	}
+
+	/^local_port = / {
+		local_port=trim_value($3)
+	}
+
+	/^remote_port = / {
+		remote_port=trim_value($3)
+	}
+
+	/^custom_domains = / {
+		custom_domains=trim_value($3)
+	}
+
+	/^type = / {
+		type=trim_value($3)
+	}
+
+	END {
+		print_service()
+	}' "$config_file"
+}
+
+
+sort_forwarding_services_by_remote_port() {
+	send_stats "按外网端口排序frpc服务"
+	local config_file="/home/frp/frpc.toml"
+
+	if [ ! -f "$config_file" ]; then
+		echo "排序失败：未找到 $config_file"
+		return 1
+	fi
+
+	cp -f "$config_file" "${config_file}.bak" 2>/dev/null || true
+
+	local tmp_dir
+	tmp_dir=$(mktemp -d)
+	if [ -z "$tmp_dir" ] || [ ! -d "$tmp_dir" ]; then
+		echo "排序失败：无法创建临时目录。"
+		return 1
+	fi
+
+	awk -v out_dir="$tmp_dir" '
+	function flush_section(    order,key,file,m) {
+		if (section_name == "") return
+
+		file = sprintf("%s/sec_%06d.toml", out_dir, section_index)
+		printf "%s", section_body > file
+		close(file)
+
+		if (section_name == "common") {
+			order = 0
+			key = 0
+		} else {
+			order = 1
+			key = 999999
+			if (match(section_body, /(^|\n)remote_port = *([0-9]+)/, m)) {
+				key = m[2] + 0
+			}
+		}
+
+		printf "%d\t%09d\t%06d\t%s\n", order, key, section_index, file
+	}
+
+	BEGIN {
+		section_name = ""
+		section_body = ""
+		section_index = 0
+	}
+
+	/^\[.*\]$/ {
+		flush_section()
+		section_index++
+		section_name = $0
+		gsub(/[\[\]]/, "", section_name)
+		section_body = $0 "\n"
+		next
+	}
+
+	{
+		if (section_name != "") {
+			section_body = section_body $0 "\n"
+		}
+	}
+
+	END {
+		flush_section()
+	}
+	' "$config_file" > "$tmp_dir/index.tsv"
+
+	if [ ! -s "$tmp_dir/index.tsv" ]; then
+		echo "排序失败：未解析到有效服务段。"
+		rm -rf "$tmp_dir"
+		return 1
+	fi
+
+	sort -t $'\t' -k1,1n -k2,2n -k3,3n "$tmp_dir/index.tsv" | awk -F'\t' '{print $4}' | while IFS= read -r part_file; do
+		cat "$part_file"
+		echo
+	done > "$tmp_dir/frpc.sorted.toml"
+
+	if [ ! -s "$tmp_dir/frpc.sorted.toml" ]; then
+		echo "排序失败：排序后配置为空，已取消覆盖。"
+		rm -rf "$tmp_dir"
+		return 1
+	fi
+
+	mv "$tmp_dir/frpc.sorted.toml" "$config_file"
+	rm -rf "$tmp_dir"
+
+	echo "已按外网端口升序完成排序（无 remote_port 的服务放在最后）。"
+	if docker restart frpc >/dev/null 2>&1; then
+		echo "frpc 已重启。"
+	else
+		echo "警告：frpc 重启失败，请检查 /home/frp/frpc.toml 配置。"
+		return 1
+	fi
+}
+
+
+
+# 获取 FRP 服务端端口
+
+# ===== 第二部分: frpc_panel 增强版 (行4705-4793) =====
+frpc_panel() {
+	send_stats "FRP客户端"
+	local app_id="56"
+	local docker_name="frpc"
+	local docker_port=8055
+	while true; do
+		clear
+		check_frp_app
+		check_docker_image_update $docker_name
+		echo -e "FRP客户端 $check_frp $update_status"
+		echo "与服务端对接，对接后可创建内网穿透服务到互联网访问"
+		echo "官网介绍: ${gh_https_url}github.com/fatedier/frp/"
+		echo "视频教学: https://www.bilibili.com/video/BV1yMw6e2EwL?t=173.9"
+		echo "------------------------"
+		if [ -d "/home/frp/" ]; then
+			[ -f /home/frp/frpc.toml ] || cp /home/frp/frp_0.61.0_linux_amd64/frpc.toml /home/frp/frpc.toml
+			list_forwarding_services "/home/frp/frpc.toml"
+		fi
+		echo ""
+		echo "------------------------"
+		echo "1. 安装               2. 更新               3. 卸载"
+		echo "------------------------"
+		echo "4. 添加对外服务       5. 删除对外服务       6. 手动配置服务"
+		echo "------------------------"
+		echo "7. 按外网端口升序排序"
+		echo "------------------------"
+		echo "0. 返回上一级选单"
+		echo "------------------------"
+		read -e -p "输入你的选择: " choice
+		case $choice in
+			1)
+				install jq grep ss
+				install_docker
+				configure_frpc
+
+				add_app_id
+				echo "FRP客户端已经安装完成"
+				;;
+			2)
+				crontab -l | grep -v 'frpc' | crontab - > /dev/null 2>&1
+				tmux kill-session -t frpc >/dev/null 2>&1
+				docker rm -f frpc && docker rmi kjlion/frp:alpine >/dev/null 2>&1
+				[ -f /home/frp/frpc.toml ] || cp /home/frp/frp_0.61.0_linux_amd64/frpc.toml /home/frp/frpc.toml
+				donlond_frp frpc
+
+				add_app_id
+				echo "FRP客户端已经更新完成"
+				;;
+
+			3)
+				crontab -l | grep -v 'frpc' | crontab - > /dev/null 2>&1
+				tmux kill-session -t frpc >/dev/null 2>&1
+				docker rm -f frpc && docker rmi kjlion/frp:alpine
+				rm -rf /home/frp
+				close_port 8055
+
+				sed -i "/\b${app_id}\b/d" /home/docker/appno.txt
+				echo "应用已卸载"
+				;;
+
+			4)
+				add_forwarding_service
+				;;
+
+			5)
+				delete_forwarding_service
+				;;
+
+			6)
+				install nano
+				nano /home/frp/frpc.toml
+				docker restart frpc
+				;;
+
+			7)
+				sort_forwarding_services_by_remote_port
+				;;
+
+			*)
+				break
+				;;
+		esac
+		break_end
+	done
+}
+
 
 
 
@@ -5890,89 +6615,6 @@ frps_panel() {
 		break_end
 	done
 }
-
-
-frpc_panel() {
-	send_stats "FRP客户端"
-	local app_id="56"
-	local docker_name="frpc"
-	local docker_port=8055
-	while true; do
-		clear
-		check_frp_app
-		check_docker_image_update $docker_name
-		echo -e "FRP客户端 $check_frp $update_status"
-		echo "与服务端对接，对接后可创建内网穿透服务到互联网访问"
-		echo "官网介绍: ${gh_https_url}github.com/fatedier/frp/"
-		echo "视频教学: https://www.bilibili.com/video/BV1yMw6e2EwL?t=173.9"
-		echo "------------------------"
-		if [ -d "/home/frp/" ]; then
-			[ -f /home/frp/frpc.toml ] || cp /home/frp/frp_0.61.0_linux_amd64/frpc.toml /home/frp/frpc.toml
-			list_forwarding_services "/home/frp/frpc.toml"
-		fi
-		echo ""
-		echo "------------------------"
-		echo "1. 安装               2. 更新               3. 卸载"
-		echo "------------------------"
-		echo "4. 添加对外服务       5. 删除对外服务       6. 手动配置服务"
-		echo "------------------------"
-		echo "0. 返回上一级选单"
-		echo "------------------------"
-		read -e -p "输入你的选择: " choice
-		case $choice in
-			1)
-				install jq grep ss
-				install_docker
-				configure_frpc
-
-				add_app_id
-				echo "FRP客户端已经安装完成"
-				;;
-			2)
-				crontab -l | grep -v 'frpc' | crontab - > /dev/null 2>&1
-				tmux kill-session -t frpc >/dev/null 2>&1
-				docker rm -f frpc && docker rmi kjlion/frp:alpine >/dev/null 2>&1
-				[ -f /home/frp/frpc.toml ] || cp /home/frp/frp_0.61.0_linux_amd64/frpc.toml /home/frp/frpc.toml
-				donlond_frp frpc
-
-				add_app_id
-				echo "FRP客户端已经更新完成"
-				;;
-
-			3)
-				crontab -l | grep -v 'frpc' | crontab - > /dev/null 2>&1
-				tmux kill-session -t frpc >/dev/null 2>&1
-				docker rm -f frpc && docker rmi kjlion/frp:alpine
-				rm -rf /home/frp
-				close_port 8055
-
-				sed -i "/\b${app_id}\b/d" /home/docker/appno.txt
-				echo "应用已卸载"
-				;;
-
-			4)
-				add_forwarding_service
-				;;
-
-			5)
-				delete_forwarding_service
-				;;
-
-			6)
-				install nano
-				nano /home/frp/frpc.toml
-				docker restart frpc
-				;;
-
-			*)
-				break
-				;;
-		esac
-		break_end
-	done
-}
-
-
 
 
 yt_menu_pro() {
@@ -10679,6 +11321,10 @@ kpanel_node_paths() {
 	KPANEL_NODE_HOME="/usr/local/lib/kejilion-node"
 	KPANEL_NODE_BINARY="${KPANEL_NODE_HOME}/kejilion-node"
 	KPANEL_NODE_UPDATER="${KPANEL_NODE_HOME}/update.sh"
+	KPANEL_NODE_FILE_SERVICE="kejilion-node-file.service"
+	KPANEL_NODE_SSH_LOGIN_SERVICE="/etc/systemd/system/kejilion-node-ssh-login.service"
+	KPANEL_NODE_SSH_LOGIN_RUNTIME="/run/kejilion-node-ssh"
+	KPANEL_NODE_SSH_LOGIN_EVENT="${KPANEL_NODE_SSH_LOGIN_RUNTIME}/ssh-login.json"
 	KPANEL_NODE_CONFIG_DIR="/etc/kejilion-node"
 	KPANEL_NODE_CONFIG="${KPANEL_NODE_CONFIG_DIR}/node.json"
 	KPANEL_NODE_TERMINAL_CONFIG="${KPANEL_NODE_CONFIG_DIR}/terminal.json"
@@ -10690,7 +11336,7 @@ kpanel_node_preflight() {
 		echo "KPanel 轻量节点安装需要 root 权限。" >&2
 		return 1
 	}
-	for command_name in curl sha256sum mktemp; do
+	for command_name in curl sha256sum mktemp flock; do
 		command -v "$command_name" >/dev/null 2>&1 || {
 			echo "缺少必要命令: ${command_name}" >&2
 			return 1
@@ -10764,10 +11410,102 @@ kpanel_node_ensure_account() {
 	}
 }
 
+kpanel_node_lock_template() {
+	cat <<'KPANEL_NODE_LIFECYCLE'
+# Shared by the installer and its generated updater. Keep the inode outside
+# the removable installation; unlinking a held flock creates two lock owners.
+kpanel_node_release_lock() {
+	[ "${kpanel_legacy_lock_owned:-false}" != true ] || rmdir -- /run/lock/kejilion-node-update.lock 2>/dev/null || true
+}
+kpanel_node_acquire_lock() {
+	local lifecycle_lock=/run/kejilion-node-lifecycle.lock
+	local home=/usr/local/lib/kejilion-node legacy_lock=/run/lock/kejilion-node-update.lock
+	local legacy_marker="${home}/legacy-update.pid" legacy_pid legacy_start process argument script_file
+	kpanel_legacy_lock_owned=false
+	[ ! -L "$lifecycle_lock" ] && { [ ! -e "$lifecycle_lock" ] || [ -f "$lifecycle_lock" ]; } || return 1
+	[ ! -e "$lifecycle_lock" ] || [ "$(stat -c '%u' "$lifecycle_lock")" = 0 ] || return 1
+	# The installer passes the same open-file description to its child updater.
+	# Do not trust an environment flag as proof of lock ownership.
+	if [ /proc/self/fd/8 -ef "$lifecycle_lock" ] && flock -n 8; then
+		return 0
+	fi
+	local previous_umask="$(umask)"
+	umask 077
+	exec 8>>"$lifecycle_lock" || { umask "$previous_umask"; return 1; }
+	umask "$previous_umask"
+	if ! flock -n 8; then
+		echo "another KPanel lightweight node lifecycle operation is running; retry when it finishes" >&2
+		return 1
+	fi
+	chmod 0600 "$lifecycle_lock" || return 1
+	# Bridge the previous flock updater before inspecting its PID marker. Keep
+	# this descriptor open through enrollment, activation and uninstall as well.
+	if [ -d "$home" ]; then
+		[ ! -L "$home" ] && [ ! -L "${home}/update.lock" ] || return 1
+		exec 9>>"${home}/update.lock" || return 1
+		if ! flock -n 9; then
+			echo "another KPanel lightweight node update is running" >&2
+			return 1
+		fi
+	fi
+	if [ -e "$legacy_marker" ] || [ -L "$legacy_marker" ]; then
+		if [ -L "$legacy_marker" ] || [ ! -f "$legacy_marker" ] ||
+			! read -r legacy_pid legacy_start <"$legacy_marker" ||
+			! [[ "$legacy_pid" =~ ^[1-9][0-9]*$ && "$legacy_start" =~ ^[0-9]+$ ]]; then
+			echo "KPanel legacy updater identity is invalid; inspect ${legacy_marker} first" >&2
+			return 1
+		fi
+		if [ "$(awk '{ sub(/^.*\) /, ""); print $20 }' "/proc/${legacy_pid}/stat" 2>/dev/null || true)" = "$legacy_start" ]; then
+			echo "previous KPanel lightweight node updater is still finishing" >&2
+			return 1
+		fi
+	fi
+	if ! mkdir -- "$legacy_lock" 2>/dev/null; then
+		[ ! -L "$legacy_lock" ] && [ -d "$legacy_lock" ] && [ -r /proc/self/stat ] || return 1
+		[ "$(stat -c '%u' "$legacy_lock")" = 0 ] || return 1
+		for process in /proc/[0-9]*; do
+			[ "${process##*/}" != "$BASHPID" ] || continue
+			script_file="$(readlink "${process}/fd/255" 2>/dev/null || true)"
+			if [ "${script_file% (deleted)}" = "${home}/update.sh" ]; then
+				echo "legacy KPanel update lock is still in use" >&2; return 1
+			fi
+			if [ ! -r "${process}/cmdline" ]; then
+				[ ! -d "$process" ] && continue
+				return 1
+			fi
+			while IFS= read -r -d '' argument; do
+				if [ "$argument" = "${home}/update.sh" ]; then
+					echo "legacy KPanel update lock is still in use" >&2; return 1
+				fi
+			done <"${process}/cmdline" || return 1
+		done
+		# Never recursively remove unknown contents or a competing old owner.
+		rmdir -- "$legacy_lock" && mkdir -- "$legacy_lock" || return 1
+		echo "Recovered an inactive KPanel lightweight node update lock."
+	fi
+	kpanel_legacy_lock_owned=true
+	trap kpanel_node_release_lock EXIT
+	trap 'echo "KPanel lightweight node update interrupted; run the command again to retry." >&2; exit 130' INT
+	trap 'exit 143' HUP TERM
+	rm -f -- "$legacy_marker"
+}
+KPANEL_NODE_LIFECYCLE
+}
+
+kpanel_node_lock() {
+	# Only source the fixed template above, never an installed/remote helper.
+	source <(kpanel_node_lock_template)
+	kpanel_node_acquire_lock
+}
+
 kpanel_node_write_updater() {
 	"$KPANEL_NODE_INSTALL_BIN" -d -o root -g root -m 0755 "$KPANEL_NODE_HOME" || return 1
-	cat >"$KPANEL_NODE_UPDATER" <<'KPANEL_NODE_UPDATE'
-#!/bin/bash
+	local updater_temporary
+	updater_temporary="$(mktemp "${KPANEL_NODE_HOME}/.update.sh.XXXXXX")" || return 1
+	printf '#!/bin/bash\n' >"$updater_temporary" || return 1
+	kpanel_node_lock_template >>"$updater_temporary" || return 1
+	cat >>"$updater_temporary" <<'KPANEL_NODE_UPDATE'
+# KPANEL_NODE_RUNTIME_GENERATION=3
 set -euo pipefail
 
 mode="${1:-update}"
@@ -10775,7 +11513,6 @@ case "$mode" in
 	install|update) ;;
 	*) echo "unsupported update mode" >&2; exit 2 ;;
 esac
-
 case "$(uname -m)" in
 	x86_64|amd64) arch="amd64" ;;
 	aarch64|arm64) arch="arm64" ;;
@@ -10785,49 +11522,255 @@ esac
 home_dir="/usr/local/lib/kejilion-node"
 binary_name="kejilion-node-linux-${arch}"
 binary_path="${home_dir}/kejilion-node"
-base_url="https://github.com/kejilion/KPanel/releases/latest/download"
-lock_dir="/run/lock/kejilion-node-update.lock"
+# Resolve releases at the origin: script-delivery proxies can rewrite literal
+# GitHub URLs and hide the redirects that bind the checksum to one release.
+github_host="github.com"
+base_url="https://${github_host}/kejilion/KPanel/releases/latest/download"
+temporary_dir=""
 
-if ! mkdir "$lock_dir" 2>/dev/null; then
-	echo "another KPanel lightweight node update is running" >&2
+kpanel_node_acquire_lock || exit 1
+# A single credential-free observation; lifecycle lock serializes every writer.
+update_checked_at="$(date +%s)"
+update_result=running
+update_error=""
+optional_degraded=false
+write_update_status() {
+	local result="$1" error="$2" finished="$3" directory=/etc/kejilion-node
+	local status_file="$directory/update-status.json" gid status_temporary
+	gid="$(id -g kejilion-node)" || return 1
+	[ -d "$directory" ] && [ ! -L "$directory" ] && [ "$(stat -c '%u:%g:%a' "$directory")" = "0:$gid:750" ] || return 1
+	if [ -e "$status_file" ] || [ -L "$status_file" ]; then
+		[ -f "$status_file" ] && [ ! -L "$status_file" ] && [ "$(stat -c '%u:%g:%a:%h' "$status_file")" = "0:$gid:640:1" ] || return 1
+	fi
+	status_temporary="$directory/.update-status.pending"
+	# One fixed staging file also bounds residue after SIGKILL. Never follow it.
+	if [ -e "$status_temporary" ] || [ -L "$status_temporary" ]; then
+		[ -f "$status_temporary" ] && [ ! -L "$status_temporary" ] && [ "$(stat -c '%u:%h' "$status_temporary")" = "0:1" ] || return 1
+		rm -f -- "$status_temporary" || return 1
+	fi
+	(umask 077; set -C; : >"$status_temporary") || return 1
+	if ! printf '{"state":"%s","checkedAt":%s,"finishedAt":%s,"errorCode":"%s"}\n' "$result" "$update_checked_at" "$finished" "$error" >"$status_temporary" ||
+		! chown "0:$gid" "$status_temporary" || ! chmod 0640 "$status_temporary" || ! mv -f -- "$status_temporary" "$status_file"; then
+		rm -f -- "$status_temporary"
+		return 1
+	fi
+}
+cleanup() {
+	local exit_code=$? finished
+	trap - EXIT
+	if [ "$update_result" = running ]; then
+		update_result=failed
+		[ -n "$update_error" ] || update_error=internal
+	fi
+	if [ "$exit_code" = 130 ] || [ "$exit_code" = 143 ]; then update_result=interrupted; update_error=interrupted; fi
+	if [ "$exit_code" = 0 ] && [ "$optional_degraded" = true ]; then update_result=degraded; update_error=optional_service; fi
+	finished="$(date +%s)"
+	write_update_status "$update_result" "$update_error" "$finished" || echo "KPanel update status could not be recorded." >&2
+	[ -z "$temporary_dir" ] || rm -rf -- "$temporary_dir"
+	kpanel_node_release_lock
+	exit "$exit_code"
+}
+trap cleanup EXIT
+trap 'echo "KPanel lightweight node update interrupted; run the command again to retry." >&2; exit 130' INT
+trap 'exit 143' HUP TERM
+write_update_status running '' 0 || echo "KPanel update status could not be recorded." >&2
+
+# Old release assets only migrate in kejilion-node-update.*. The new staging
+# namespace prevents their `version` probe from restoring an obsolete updater.
+temporary_dir="$(mktemp -d /tmp/kejilion-node-release.XXXXXX)"
+
+curl_progress=(--silent --show-error)
+[ ! -t 2 ] || curl_progress=(--progress-bar --show-error)
+update_error=release_check
+echo "Checking KPanel lightweight node release..."
+if ! curl --proto '=https' --proto-redir '=https' --tlsv1.2 --fail --location "${curl_progress[@]}" \
+	--connect-timeout 15 --max-time 60 --retry 3 --retry-delay 5 --retry-max-time 240 \
+	--max-filesize 65536 --dump-header "${temporary_dir}/headers" \
+	-o "${temporary_dir}/SHA256SUMS" "${base_url}/SHA256SUMS"; then
+	echo "KPanel release check failed; check access to github.com and retry." >&2
 	exit 1
 fi
-temporary_dir="$(mktemp -d /tmp/kejilion-node-update.XXXXXX)"
-cleanup() {
-	rm -rf -- "$temporary_dir"
-	rmdir "$lock_dir" 2>/dev/null || true
-}
-trap cleanup EXIT HUP INT TERM
-
-curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
-	--connect-timeout 15 --max-time 180 \
-	-o "${temporary_dir}/${binary_name}" "${base_url}/${binary_name}"
-curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
-	--connect-timeout 15 --max-time 60 \
-	-o "${temporary_dir}/SHA256SUMS" "${base_url}/SHA256SUMS"
-
+update_error=manifest
 expected="$(awk -v name="$binary_name" '$2 == name { print $1 }' "${temporary_dir}/SHA256SUMS")"
 printf '%s' "$expected" | grep -Eq '^[0-9a-f]{64}$' || {
 	echo "release checksum is unavailable" >&2
 	exit 1
 }
+# The first redirect binds the manifest to a release; the following CDN redirect
+# must never be used as a base URL or mixed with a later value of latest.
+release_url="$(awk 'tolower($1) == "location:" { sub(/\r$/, "", $2); print $2 }' "${temporary_dir}/headers" |
+	grep -E '^https://github[.]com/kejilion/KPanel/releases/download/v[0-9]+\.[0-9]+\.[0-9]+/SHA256SUMS$' | tail -n 1 || true)"
+[ -n "$release_url" ] || { echo "release manifest redirect is invalid" >&2; exit 1; }
+release_base="${release_url%/SHA256SUMS}"
+
+file_service="kejilion-node-file.service"
+file_service_path="/etc/systemd/system/${file_service}"
+file_service_unit_changed=false
+
+ensure_file_service_unit() {
+	if [ -e "$file_service_path" ] || [ -L "$file_service_path" ]; then
+		[ -f "$file_service_path" ] && [ ! -L "$file_service_path" ] || return 1
+		[ "$(stat -c '%u' "$file_service_path")" = "0" ] || return 1
+		[ $(( 8#$(stat -c '%a' "$file_service_path") & 8#022 )) -eq 0 ] || return 1
+	fi
+	local template="${temporary_dir}/file.service" legacy_template="${temporary_dir}/file.legacy.service" unit_temporary
+	cat >"$template" <<'KPANEL_NODE_FILE_SERVICE'
+[Unit]
+Description=KPanel Lightweight Node File Manager
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/kejilion-node/node.json
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/
+ExecStart=/usr/local/lib/kejilion-node/kejilion-node file-broker --config /etc/kejilion-node/node.json --terminal-config /etc/kejilion-node/terminal.json
+Restart=on-failure
+RestartSec=15s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+KPANEL_NODE_FILE_SERVICE
+	if [ -f "$file_service_path" ]; then
+		cmp -s "$file_service_path" "$template" && return 0
+		# Repair only the exact installer-owned legacy template. Preserve custom
+		# units and drop-ins; never erase an administrator's service policy.
+		# The original managed unit also required terminal.json before file-broker
+		# could start. Compare that complete historical variant, not arbitrary edits.
+		sed -e '/^ConditionPathExists=/aConditionPathExists=/etc/kejilion-node/terminal.json' \
+			-e 's/^RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6$/RestrictAddressFamilies=AF_UNIX/' "$template" >"$legacy_template"
+		if ! cmp -s "$file_service_path" "$legacy_template" && ! sed 's/^RestrictAddressFamilies=AF_UNIX$/RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6/' "$file_service_path" | cmp -s - "$template"; then
+			echo "KPanel file service has custom settings; retaining the existing unit" >&2
+			return 0
+		fi
+	fi
+	unit_temporary="$(mktemp "${file_service_path}.XXXXXX")" || return 1
+	if ! install -o root -g root -m 0644 "$template" "$unit_temporary" || ! mv -f -- "$unit_temporary" "$file_service_path"; then
+		rm -f -- "$unit_temporary"
+		return 1
+	fi
+	file_service_unit_changed=true
+	systemctl daemon-reload
+}
+
+service_running_current() {
+	local service="$1" pid
+	systemctl is-active --quiet "$service" || return 1
+	pid="$(systemctl show "$service" --property=MainPID --value)" || return 1
+	[[ "$pid" =~ ^[1-9][0-9]*$ ]] && [ "/proc/${pid}/exe" -ef "$binary_path" ]
+}
+wait_for_service() {
+	local service="$1" attempt
+	for attempt in {1..20}; do
+		if service_running_current "$service"; then
+			sleep 0.25
+			service_running_current "$service" && return 0
+		fi
+		sleep 0.25
+	done
+	return 1
+}
+
+repair_config_access() {
+	local directory="/etc/kejilion-node" config="/etc/kejilion-node/node.json" gid owner group mode
+	[ -e "$config" ] || return 0
+	[ -d "$directory" ] && [ ! -L "$directory" ] && [ -f "$config" ] && [ ! -L "$config" ] || return 1
+	gid="$(id -g kejilion-node)" || return 1
+	[ "$(id -gn kejilion-node)" = "kejilion-node" ] || return 1
+	[ "$(stat -c '%u:%g:%a' "$directory")" = "0:${gid}:750" ] || return 1
+	read -r owner group mode < <(stat -c '%u %g %a' "$config")
+	[ "$owner" = "0" ] && { [ "$group" = "0" ] || [ "$group" = "$gid" ]; } || return 1
+	case "$mode" in 600|640) ;; *) return 1 ;; esac
+	# Restore only the installer-owned telemetry credential, never terminal keys
+	# or a caller-supplied path. Older file brokers accidentally made it 0600.
+	chown "root:${gid}" "$config" && chmod 0640 "$config"
+}
+restart_required=false
+if [ "$mode" = "update" ] && systemctl cat kejilion-node.service >/dev/null 2>&1; then
+	restart_required=true
+fi
+
+restart_optional_services() {
+	if ! ensure_file_service_unit; then
+		optional_degraded=true
+		echo "KPanel lightweight node updated; file service unit is unavailable" >&2
+	fi
+	systemctl enable "$file_service" >/dev/null 2>&1 || optional_degraded=true
+	# Telemetry is the core update contract. Optional brokers can be unavailable
+	# on older centers; their failure must not roll back a healthy reporting node.
+	local service
+	for service in kejilion-node-terminal.service kejilion-node-ssh-login.service kejilion-node-file.service; do
+		if systemctl cat "$service" >/dev/null 2>&1; then
+			if service_running_current "$service" && { [ "$service" != "$file_service" ] || [ "$file_service_unit_changed" != true ]; }; then continue; fi
+			if ! systemctl restart "$service" || ! wait_for_service "$service"; then
+				optional_degraded=true
+				echo "KPanel lightweight node updated; optional service unavailable: ${service}" >&2
+			fi
+		fi
+	done
+}
+restart_services() {
+	update_error=config
+	repair_config_access || return 1
+	update_error=restart
+	systemctl restart kejilion-node.service || return 1
+	wait_for_service kejilion-node.service || return 1
+	restart_optional_services
+}
+
+if [ -f "$binary_path" ] && [ "$(sha256sum "$binary_path" | awk '{print $1}')" = "$expected" ]; then
+	if [ "$restart_required" = "true" ] && ! service_running_current kejilion-node.service; then
+		restart_services || { echo "installed node is current but restart failed" >&2; exit 1; }
+	elif [ "$restart_required" = "true" ]; then
+		update_error=config
+		repair_config_access || { echo "node configuration access is invalid" >&2; exit 1; }
+		restart_optional_services
+	fi
+	update_result=current; update_error=""
+	echo "KPanel lightweight node is already up to date."
+	exit 0
+fi
+
+update_error=download
+echo "Downloading KPanel lightweight node..."
+if ! curl --proto '=https' --proto-redir '=https' --tlsv1.2 --fail --location "${curl_progress[@]}" \
+	--connect-timeout 15 --max-time 180 --retry 3 --retry-delay 5 --retry-max-time 600 \
+	--max-filesize 134217728 \
+	-o "${temporary_dir}/${binary_name}" "${release_base}/${binary_name}"; then
+	echo "KPanel node download failed; check access to GitHub release downloads and retry." >&2
+	exit 1
+fi
+update_error=checksum
 actual="$(sha256sum "${temporary_dir}/${binary_name}" | awk '{print $1}')"
 [ "$actual" = "$expected" ] || {
 	echo "release checksum verification failed" >&2
 	exit 1
 }
 chmod 0755 "${temporary_dir}/${binary_name}"
+update_error=protocol
 version_output="$("${temporary_dir}/${binary_name}" version)"
 printf '%s\n' "$version_output" | grep -Eq '^[^[:space:]]+ light-v1$' || {
 	echo "release binary protocol is invalid" >&2
 	exit 1
 }
 
-if [ -f "$binary_path" ] && [ "$(sha256sum "$binary_path" | awk '{print $1}')" = "$actual" ]; then
-	echo "KPanel lightweight node is already up to date."
-	exit 0
-fi
-
+update_error=internal
 install -o root -g root -m 0755 "${temporary_dir}/${binary_name}" "${binary_path}.new"
 had_previous=false
 if [ -f "$binary_path" ]; then
@@ -10836,29 +11779,29 @@ if [ -f "$binary_path" ]; then
 fi
 mv -f -- "${binary_path}.new" "$binary_path"
 
-if [ "$mode" = "update" ] && systemctl cat kejilion-node.service >/dev/null 2>&1; then
-	has_terminal_broker=false
-	if systemctl cat kejilion-node-terminal.service >/dev/null 2>&1 && [ -f /etc/kejilion-node/terminal.json ]; then
-		has_terminal_broker=true
-	fi
-	if { [ "$has_terminal_broker" != "true" ] || systemctl restart kejilion-node-terminal.service; } &&
-		systemctl restart kejilion-node.service && systemctl is-active --quiet kejilion-node.service &&
-		{ [ "$has_terminal_broker" != "true" ] || systemctl is-active --quiet kejilion-node-terminal.service; }; then
-		:
-	else
-		if [ "$had_previous" = "true" ] && [ -f "${binary_path}.previous" ]; then
-			mv -f -- "${binary_path}.previous" "$binary_path"
-			[ "$has_terminal_broker" != "true" ] || systemctl restart kejilion-node-terminal.service || true
-			systemctl restart kejilion-node.service || true
+if [ "$restart_required" = "true" ] && ! restart_services; then
+	if [ "$had_previous" = "true" ] && [ -f "${binary_path}.previous" ]; then
+		mv -f -- "${binary_path}.previous" "$binary_path"
+		if ! restart_services; then
+			update_error=rollback
+			echo "KPanel lightweight node rollback restored the binary but service recovery failed." >&2
+			exit 1
 		fi
+		update_result=rolled_back; update_error=restart
 		echo "KPanel lightweight node update failed and was rolled back." >&2
-		exit 1
+	else
+		echo "KPanel lightweight node update failed; no previous binary is available." >&2
 	fi
+	exit 1
 fi
 rm -f -- "${binary_path}.previous"
-echo "KPanel lightweight node update completed."
+update_result=updated; update_error=""
+echo "KPanel lightweight node update completed: ${version_output}"
 KPANEL_NODE_UPDATE
-	chmod 0755 "$KPANEL_NODE_UPDATER"
+	if ! chmod 0755 "$updater_temporary" || ! mv -f -- "$updater_temporary" "$KPANEL_NODE_UPDATER"; then
+		rm -f -- "$updater_temporary"
+		return 1
+	fi
 }
 
 kpanel_node_write_units() {
@@ -10938,6 +11881,81 @@ UMask=0077
 WantedBy=multi-user.target
 KPANEL_NODE_TERMINAL_SERVICE
 
+	cat >"$KPANEL_NODE_SSH_LOGIN_SERVICE" <<'KPANEL_NODE_SSH_LOGIN_SERVICE'
+[Unit]
+Description=KPanel SSH Login Event Collector
+After=systemd-journald.service
+Wants=systemd-journald.service
+
+[Service]
+Type=simple
+User=root
+Group=kejilion-node
+ExecStart=/usr/local/lib/kejilion-node/kejilion-node ssh-login-broker --output /run/kejilion-node-ssh/ssh-login.json
+RuntimeDirectory=kejilion-node-ssh
+RuntimeDirectoryMode=0750
+Restart=always
+RestartSec=15s
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_DAC_READ_SEARCH
+ReadWritePaths=/run/kejilion-node-ssh
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target
+KPANEL_NODE_SSH_LOGIN_SERVICE
+
+	cat >/etc/systemd/system/kejilion-node-file.service <<'KPANEL_NODE_FILE_SERVICE'
+[Unit]
+Description=KPanel Lightweight Node File Manager
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/kejilion-node/node.json
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/
+ExecStart=/usr/local/lib/kejilion-node/kejilion-node file-broker --config /etc/kejilion-node/node.json --terminal-config /etc/kejilion-node/terminal.json
+Restart=on-failure
+RestartSec=15s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+KPANEL_NODE_FILE_SERVICE
+
 	cat >/etc/systemd/system/kejilion-node-update.service <<'KPANEL_NODE_UPDATE_SERVICE'
 [Unit]
 Description=Update KPanel Lightweight Monitoring Node
@@ -10959,8 +11977,8 @@ Description=Check KPanel Lightweight Monitoring Node Updates
 
 [Timer]
 OnBootSec=15min
-OnUnitActiveSec=24h
-RandomizedDelaySec=6h
+OnUnitInactiveSec=1h
+RandomizedDelaySec=15min
 Persistent=true
 
 [Install]
@@ -10968,6 +11986,8 @@ WantedBy=timers.target
 KPANEL_NODE_UPDATE_TIMER
 	chmod 0644 /etc/systemd/system/kejilion-node.service \
 		/etc/systemd/system/kejilion-node-terminal.service \
+		"$KPANEL_NODE_SSH_LOGIN_SERVICE" \
+		/etc/systemd/system/kejilion-node-file.service \
 		/etc/systemd/system/kejilion-node-update.service \
 		/etc/systemd/system/kejilion-node-update.timer
 }
@@ -10976,33 +11996,61 @@ kpanel_node_cleanup_failed_join() {
 	if [ -x "$KPANEL_NODE_SYSTEMCTL" ]; then
 		"$KPANEL_NODE_SYSTEMCTL" stop kejilion-node.service >/dev/null 2>&1 || true
 		"$KPANEL_NODE_SYSTEMCTL" stop kejilion-node-terminal.service >/dev/null 2>&1 || true
+		"$KPANEL_NODE_SYSTEMCTL" stop kejilion-node-ssh-login.service >/dev/null 2>&1 || true
+		"$KPANEL_NODE_SYSTEMCTL" stop kejilion-node-file.service >/dev/null 2>&1 || true
 		"$KPANEL_NODE_SYSTEMCTL" stop kejilion-node-update.timer >/dev/null 2>&1 || true
 		"$KPANEL_NODE_SYSTEMCTL" disable kejilion-node.service >/dev/null 2>&1 || true
 		"$KPANEL_NODE_SYSTEMCTL" disable kejilion-node-terminal.service >/dev/null 2>&1 || true
+		"$KPANEL_NODE_SYSTEMCTL" disable kejilion-node-ssh-login.service >/dev/null 2>&1 || true
+		"$KPANEL_NODE_SYSTEMCTL" disable kejilion-node-file.service >/dev/null 2>&1 || true
 		"$KPANEL_NODE_SYSTEMCTL" disable kejilion-node-update.timer >/dev/null 2>&1 || true
 	fi
 	rm -f -- /etc/systemd/system/kejilion-node.service \
 		/etc/systemd/system/kejilion-node-terminal.service \
+		"$KPANEL_NODE_SSH_LOGIN_SERVICE" \
+		/etc/systemd/system/kejilion-node-file.service \
 		/etc/systemd/system/kejilion-node-update.service \
 		/etc/systemd/system/kejilion-node-update.timer
 	rm -rf -- "$KPANEL_NODE_HOME" "$KPANEL_NODE_CONFIG_DIR"
+	rmdir -- "$KPANEL_NODE_SSH_LOGIN_RUNTIME" 2>/dev/null || true
 	[ ! -x "$KPANEL_NODE_SYSTEMCTL" ] || "$KPANEL_NODE_SYSTEMCTL" daemon-reload >/dev/null 2>&1 || true
 }
 
 kpanel_node_activate() {
-	"$KPANEL_NODE_SYSTEMCTL" daemon-reload &&
-		"$KPANEL_NODE_SYSTEMCTL" enable kejilion-node-terminal.service &&
-		"$KPANEL_NODE_SYSTEMCTL" enable kejilion-node.service &&
-		"$KPANEL_NODE_SYSTEMCTL" enable kejilion-node-update.timer &&
-		{ "$KPANEL_NODE_SYSTEMCTL" start kejilion-node-terminal.service || echo "KPanel 轻量节点终端 broker 启动失败；遥测服务仍将继续。" >&2; } &&
-		"$KPANEL_NODE_SYSTEMCTL" start kejilion-node.service &&
-		"$KPANEL_NODE_SYSTEMCTL" start kejilion-node-update.timer &&
-		{ "$KPANEL_NODE_SYSTEMCTL" is-active kejilion-node-terminal.service >/dev/null || echo "KPanel 轻量节点终端 broker 当前不可用；遥测服务仍在运行。" >&2; } &&
-		"$KPANEL_NODE_SYSTEMCTL" is-active kejilion-node.service >/dev/null
+	"$KPANEL_NODE_SYSTEMCTL" daemon-reload || return 1
+	if [ -f "$KPANEL_NODE_TERMINAL_CONFIG" ]; then
+		"$KPANEL_NODE_SYSTEMCTL" enable kejilion-node-terminal.service || return 1
+	else
+		"$KPANEL_NODE_SYSTEMCTL" disable kejilion-node-terminal.service >/dev/null 2>&1 || true
+		"$KPANEL_NODE_SYSTEMCTL" stop kejilion-node-terminal.service >/dev/null 2>&1 || true
+	fi
+	"$KPANEL_NODE_SYSTEMCTL" enable kejilion-node.service || return 1
+	"$KPANEL_NODE_SYSTEMCTL" enable kejilion-node-ssh-login.service || return 1
+	"$KPANEL_NODE_SYSTEMCTL" enable kejilion-node-update.timer || return 1
+	if [ -f "$KPANEL_NODE_TERMINAL_CONFIG" ]; then
+		if ! "$KPANEL_NODE_SYSTEMCTL" start kejilion-node-terminal.service; then
+			echo "KPanel 轻量节点终端 broker 启动失败；文件管理和遥测服务仍将继续。" >&2
+		fi
+	fi
+	if ! "$KPANEL_NODE_SYSTEMCTL" start kejilion-node-ssh-login.service; then
+		echo "KPanel SSH 登录采集服务启动失败；普通遥测仍将继续。" >&2
+	fi
+	"$KPANEL_NODE_SYSTEMCTL" start kejilion-node.service || return 1
+	"$KPANEL_NODE_SYSTEMCTL" start kejilion-node-update.timer || return 1
+	if [ -f "$KPANEL_NODE_TERMINAL_CONFIG" ] && ! "$KPANEL_NODE_SYSTEMCTL" is-active kejilion-node-terminal.service >/dev/null; then
+		echo "KPanel 轻量节点终端 broker 当前不可用；文件管理和遥测服务仍在运行。" >&2
+	fi
+	"$KPANEL_NODE_SYSTEMCTL" enable "$KPANEL_NODE_FILE_SERVICE" || return 1
+	{ "$KPANEL_NODE_SYSTEMCTL" start "$KPANEL_NODE_FILE_SERVICE" >/dev/null 2>&1 || true; }
+	if ! "$KPANEL_NODE_SYSTEMCTL" is-active kejilion-node-ssh-login.service >/dev/null; then
+		echo "KPanel SSH 登录采集服务当前不可用；普通遥测仍在运行。" >&2
+	fi
+	"$KPANEL_NODE_SYSTEMCTL" is-active kejilion-node.service >/dev/null
 }
 
 kpanel_node_join() {
-	local token="${1:-}" node_name resume_enrollment=false
+	(
+	local token="${1:-}" node_name resume_enrollment=false update_mode=install
 	kpanel_node_paths
 	kpanel_node_preflight || return 1
 	case "$token" in
@@ -11013,9 +12061,11 @@ kpanel_node_join() {
 		echo "轻量节点接入授权无效。" >&2
 		return 2
 	}
+	kpanel_node_lock || return 1
 	if [ -e "$KPANEL_NODE_CONFIG" ]; then
 		if [ -f "$KPANEL_NODE_CONFIG" ] && [ ! -L "$KPANEL_NODE_CONFIG" ] && [ -x "$KPANEL_NODE_BINARY" ]; then
 			resume_enrollment=true
+			update_mode=update
 			echo "检测到已完成的节点授权，继续启用本机服务。"
 		else
 			echo "本机存在不完整的 KPanel 节点配置；请先执行 k kpanel node uninstall。" >&2
@@ -11024,13 +12074,15 @@ kpanel_node_join() {
 	fi
 	kpanel_node_ensure_account || return 1
 	"$KPANEL_NODE_INSTALL_BIN" -d -o root -g kejilion-node -m 0750 "$KPANEL_NODE_CONFIG_DIR" || return 1
-	if ! kpanel_node_write_updater || ! "$KPANEL_NODE_UPDATER" install; then
-		[ "$resume_enrollment" = "true" ] || kpanel_node_cleanup_failed_join
+	if ! kpanel_node_write_updater || ! "$KPANEL_NODE_UPDATER" "$update_mode"; then
+		# Preserve updater locks and migration identity; another updater may own
+		# them. The transactional updater already preserves the previous binary.
+		echo "KPanel 轻量节点安装未完成；请根据上面的提示处理后，再次执行接入命令。" >&2
 		return 1
 	fi
 	if [ "$resume_enrollment" != "true" ]; then
 		node_name="$(hostname 2>/dev/null | LC_ALL=C tr -cd '[:alnum:]_. -' | cut -c1-80)"
-		if ! "$KPANEL_NODE_BINARY" enroll --token "$token" --name "$node_name" --config "$KPANEL_NODE_CONFIG"; then
+		if ! "$KPANEL_NODE_BINARY" enroll --token "$token" --name "$node_name" --config "$KPANEL_NODE_CONFIG" --terminal-config "$KPANEL_NODE_TERMINAL_CONFIG"; then
 			kpanel_node_cleanup_failed_join
 			return 1
 		fi
@@ -11057,6 +12109,7 @@ kpanel_node_join() {
 		return 1
 	fi
 	echo "KPanel 轻量节点已接入，后续将自动更新。"
+	)
 }
 
 kpanel_node_status() {
@@ -11067,41 +12120,61 @@ kpanel_node_status() {
 	}
 	"$KPANEL_NODE_BINARY" version
 	"$KPANEL_NODE_SYSTEMCTL" --no-pager --full status kejilion-node.service
+	main_status=$?
+	"$KPANEL_NODE_SYSTEMCTL" --no-pager --full status kejilion-node-update.timer kejilion-node-terminal.service kejilion-node-file.service kejilion-node-ssh-login.service || true
+	local health_output
+	# Old release binaries do not support this optional read-only summary yet.
+	if health_output="$("$KPANEL_NODE_BINARY" health 2>/dev/null)"; then printf '%s\n' "$health_output"; fi
+	return "$main_status"
 }
 
 kpanel_node_update() {
+	(
 	kpanel_node_paths
 	kpanel_node_preflight || return 1
+	kpanel_node_lock || return 1
 	[ -x "$KPANEL_NODE_UPDATER" ] || {
 		echo "KPanel 轻量节点未安装。" >&2
 		return 1
 	}
+	kpanel_node_write_updater || return 1
 	"$KPANEL_NODE_UPDATER" update || return 1
 	kpanel_node_write_units || return 1
-	kpanel_node_activate
+	kpanel_node_activate || return 1
+	)
 }
 
 kpanel_node_uninstall() {
+	(
 	kpanel_node_paths
 	[ "$(id -u)" = "0" ] || {
 		echo "卸载 KPanel 轻量节点需要 root 权限。" >&2
 		return 1
 	}
+	kpanel_node_lock || return 1
 	if [ -x "$KPANEL_NODE_SYSTEMCTL" ]; then
 		"$KPANEL_NODE_SYSTEMCTL" stop kejilion-node.service >/dev/null 2>&1 || true
 		"$KPANEL_NODE_SYSTEMCTL" stop kejilion-node-terminal.service >/dev/null 2>&1 || true
+		"$KPANEL_NODE_SYSTEMCTL" stop kejilion-node-ssh-login.service >/dev/null 2>&1 || true
+		"$KPANEL_NODE_SYSTEMCTL" stop kejilion-node-file.service >/dev/null 2>&1 || true
 		"$KPANEL_NODE_SYSTEMCTL" stop kejilion-node-update.timer >/dev/null 2>&1 || true
 		"$KPANEL_NODE_SYSTEMCTL" disable kejilion-node.service >/dev/null 2>&1 || true
 		"$KPANEL_NODE_SYSTEMCTL" disable kejilion-node-terminal.service >/dev/null 2>&1 || true
+		"$KPANEL_NODE_SYSTEMCTL" disable kejilion-node-ssh-login.service >/dev/null 2>&1 || true
+		"$KPANEL_NODE_SYSTEMCTL" disable kejilion-node-file.service >/dev/null 2>&1 || true
 		"$KPANEL_NODE_SYSTEMCTL" disable kejilion-node-update.timer >/dev/null 2>&1 || true
 	fi
 	rm -f -- /etc/systemd/system/kejilion-node.service \
 		/etc/systemd/system/kejilion-node-terminal.service \
+		"$KPANEL_NODE_SSH_LOGIN_SERVICE" \
+		/etc/systemd/system/kejilion-node-file.service \
 		/etc/systemd/system/kejilion-node-update.service \
 		/etc/systemd/system/kejilion-node-update.timer
 	rm -rf -- "$KPANEL_NODE_HOME" "$KPANEL_NODE_CONFIG_DIR"
+	rmdir -- "$KPANEL_NODE_SSH_LOGIN_RUNTIME" 2>/dev/null || true
 	[ ! -x "$KPANEL_NODE_SYSTEMCTL" ] || "$KPANEL_NODE_SYSTEMCTL" daemon-reload >/dev/null 2>&1 || true
 	echo "KPanel 轻量节点已从本机卸载；中心端的离线记录需在集群页面删除。"
+	)
 }
 
 kpanel_node_dispatch() {
@@ -30604,6 +31677,10 @@ else
 			if [ "$1" = "env" ] || [ "$1" = "environment" ] || [ "$1" = "环境" ]; then
 				shift
 				kpanel_ldnmp_dispatch "$@"
+			elif [ "$1" = "certificate-replace" ]; then
+				shift
+				kpanel_web_replace_certificate "$@"
+				exit $?
 			elif [ "$1" = "cache" ]; then
 				web_cache
 			elif [ "$1" = "del" ] || [ "$1" = "delete" ] || [ "$1" = "删除" ]; then
