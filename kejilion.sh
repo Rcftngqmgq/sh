@@ -17,6 +17,69 @@ permission_granted="false"
 ENABLE_STATS="false"
 KPANEL_WEB_CERTIFICATE_PROTOCOL_VERSION="1"
 KPANEL_WEB_CERTIFICATE_REPLACE_PROTOCOL_VERSION="1"
+KPANEL_APP_CONCURRENCY_PROTOCOL_VERSION="1"
+unset KJ_APP_LOCKS_HELD
+
+# Locks live outside PrivateTmp and app data. Only the paired KPanel worker
+# enables this protocol; old workers keep their existing exclusive admission.
+kpanel_app_lock_held() {
+	case ":${KJ_APP_LOCKS_HELD:-}:" in *":$1:"*) return 0 ;; esac
+	return 1
+}
+
+kpanel_app_with_lock() {
+	local resource="$1"
+	shift
+	case "$resource" in system|catalog|markers) ;; *) exit 1 ;; esac
+	if kpanel_app_lock_held "$resource"; then "$@"; return $?; fi
+	local lock_dir="/run/lock/kejilion-app"
+	local lock_fd result
+	command -v flock >/dev/null 2>&1 || { echo "错误: 应用并行交互需要 flock" >&2; exit 1; }
+	[ "$(id -u)" = "0" ] || exit 1
+	[ ! -L "$lock_dir" ] || exit 1
+	(umask 077; mkdir -p "$lock_dir") || exit 1
+	[ ! -L "$lock_dir" ] && [ -d "$lock_dir" ] && [ "$(stat -c '%u:%a' "$lock_dir")" = "0:700" ] || exit 1
+	[ ! -L "$lock_dir/$resource.lock" ] || exit 1
+	(umask 077; touch "$lock_dir/$resource.lock") || exit 1
+	[ -f "$lock_dir/$resource.lock" ] || exit 1
+	exec {lock_fd}>>"$lock_dir/$resource.lock" || exit 1
+	if ! flock -w 300 "$lock_fd"; then
+		echo "共享系统资源正忙，等待超过 300 秒，请稍后重试。" >&2
+		exec {lock_fd}>&-
+		exit 1
+	fi
+	local KJ_APP_LOCKS_HELD="${KJ_APP_LOCKS_HELD:-}:$resource"
+	export -n KJ_APP_LOCKS_HELD
+	if "$@"; then result=0; else result=$?; fi
+	flock -u "$lock_fd" || exit 1
+	exec {lock_fd}>&-
+	return "$result"
+}
+
+kpanel_app_update_marker() (
+	local action="$1" marker="/home/docker/appno.txt" temporary status
+	[[ "${app_id:-}" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || return 1
+	mkdir -p /home/docker || return 1
+	[ ! -L "$marker" ] || return 1
+	[ ! -e "$marker" ] || [ -f "$marker" ] || return 1
+	temporary=$(mktemp /home/docker/.appno.XXXXXX) || return 1
+	trap 'rm -f -- "$temporary"' EXIT
+	if [ -f "$marker" ]; then
+		if grep -vxF -- "$app_id" "$marker" > "$temporary"; then status=0; else status=$?; fi
+		[ "$status" -le 1 ] || return "$status"
+	fi
+	case "$action" in add) printf '%s\n' "$app_id" >> "$temporary" || return 1 ;; remove) ;; *) return 1 ;; esac
+	chmod 600 "$temporary" || return 1
+	mv -f -- "$temporary" "$marker"
+)
+
+remove_app_id() {
+	if [ "${KJ_APP_CONCURRENCY:-}" = "1" ]; then
+		kpanel_app_with_lock markers kpanel_app_update_marker remove
+	else
+		sed -i "/\\b${app_id}\\b/d" /home/docker/appno.txt
+	fi
+}
 
 if [ "${1:-}" = "kpanel" ] && [ "${2:-}" = "node" ]; then
 	KJ_LIGHT_NODE_PROTOCOL=1
@@ -206,6 +269,9 @@ ipv6_address=$(curl -s --max-time 1 https://v6.ipinfo.io/ip && echo)
 
 
 install() {
+	if [ "${KJ_APP_CONCURRENCY:-}" = "1" ] && ! kpanel_app_lock_held system; then
+		kpanel_app_with_lock system install "$@"; return $?
+	fi
 	if [ $# -eq 0 ]; then
 		echo "未提供软件包参数!"
 		return 1
@@ -282,6 +348,9 @@ install_dependency() {
 }
 
 remove() {
+	if [ "${KJ_APP_CONCURRENCY:-}" = "1" ] && ! kpanel_app_lock_held system; then
+		kpanel_app_with_lock system remove "$@"; return $?
+	fi
 	if [ $# -eq 0 ]; then
 		echo "未提供软件包参数!"
 		return 1
@@ -485,6 +554,9 @@ install_add_docker_cn
 
 
 install_add_docker() {
+	if [ "${KJ_APP_CONCURRENCY:-}" = "1" ] && ! kpanel_app_lock_held system; then
+		kpanel_app_with_lock system install_add_docker "$@"; return $?
+	fi
 	echo -e "${gl_kjlan}正在安装docker环境...${gl_bai}"
 	if command -v apt &>/dev/null || command -v yum &>/dev/null || command -v dnf &>/dev/null; then
 		linuxmirrors_install_docker
@@ -498,6 +570,9 @@ install_add_docker() {
 
 
 install_docker() {
+	if [ "${KJ_APP_CONCURRENCY:-}" = "1" ] && ! kpanel_app_lock_held system; then
+		kpanel_app_with_lock system install_docker "$@"; return $?
+	fi
 	if ! command -v docker &>/dev/null; then
 		install_add_docker
 	fi
@@ -620,7 +695,7 @@ while true; do
 			send_stats "允许容器端口访问"
 			read -e -p "请输入容器名: " docker_name
 			ip_address
-			clear_container_rules "$docker_name" "$ipv4_address"
+			clear_container_rules "$docker_name" "$ipv4_address" || return 1
 			local docker_port=$(docker port $docker_name | awk -F'[:]' '/->/ {print $NF}' | uniq)
 			check_docker_app_ip
 			break_end
@@ -630,7 +705,7 @@ while true; do
 			send_stats "阻止容器端口访问"
 			read -e -p "请输入容器名: " docker_name
 			ip_address
-			block_container_port "$docker_name" "$ipv4_address"
+			block_container_port "$docker_name" "$ipv4_address" || return 1
 			local docker_port=$(docker port $docker_name | awk -F'[:]' '/->/ {print $NF}' | uniq)
 			check_docker_app_ip
 			break_end
@@ -719,6 +794,9 @@ check_crontab_installed() {
 
 
 install_crontab() {
+	if [ "${KJ_APP_CONCURRENCY:-}" = "1" ] && ! kpanel_app_lock_held system; then
+		kpanel_app_with_lock system install_crontab "$@"; return $?
+	fi
 	local package_manager
 
 	if [ -f /etc/os-release ]; then
@@ -856,9 +934,16 @@ docker_ipv6_off() {
 
 
 save_iptables_rules() {
+	if [ "${KJ_APP_CONCURRENCY:-}" = "1" ] && ! kpanel_app_lock_held system; then
+		kpanel_app_with_lock system save_iptables_rules "$@"; return $?
+	fi
 	mkdir -p /etc/iptables
-	touch /etc/iptables/rules.v4 || return 1
-	iptables-save > /etc/iptables/rules.v4 || return 1
+	local rules_temp
+	rules_temp=$(mktemp /etc/iptables/.rules.v4.XXXXXX) || return 1
+	if ! iptables-save > "$rules_temp" || ! mv -f -- "$rules_temp" /etc/iptables/rules.v4; then
+		rm -f -- "$rules_temp"
+		return 1
+	fi
 	check_crontab_installed || return 1
 	crontab -l | grep -v 'iptables-restore' | crontab - > /dev/null 2>&1 || return 1
 	(crontab -l ; echo '@reboot iptables-restore < /etc/iptables/rules.v4') | crontab - > /dev/null 2>&1 || return 1
@@ -869,6 +954,9 @@ save_iptables_rules() {
 
 
 iptables_open() {
+	if [ "${KJ_APP_CONCURRENCY:-}" = "1" ] && ! kpanel_app_lock_held system; then
+		kpanel_app_with_lock system iptables_open "$@"; return $?
+	fi
 	install iptables || return 1
 	save_iptables_rules || return 1
 	iptables -P INPUT ACCEPT || return 1
@@ -886,6 +974,9 @@ iptables_open() {
 
 
 open_port() {
+	if [ "${KJ_APP_CONCURRENCY:-}" = "1" ] && ! kpanel_app_lock_held system; then
+		kpanel_app_with_lock system open_port "$@"; return $?
+	fi
 	local ports=($@)  # 将传入的参数转换为数组
 	if [ ${#ports[@]} -eq 0 ]; then
 		echo "请提供至少一个端口号"
@@ -901,11 +992,11 @@ open_port() {
 
 		# 添加打开规则
 		if ! iptables -C INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null; then
-			iptables -I INPUT 1 -p tcp --dport $port -j ACCEPT
+			iptables -I INPUT 1 -p tcp --dport $port -j ACCEPT || return 1
 		fi
 
 		if ! iptables -C INPUT -p udp --dport $port -j ACCEPT 2>/dev/null; then
-			iptables -I INPUT 1 -p udp --dport $port -j ACCEPT
+			iptables -I INPUT 1 -p udp --dport $port -j ACCEPT || return 1
 			echo "已打开端口 $port"
 		fi
 	done
@@ -916,13 +1007,16 @@ open_port() {
 
 
 close_port() {
+	if [ "${KJ_APP_CONCURRENCY:-}" = "1" ] && ! kpanel_app_lock_held system; then
+		kpanel_app_with_lock system close_port "$@"; return $?
+	fi
 	local ports=($@)  # 将传入的参数转换为数组
 	if [ ${#ports[@]} -eq 0 ]; then
 		echo "请提供至少一个端口号"
 		return 1
 	fi
 
-	install iptables
+	install iptables || return 1
 
 	for port in "${ports[@]}"; do
 		# 删除已存在的打开规则
@@ -931,11 +1025,11 @@ close_port() {
 
 		# 添加关闭规则
 		if ! iptables -C INPUT -p tcp --dport $port -j DROP 2>/dev/null; then
-			iptables -I INPUT 1 -p tcp --dport $port -j DROP
+			iptables -I INPUT 1 -p tcp --dport $port -j DROP || return 1
 		fi
 
 		if ! iptables -C INPUT -p udp --dport $port -j DROP 2>/dev/null; then
-			iptables -I INPUT 1 -p udp --dport $port -j DROP
+			iptables -I INPUT 1 -p udp --dport $port -j DROP || return 1
 			echo "已关闭端口 $port"
 		fi
 	done
@@ -945,10 +1039,10 @@ close_port() {
 	iptables -D FORWARD -i lo -j ACCEPT 2>/dev/null
 
 	# 插入新规则到第一条
-	iptables -I INPUT 1 -i lo -j ACCEPT
-	iptables -I FORWARD 1 -i lo -j ACCEPT
+	iptables -I INPUT 1 -i lo -j ACCEPT || return 1
+	iptables -I FORWARD 1 -i lo -j ACCEPT || return 1
 
-	save_iptables_rules
+	save_iptables_rules || return 1
 	send_stats "已关闭端口"
 }
 
@@ -1537,13 +1631,26 @@ kpanel_web_upgrade_certificate_renewal() (
 		! pgrep -f -- "$renewal" >/dev/null 2>&1
 		return $?
 	fi
-	[ "$digest" = ffc714440b503d5f8ee082006f31cc0b59b1c3fd8a1d015257a6cf5944153e83 ] || return 1
+	# Recognize exact official revisions, including the first v1 renewal entry
+	# and the older entry whose only extra content is commented firewall commands.
+	# Never rewrite an unknown locally edited renewal policy.
+	case "$digest" in
+		ffc714440b503d5f8ee082006f31cc0b59b1c3fd8a1d015257a6cf5944153e83|\
+		b117c82fe949d23c745902f633bd343cd13d8a929bb17dd51534fb12af46669d|\
+		90ec47433699bc981c5a146b9853ab1ed220540abbb553bd373e87c42615c7d1) ;;
+		*) return 1 ;;
+	esac
 	local temporary
 	temporary=$(mktemp "${renewal}.XXXXXX") || return 1
 	trap 'rm -f -- "$temporary"' EXIT
 	{
 		kpanel_web_certificate_renewal_header
 		awk '
+			$0 == "# 定义证书存储目录" { body=1 }
+			!body { next }
+			skip { skip--; next }
+			$0 == "    # Custom material is renewed by its owner; the PEM files remain the truth." { skip=7; next }
+			$0 == "            # if ! iptables -C INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null; then" { skip=13; next }
 			{ print }
 			$0 == "    yuming=$(basename \"$cert_file\" \"_cert.pem\")" {
 				print "    # Custom material is renewed by its owner; the PEM files remain the truth."
@@ -1794,6 +1901,10 @@ kpanel_web_replace_certificate() (
 )
 
 install_ssltls() {
+	if kpanel_web_http_mode; then return 0; fi
+	if [ "${KJ_APP_CONCURRENCY:-}" = "1" ] && ! kpanel_app_lock_held system; then
+		kpanel_app_with_lock system install_ssltls "$@"; return $?
+	fi
 	  docker stop nginx > /dev/null 2>&1
 	  cd ~
 
@@ -1926,7 +2037,17 @@ openssl rand -out /home/web/certs/ticket13.key 80
 }
 
 
+kpanel_app_write_imported_certificate() {
+	if [ "${KJ_APP_CONCURRENCY:-}" = "1" ] && ! kpanel_app_lock_held system; then
+		kpanel_app_with_lock system kpanel_app_write_imported_certificate "$@"; return $?
+	fi
+	printf '%s' "$cert_content" > "$cert_file" &&
+	printf '%s' "$key_content" > "$key_file" &&
+	chmod 644 "$cert_file" && chmod 600 "$key_file"
+}
+
 certs_status() {
+	if kpanel_web_http_mode; then return 0; fi
 
 	sleep 1
 
@@ -1987,11 +2108,7 @@ certs_status() {
 			# 3. 智能校验
 			# 只要包含 "BEGIN CERTIFICATE" 和 "PRIVATE KEY" 即可通过
 			if [[ "$cert_content" == *"-----BEGIN CERTIFICATE-----"* && "$key_content" == *"PRIVATE KEY-----"* ]]; then
-				echo -n "$cert_content" > "$cert_file"
-				echo -n "$key_content" > "$key_file"
-
-				chmod 644 "$cert_file"
-				chmod 600 "$key_file"
+				kpanel_app_write_imported_certificate || return $?
 
 				# 识别当前证书类型并显示
 				if [[ "$key_content" == *"EC PRIVATE KEY"* ]]; then
@@ -2044,6 +2161,7 @@ add_yuming() {
 
 
 check_ip_and_get_access_port() {
+	if kpanel_web_http_mode; then access_port=""; return 0; fi
 	local yuming="$1"
 
 	local ipv4_pattern='^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
@@ -2244,6 +2362,14 @@ web_del() {
 		read -r -a yuming_list <<< "$yuming_input"
 	fi
 
+	kpanel_app_delete_sites "${yuming_list[@]}"
+}
+
+kpanel_app_delete_sites() {
+	if [ "${KJ_APP_CONCURRENCY:-}" = "1" ] && ! kpanel_app_lock_held system; then
+		kpanel_app_with_lock system kpanel_app_delete_sites "$@"; return $?
+	fi
+	local -a yuming_list=("$@")
 	local action_status=0
 	for yuming in "${yuming_list[@]}"; do
 		if [ -z "$yuming" ] || [ "${#yuming}" -gt 253 ] ||
@@ -2357,6 +2483,10 @@ check_cf_mode() {
 
 
 nginx_http_on() {
+	if kpanel_web_http_mode; then
+		kpanel_web_http_config || exit 1
+		return 0
+	fi
 
 local ipv4_pattern='^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
 local ipv6_pattern='^(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|(2[0-4][0-9]|[01]?[0-9][0-9]?))|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|(2[0-4][0-9]|[01]?[0-9][0-9]?))|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|(2[0-4][0-9]|[01]?[0-9][0-9]?))|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|(2[0-4][0-9]|[01]?[0-9][0-9]?))))$'
@@ -2425,6 +2555,7 @@ patch_wp_url() {
   local HOME_URL="$1"
   local SITE_URL="$2"
   local TARGET_DIR="/home/web/html"
+  if kpanel_web_http_mode; then TARGET_DIR="/home/web/html/$yuming"; fi
 
   find "$TARGET_DIR" -type f -name "wp-config-sample.php" | while read -r FILE; do
 	# 删除旧定义
@@ -3116,6 +3247,9 @@ remove_docker_user_rule() {
 }
 
 block_container_port() {
+	if [ "${KJ_APP_CONCURRENCY:-}" = "1" ] && ! kpanel_app_lock_held system; then
+		kpanel_app_with_lock system block_container_port "$@"; return $?
+	fi
 	local container_name_or_id=$1
 	local allowed_ip=$2
 	local container_ips
@@ -3128,7 +3262,7 @@ block_container_port() {
 		return 1
 	fi
 
-	install iptables
+	install iptables || return 1
 
 	while IFS= read -r container_ip; do
 		ensure_docker_user_rule -p tcp -d "$container_ip" -j DROP || return 1
@@ -3141,13 +3275,16 @@ block_container_port() {
 	done <<< "$container_ips"
 
 	echo "已阻止IP+端口访问该服务"
-	save_iptables_rules
+	save_iptables_rules || return 1
 }
 
 
 
 
 clear_container_rules() {
+	if [ "${KJ_APP_CONCURRENCY:-}" = "1" ] && ! kpanel_app_lock_held system; then
+		kpanel_app_with_lock system clear_container_rules "$@"; return $?
+	fi
 	local container_name_or_id=$1
 	local allowed_ip=$2
 	local container_ips
@@ -3160,7 +3297,7 @@ clear_container_rules() {
 		return 1
 	fi
 
-	install iptables
+	install iptables || return 1
 
 	while IFS= read -r container_ip; do
 		remove_docker_user_rule -p tcp -d "$container_ip" -j DROP || return 1
@@ -3173,7 +3310,7 @@ clear_container_rules() {
 	done <<< "$container_ips"
 
 	echo "已允许IP+端口访问该服务"
-	save_iptables_rules
+	save_iptables_rules || return 1
 }
 
 
@@ -3182,6 +3319,9 @@ clear_container_rules() {
 
 
 block_host_port() {
+	if [ "${KJ_APP_CONCURRENCY:-}" = "1" ] && ! kpanel_app_lock_held system; then
+		kpanel_app_with_lock system block_host_port "$@"; return $?
+	fi
 	local port=$1
 	local allowed_ip=$2
 
@@ -3191,22 +3331,22 @@ block_host_port() {
 		return 1
 	fi
 
-	install iptables
+	install iptables || return 1
 
 
 	# 拒绝其他所有 IP 访问
 	if ! iptables -C INPUT -p tcp --dport "$port" -j DROP &>/dev/null; then
-		iptables -I INPUT -p tcp --dport "$port" -j DROP
+		iptables -I INPUT -p tcp --dport "$port" -j DROP || return 1
 	fi
 
 	# 允许指定 IP 访问
 	if ! iptables -C INPUT -p tcp --dport "$port" -s "$allowed_ip" -j ACCEPT &>/dev/null; then
-		iptables -I INPUT -p tcp --dport "$port" -s "$allowed_ip" -j ACCEPT
+		iptables -I INPUT -p tcp --dport "$port" -s "$allowed_ip" -j ACCEPT || return 1
 	fi
 
 	# 允许本机访问
 	if ! iptables -C INPUT -p tcp --dport "$port" -s 127.0.0.0/8 -j ACCEPT &>/dev/null; then
-		iptables -I INPUT -p tcp --dport "$port" -s 127.0.0.0/8 -j ACCEPT
+		iptables -I INPUT -p tcp --dport "$port" -s 127.0.0.0/8 -j ACCEPT || return 1
 	fi
 
 
@@ -3215,32 +3355,35 @@ block_host_port() {
 
 	# 拒绝其他所有 IP 访问
 	if ! iptables -C INPUT -p udp --dport "$port" -j DROP &>/dev/null; then
-		iptables -I INPUT -p udp --dport "$port" -j DROP
+		iptables -I INPUT -p udp --dport "$port" -j DROP || return 1
 	fi
 
 	# 允许指定 IP 访问
 	if ! iptables -C INPUT -p udp --dport "$port" -s "$allowed_ip" -j ACCEPT &>/dev/null; then
-		iptables -I INPUT -p udp --dport "$port" -s "$allowed_ip" -j ACCEPT
+		iptables -I INPUT -p udp --dport "$port" -s "$allowed_ip" -j ACCEPT || return 1
 	fi
 
 	# 允许本机访问
 	if ! iptables -C INPUT -p udp --dport "$port" -s 127.0.0.0/8 -j ACCEPT &>/dev/null; then
-		iptables -I INPUT -p udp --dport "$port" -s 127.0.0.0/8 -j ACCEPT
+		iptables -I INPUT -p udp --dport "$port" -s 127.0.0.0/8 -j ACCEPT || return 1
 	fi
 
 	# 允许已建立和相关连接的流量
 	if ! iptables -C INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT &>/dev/null; then
-		iptables -I INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+		iptables -I INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT || return 1
 	fi
 
 	echo "已阻止IP+端口访问该服务"
-	save_iptables_rules
+	save_iptables_rules || return 1
 }
 
 
 
 
 clear_host_port_rules() {
+	if [ "${KJ_APP_CONCURRENCY:-}" = "1" ] && ! kpanel_app_lock_held system; then
+		kpanel_app_with_lock system clear_host_port_rules "$@"; return $?
+	fi
 	local port=$1
 	local allowed_ip=$2
 
@@ -3250,7 +3393,7 @@ clear_host_port_rules() {
 		return 1
 	fi
 
-	install iptables
+	install iptables || return 1
 
 
 	# 清除封禁所有其他 IP 访问的规则
@@ -3286,13 +3429,16 @@ clear_host_port_rules() {
 
 
 	echo "已允许IP+端口访问该服务"
-	save_iptables_rules
+	save_iptables_rules || return 1
 
 }
 
 
 
 setup_docker_dir() {
+	if [ "${KJ_APP_CONCURRENCY:-}" = "1" ] && ! kpanel_app_lock_held system; then
+		kpanel_app_with_lock system setup_docker_dir "$@"; return $?
+	fi
 
 	mkdir -p /home /home/docker 2>/dev/null
 
@@ -3315,6 +3461,9 @@ setup_docker_dir() {
 
 
 add_app_id() {
+	if [ "${KJ_APP_CONCURRENCY:-}" = "1" ]; then
+		kpanel_app_with_lock markers kpanel_app_update_marker add; return $?
+	fi
 mkdir -p /home/docker
 touch /home/docker/appno.txt
 grep -qxF "${app_id}" /home/docker/appno.txt || echo "${app_id}" >> /home/docker/appno.txt
@@ -3531,7 +3680,7 @@ kpanel_app_remove_compatibility_state() {
 	access_path="$(kpanel_app_access_path)" || return 1
 	rm -f "/home/docker/${docker_name}_port.conf" "$access_path" || return 1
 	if [ -f /home/docker/appno.txt ]; then
-		sed -i "/\b${app_id}\b/d" /home/docker/appno.txt || return 1
+		remove_app_id || return 1
 	fi
 }
 
@@ -3625,7 +3774,7 @@ kpanel_run_docker_app_install() {
 
 	kpanel_app_progress 90 "正在写入 kejilion.sh 兼容状态"
 	echo "$docker_port" > "/home/docker/${docker_name}_port.conf"
-	add_app_id
+	add_app_id || return 1
 	if [ "${KJ_APP_ACCESS_MODE:-direct}" = "domain_only" ]; then
 		kpanel_app_apply_access_mode domain_only false || return 1
 	else
@@ -3683,7 +3832,7 @@ kpanel_run_docker_app_action() {
 				docker_rum || return 1
 			fi
 			kpanel_app_verified_service false >/dev/null || return 1
-			add_app_id
+			add_app_id || return 1
 			kpanel_app_progress 80 "正在恢复应用访问策略"
 			kpanel_app_restore_access_mode "$access_mode" || return 1
 			if [ "$adapter" = "standard" ]; then
@@ -3785,7 +3934,7 @@ while true; do
 			fi
 			echo "$docker_port" > "/home/docker/${docker_name}_port.conf"
 
-			add_app_id
+			add_app_id || return 1
 			kpanel_app_write_access_mode direct
 
 			clear
@@ -3806,7 +3955,7 @@ while true; do
 				fi
 			fi
 
-			add_app_id
+			add_app_id || return 1
 			kpanel_app_restore_access_mode "$(kpanel_app_read_access_mode)"
 
 			clear
@@ -3829,7 +3978,7 @@ while true; do
 			rm -f /home/docker/${docker_name}_port.conf
 			rm -f /home/docker/${docker_name}_access.conf
 
-			sed -i "/\b${app_id}\b/d" /home/docker/appno.txt
+			remove_app_id || return 1
 			echo "应用已卸载"
 			send_stats "卸载$docker_name"
 			;;
@@ -3839,7 +3988,7 @@ while true; do
 			send_stats "${docker_name}域名访问设置"
 			add_yuming
 			ldnmp_Proxy ${yuming} 127.0.0.1 ${docker_port}
-			block_container_port "$docker_name" "$ipv4_address"
+			block_container_port "$docker_name" "$ipv4_address" || return 1
 			kpanel_app_write_access_mode domain_only || action_status=1
 			;;
 
@@ -3850,13 +3999,13 @@ while true; do
 
 		7)
 			send_stats "允许IP访问 ${docker_name}"
-			clear_container_rules "$docker_name" "$ipv4_address"
+			clear_container_rules "$docker_name" "$ipv4_address" || return 1
 			kpanel_app_write_access_mode direct || action_status=1
 			;;
 
 		8)
 			send_stats "阻止IP访问 ${docker_name}"
-			block_container_port "$docker_name" "$ipv4_address"
+			block_container_port "$docker_name" "$ipv4_address" || return 1
 			kpanel_app_write_access_mode domain_only || action_status=1
 			;;
 
@@ -3925,7 +4074,7 @@ docker_app_plus() {
 				install_docker
 				if docker_app_install; then
 					echo "$docker_port" > "/home/docker/${docker_name}_port.conf"
-					add_app_id
+					add_app_id || return 1
 					kpanel_app_write_access_mode direct
 					send_stats "$app_name 安装"
 				else
@@ -3936,7 +4085,7 @@ docker_app_plus() {
 
 			2)
 				if docker_app_update; then
-					add_app_id
+					add_app_id || return 1
 					kpanel_app_restore_access_mode "$(kpanel_app_read_access_mode)"
 					send_stats "$app_name 更新"
 				else
@@ -3949,7 +4098,7 @@ docker_app_plus() {
 				if docker_app_uninstall; then
 					rm -f /home/docker/${docker_name}_port.conf
 					rm -f /home/docker/${docker_name}_access.conf
-					sed -i "/\b${app_id}\b/d" /home/docker/appno.txt
+					remove_app_id || return 1
 					send_stats "$app_name 卸载"
 				else
 					echo -e "${gl_hong}卸载失败: ${gl_bai}已保留应用登记状态。"
@@ -3963,7 +4112,7 @@ docker_app_plus() {
 				add_yuming
 				ldnmp_Proxy ${yuming} 127.0.0.1 ${docker_port}
 				local docker_check_name="${docker_app_service:-$docker_name}"
-				block_container_port "$docker_check_name" "$ipv4_address"
+				block_container_port "$docker_check_name" "$ipv4_address" || return 1
 				kpanel_app_write_access_mode domain_only || action_status=1
 
 				;;
@@ -3974,13 +4123,13 @@ docker_app_plus() {
 			7)
 				send_stats "允许IP访问 ${docker_name}"
 				local docker_check_name="${docker_app_service:-$docker_name}"
-				clear_container_rules "$docker_check_name" "$ipv4_address"
+				clear_container_rules "$docker_check_name" "$ipv4_address" || return 1
 				kpanel_app_write_access_mode direct || action_status=1
 				;;
 			8)
 				send_stats "阻止IP访问 ${docker_name}"
 				local docker_check_name="${docker_app_service:-$docker_name}"
-				block_container_port "$docker_check_name" "$ipv4_address"
+				block_container_port "$docker_check_name" "$ipv4_address" || return 1
 				kpanel_app_write_access_mode domain_only || action_status=1
 				;;
 			*)
@@ -5210,6 +5359,9 @@ ldnmp_install_status() {
 
 
 nginx_install_status() {
+	if [ "${KJ_APP_CONCURRENCY:-}" = "1" ] && ! kpanel_app_lock_held system; then
+		kpanel_app_with_lock system nginx_install_status "$@"; return $?
+	fi
 
 	if ! docker inspect "nginx" &>/dev/null; then
 		send_stats "请先安装nginx环境"
@@ -5224,13 +5376,17 @@ nginx_install_status() {
 ldnmp_web_on() {
 	  clear
 	  echo "您的 $webname 搭建好了！"
-	  echo "https://$yuming"
+	  if kpanel_web_http_mode; then echo "http://$yuming:$KJ_WEB_HTTP_PORT"; else echo "https://$yuming"; fi
 	  echo "------------------------"
 	  echo "$webname 安装信息如下: "
 
 }
 
 nginx_web_on() {
+	if kpanel_web_http_mode; then
+		echo "http://$yuming:$KJ_WEB_HTTP_PORT"
+		return 0
+	fi
 	clear
 
 	local ipv4_pattern='^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
@@ -5291,7 +5447,11 @@ ldnmp_wp() {
   sed -i "s|username_here|$dbuse|g" /home/web/html/$yuming/wordpress/wp-config-sample.php
   sed -i "s|password_here|$dbusepasswd|g" /home/web/html/$yuming/wordpress/wp-config-sample.php
   sed -i "s|localhost|mysql|g" /home/web/html/$yuming/wordpress/wp-config-sample.php
-  patch_wp_url "https://$yuming" "https://$yuming"
+  if kpanel_web_http_mode; then
+    patch_wp_url "http://$yuming:$KJ_WEB_HTTP_PORT" "http://$yuming:$KJ_WEB_HTTP_PORT"
+  else
+    patch_wp_url "https://$yuming" "https://$yuming"
+  fi
   cp /home/web/html/$yuming/wordpress/wp-config-sample.php /home/web/html/$yuming/wordpress/wp-config.php
 
 
@@ -5337,6 +5497,13 @@ ldnmp_Proxy() {
 	install_ssltls
 	certs_status
 
+	kpanel_app_write_proxy
+}
+
+kpanel_app_write_proxy() {
+	if [ "${KJ_APP_CONCURRENCY:-}" = "1" ] && ! kpanel_app_lock_held system; then
+		kpanel_app_with_lock system kpanel_app_write_proxy "$@"; return $?
+	fi
 	kpanel_web_progress 60 "正在获取 kejilion.sh 反向代理配置"
 	wget -O /home/web/conf.d/map.conf ${gh_proxy}raw.githubusercontent.com/kejilion/nginx/main/map.conf
 	wget -O /home/web/conf.d/$yuming.conf ${gh_proxy}raw.githubusercontent.com/kejilion/nginx/main/reverse-proxy-backend.conf
@@ -5488,20 +5655,20 @@ stream_panel() {
 		case $choice in
 			1)
 				nginx_install_status
-				add_app_id
+				add_app_id || return 1
 				send_stats "安装Stream四层代理"
 				;;
 			2)
 				update_docker_compose_with_db_creds
 				nginx_upgrade
-				add_app_id
+				add_app_id || return 1
 				send_stats "更新Stream四层代理"
 				;;
 			3)
 				read -e -p "确定要删除 nginx 容器吗？这可能会影响网站功能！(y/N): " confirm
 				if [[ "$confirm" =~ ^[Yy]$ ]]; then
 					docker rm -f nginx
-					sed -i "/\b${app_id}\b/d" /home/docker/appno.txt
+					remove_app_id || return 1
 					send_stats "更新Stream四层代理"
 					echo "nginx 容器已删除。"
 				else
@@ -5512,7 +5679,7 @@ stream_panel() {
 
 			4)
 				ldnmp_Proxy_backend_stream
-				add_app_id
+				add_app_id || return 1
 				send_stats "添加四层代理"
 				;;
 			5)
@@ -5620,11 +5787,142 @@ find_container_by_host_port() {
 
 
 
+# Site configs determine site identity; certificates are optional artifacts.
+ldnmp_site_config_files() {
+	local conf
+	for conf in /home/web/conf.d/*.conf; do
+		[ -f "$conf" ] || continue
+		case "${conf##*/}" in default.conf|map.conf) continue ;; esac
+		printf '%s\n' "$conf"
+	done
+}
+
+ldnmp_site_count() {
+	ldnmp_site_config_files | awk 'END { print NR+0 }'
+}
+
+# Read server blocks without invoking Nginx or changing files. Quoted text,
+# comments and braced variables cannot introduce structural delimiters.
+ldnmp_site_config_endpoints() {
+	LC_ALL=C awk '
+	function flush() {
+		if (length(word)) { words[++nw]=word; word="" }
+	}
+	function host_valid(host) {
+		return host ~ /^[A-Za-z0-9][A-Za-z0-9.-]*$/ ||
+			(host ~ /^[0-9A-Fa-f:]+$/ && index(host, ":"))
+	}
+	function directive(    i, value) {
+		if (sid && depth==server_depth) {
+			if (words[1]=="server_name" && !names[sid]) {
+				for (i=2; i<=nw; i++) if (host_valid(words[i])) { names[sid]=words[i]; break }
+			} else if (words[1]=="listen") {
+				value=""
+				for (i=2; i<=nw; i++) value=value (i==2 ? "" : " ") words[i]
+				listens[sid,++listen_count[sid]]=value
+			} else if (words[1]=="ssl_certificate" && !cert[sid]) cert[sid]=words[2]
+			else if (words[1]=="ssl") { has_ssl[sid]=1; legacy_ssl[sid]=(words[2]=="on") }
+			else if (words[1]=="include") included[sid]=1
+		} else if (depth==1 && blocks[depth]=="http") {
+			if (words[1]=="ssl_certificate") http_cert=words[2]
+			if (words[1]=="ssl") http_ssl=(words[2]=="on")
+		}
+	}
+	function delimiter(ch) {
+		flush()
+		if (ch=="{") {
+			if (nw==1 && words[1]=="server" && (depth==0 || (depth==1 && blocks[1]=="http"))) {
+				sid=++servers; server_depth=depth+1
+			}
+			blocks[++depth]=words[1]
+		} else if (ch=="}") {
+			if (depth==server_depth) sid=0
+			if (depth>0) depth--
+		} else directive()
+		nw=0
+	}
+	function emit(address, certificate,    key) {
+		key=address SUBSEP certificate
+		if (!seen[key]++) { print address "\t" certificate; emitted++ }
+	}
+	{
+		line=$0 "\n"
+		for (pos=1; pos<=length(line); pos++) {
+			ch=substr(line,pos,1)
+			if (comment) { if (ch=="\n") comment=0; continue }
+			if (escaped) { word=word ch; escaped=0; continue }
+			if (ch=="\\") { escaped=1; continue }
+			if (quote!="") { if (ch==quote) quote=""; else word=word ch; continue }
+			if (variable) { word=word ch; if (ch=="}") variable=0; continue }
+			if (ch=="{" && substr(word,length(word),1)=="$") { word=word ch; variable=1; continue }
+			if (ch=="\"" || ch==sprintf("%c",39)) { quote=ch; continue }
+			if (ch=="#") { flush(); comment=1; continue }
+			if (ch=="{" || ch=="}" || ch==";") { delimiter(ch); continue }
+			if (ch ~ /[[:space:]]/) flush(); else word=word ch
+		}
+	}
+	END {
+		for (s=1; s<=servers; s++) {
+			if (!listen_count[s]) {
+				if (included[s]) { emit("监听待确认（include）", "-"); continue }
+				listens[s,++listen_count[s]]="80"
+			}
+			for (l=1; l<=listen_count[s]; l++) {
+				n=split(listens[s,l],parts,/[[:space:]]+/)
+				address=parts[1]; protocol="http"
+				if (has_ssl[s] ? legacy_ssl[s] : http_ssl) protocol="https"
+				for (p=2; p<=n; p++) if (parts[p]=="ssl" || parts[p]=="quic") protocol="https"
+				certificate=(protocol=="https" ? (cert[s] ? cert[s] : http_cert) : "-")
+				if (!length(certificate)) certificate="?"
+				if (address ~ /^unix:/) { emit("Unix socket（无 TCP 端口）", certificate); continue }
+				if (address ~ /^[0-9]+$/) port=address+0
+				else if (address ~ /:[0-9]+$/) { sub(/^.*:/,"",address); port=address+0 }
+				else if (address ~ /^\[[0-9A-Fa-f:]+\]$/ || host_valid(address)) port=80
+				else continue
+				if (port<1 || port>65535) continue
+				host=names[s]
+				if (!length(host)) { emit(toupper(protocol) " :" port "（server_name 待确认）", certificate); continue }
+				if (index(host,":")) host="[" host "]"
+				emit(protocol "://" host ":" port, certificate)
+			}
+		}
+		if (!emitted) emit("监听待确认", "-")
+	}' "$1"
+}
+
+ldnmp_site_certificate_expiry() {
+	local certificate="$1" expiry
+	case "$certificate" in
+		-) printf '%s\n' '-'; return ;;
+		/etc/nginx/certs/*) certificate="/home/web/certs/${certificate#/etc/nginx/certs/}" ;;
+	esac
+	if [ ! -f "$certificate" ]; then printf '%s\n' '证书未找到/待确认'; return; fi
+	expiry=$(openssl x509 -noout -enddate -in "$certificate" 2>/dev/null) || {
+		printf '%s\n' '证书无法读取'; return
+	}
+	date -d "${expiry#notAfter=}" '+%Y-%m-%d' 2>/dev/null || printf '%s\n' '到期时间待确认'
+}
+
+ldnmp_site_table() {
+	local conf name address certificate expiry
+	printf '配置名（管理操作使用）%9s访问地址%38s证书到期时间\n' '' ''
+	while IFS= read -r conf; do
+		name="${conf##*/}"; name="${name%.conf}"
+		name=$(printf '%s' "$name" | LC_ALL=C tr -d '\000-\037\177')
+		while IFS=$'\t' read -r address certificate; do
+			expiry=$(ldnmp_site_certificate_expiry "$certificate")
+			printf '%-30s %-45s %s\n' "$name" "$address" "$expiry"
+		done < <(ldnmp_site_config_endpoints "$conf")
+	done < <(ldnmp_site_config_files)
+}
+
+
+
 ldnmp_web_status() {
 	root_use
 	while true; do
-		local cert_count=$(ls /home/web/certs/*_cert.pem 2>/dev/null | wc -l)
-		local output="${gl_lv}${cert_count}${gl_bai}"
+		local site_count=$(ldnmp_site_count)
+		local output="${gl_lv}${site_count}${gl_bai}"
 
 		local dbrootpasswd=$(grep -oP 'MYSQL_ROOT_PASSWORD:\s*\K.*' /home/web/docker-compose.yml | tr -d '[:space:]')
 		local db_count=$(docker exec mysql mysql -u root -p"$dbrootpasswd" -e "SHOW DATABASES;" 2> /dev/null | grep -Ev "Database|information_schema|mysql|performance_schema|sys" | wc -l)
@@ -5636,35 +5934,9 @@ ldnmp_web_status() {
 		echo "------------------------"
 		ldnmp_v
 
-		echo -e "站点: ${output}                      证书到期时间"
+		echo -e "站点: ${output}（按配置文件计数）"
 		echo -e "------------------------"
-		for cert_file in /home/web/certs/*_cert.pem; do
-		  local domain=$(basename "$cert_file" | sed 's/_cert.pem//')
-		  if [ -n "$domain" ]; then
-			local expire_date=$(openssl x509 -noout -enddate -in "$cert_file" | awk -F'=' '{print $2}')
-			local formatted_date=$(date -d "$expire_date" '+%Y-%m-%d')
-			printf "%-30s%s\n" "$domain" "$formatted_date"
-		  fi
-		done
-
-		for conf_file in /home/web/conf.d/*_*.conf; do
-		  [ -e "$conf_file" ] || continue
-		  basename "$conf_file" .conf
-		done
-
-		for conf_file in /home/web/conf.d/*.conf; do
-		  [ -e "$conf_file" ] || continue
-
-		  filename=$(basename "$conf_file")
-
-		  if [ "$filename" = "map.conf" ] || [ "$filename" = "default.conf" ]; then
-			continue
-		  fi
-
-		  if ! grep -q "ssl_certificate" "$conf_file"; then
-			basename "$conf_file" .conf
-		  fi
-		done
+		ldnmp_site_table
 
 		echo "------------------------"
 		echo ""
@@ -5843,20 +6115,20 @@ while true; do
 			iptables_open
 			panel_app_install
 
-			add_app_id
+			add_app_id || return 1
 			send_stats "${panelname}安装"
 			;;
 		2)
 			panel_app_manage
 
-			add_app_id
+			add_app_id || return 1
 			send_stats "${panelname}控制"
 
 			;;
 		3)
 			panel_app_uninstall
 
-			sed -i "/\b${app_id}\b/d" /home/docker/appno.txt
+			remove_app_id || return 1
 			send_stats "${panelname}卸载"
 			;;
 		*)
@@ -6464,7 +6736,7 @@ frpc_panel() {
 				install_docker
 				configure_frpc
 
-				add_app_id
+				add_app_id || return 1
 				echo "FRP客户端已经安装完成"
 				;;
 			2)
@@ -6474,7 +6746,7 @@ frpc_panel() {
 				[ -f /home/frp/frpc.toml ] || cp /home/frp/frp_0.61.0_linux_amd64/frpc.toml /home/frp/frpc.toml
 				donlond_frp frpc
 
-				add_app_id
+				add_app_id || return 1
 				echo "FRP客户端已经更新完成"
 				;;
 
@@ -6485,7 +6757,7 @@ frpc_panel() {
 				rm -rf /home/frp
 				close_port 8055
 
-				sed -i "/\b${app_id}\b/d" /home/docker/appno.txt
+				remove_app_id || return 1
 				echo "应用已卸载"
 				;;
 
@@ -6553,7 +6825,7 @@ frps_panel() {
 				install_docker
 				generate_frps_config
 
-				add_app_id
+				add_app_id || return 1
 				echo "FRP服务端已经安装完成"
 				;;
 			2)
@@ -6563,7 +6835,7 @@ frps_panel() {
 				[ -f /home/frp/frps.toml ] || cp /home/frp/frp_0.61.0_linux_amd64/frps.toml /home/frp/frps.toml
 				donlond_frp frps
 
-				add_app_id
+				add_app_id || return 1
 				echo "FRP服务端已经更新完成"
 				;;
 			3)
@@ -6574,7 +6846,7 @@ frps_panel() {
 
 				close_port 8055 8056
 
-				sed -i "/\b${app_id}\b/d" /home/docker/appno.txt
+				remove_app_id || return 1
 				echo "应用已卸载"
 				;;
 			5)
@@ -6583,7 +6855,7 @@ frps_panel() {
 				add_yuming
 				read -e -p "请输入你的内网穿透服务端口: " frps_port
 				ldnmp_Proxy ${yuming} 127.0.0.1 ${frps_port}
-				block_host_port "$frps_port" "$ipv4_address"
+				block_host_port "$frps_port" "$ipv4_address" || return 1
 				;;
 			6)
 				echo "域名格式 example.com 不带https://"
@@ -6593,14 +6865,14 @@ frps_panel() {
 			7)
 				send_stats "允许IP访问"
 				read -e -p "请输入需要放行的端口: " frps_port
-				clear_host_port_rules "$frps_port" "$ipv4_address"
+				clear_host_port_rules "$frps_port" "$ipv4_address" || return 1
 				;;
 
 			8)
 				send_stats "阻止IP访问"
 				echo "如果你已经反代域名访问了，可用此功能阻止IP+端口访问，这样更安全。"
 				read -e -p "请输入需要阻止的端口: " frps_port
-				block_host_port "$frps_port" "$ipv4_address"
+				block_host_port "$frps_port" "$ipv4_address" || return 1
 				;;
 
 			00)
@@ -6660,7 +6932,7 @@ yt_menu_pro() {
 				curl -L ${gh_https_url}github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
 				chmod a+rx /usr/local/bin/yt-dlp
 
-				add_app_id
+				add_app_id || return 1
 				echo "安装完成。按任意键继续..."
 				read ;;
 			2)
@@ -6668,7 +6940,7 @@ yt_menu_pro() {
 				echo "正在更新 yt-dlp..."
 				yt-dlp -U
 
-				add_app_id
+				add_app_id || return 1
 				echo "更新完成。按任意键继续..."
 				read ;;
 			3)
@@ -6676,7 +6948,7 @@ yt_menu_pro() {
 				echo "正在卸载 yt-dlp..."
 				rm -f /usr/local/bin/yt-dlp
 
-				sed -i "/\b${app_id}\b/d" /home/docker/appno.txt
+				remove_app_id || return 1
 				echo "卸载完成。按任意键继续..."
 				read ;;
 			5)
@@ -11005,6 +11277,7 @@ docker_ssh_migration() {
 			echo -e "2. 迁移docker项目"
 			echo -e "3. 还原docker项目"
 			echo -e "4. 删除docker项目的备份文件"
+			echo "5. 通用加密备份与恢复 (.kpb，与 KPanel 互通)"
 			echo "------------------------"
 			echo -e "0. 返回上一级选单"
 			echo "------------------------"
@@ -11014,6 +11287,7 @@ docker_ssh_migration() {
 				2) migrate_docker ;;
 				3) restore_docker ;;
 				4) delete_backup ;;
+				5) kpanel_backup_center_dispatch menu docker ;;
 				0) return ;;
 				*) echo -e "${gl_hong}无效选项${gl_bai}" ;;
 			esac
@@ -11328,6 +11602,8 @@ kpanel_node_paths() {
 	KPANEL_NODE_CONFIG_DIR="/etc/kejilion-node"
 	KPANEL_NODE_CONFIG="${KPANEL_NODE_CONFIG_DIR}/node.json"
 	KPANEL_NODE_TERMINAL_CONFIG="${KPANEL_NODE_CONFIG_DIR}/terminal.json"
+	KPANEL_NODE_ENROLLMENT_FINGERPRINT="${KPANEL_NODE_CONFIG_DIR}/enrollment-token.sha256"
+	KPANEL_NODE_ENROLLMENT_STAGE="${KPANEL_NODE_CONFIG_DIR}/.enrollment-stage"
 	KPANEL_NODE_SYSTEMCTL="$(type -P systemctl 2>/dev/null || true)"
 }
 
@@ -11579,10 +11855,14 @@ write_update_status running '' 0 || echo "KPanel update status could not be reco
 # namespace prevents their `version` probe from restoring an obsolete updater.
 temporary_dir="$(mktemp -d /tmp/kejilion-node-release.XXXXXX)"
 
+quiet=false
+[ "${KPANEL_NODE_QUIET:-0}" != "1" ] || quiet=true
 curl_progress=(--silent --show-error)
-[ ! -t 2 ] || curl_progress=(--progress-bar --show-error)
+if [ "$quiet" != true ] && [ -t 2 ]; then
+	curl_progress=(--progress-bar --show-error)
+fi
 update_error=release_check
-echo "Checking KPanel lightweight node release..."
+[ "$quiet" = true ] || echo "Checking KPanel lightweight node release..."
 if ! curl --proto '=https' --proto-redir '=https' --tlsv1.2 --fail --location "${curl_progress[@]}" \
 	--connect-timeout 15 --max-time 60 --retry 3 --retry-delay 5 --retry-max-time 240 \
 	--max-filesize 65536 --dump-header "${temporary_dir}/headers" \
@@ -11743,12 +12023,12 @@ if [ -f "$binary_path" ] && [ "$(sha256sum "$binary_path" | awk '{print $1}')" =
 		restart_optional_services
 	fi
 	update_result=current; update_error=""
-	echo "KPanel lightweight node is already up to date."
+	[ "$quiet" = true ] || echo "KPanel lightweight node is already up to date."
 	exit 0
 fi
 
 update_error=download
-echo "Downloading KPanel lightweight node..."
+[ "$quiet" = true ] || echo "Downloading KPanel lightweight node..."
 if ! curl --proto '=https' --proto-redir '=https' --tlsv1.2 --fail --location "${curl_progress[@]}" \
 	--connect-timeout 15 --max-time 180 --retry 3 --retry-delay 5 --retry-max-time 600 \
 	--max-filesize 134217728 \
@@ -11796,7 +12076,7 @@ if [ "$restart_required" = "true" ] && ! restart_services; then
 fi
 rm -f -- "${binary_path}.previous"
 update_result=updated; update_error=""
-echo "KPanel lightweight node update completed: ${version_output}"
+[ "$quiet" = true ] || echo "KPanel lightweight node update completed: ${version_output}"
 KPANEL_NODE_UPDATE
 	if ! chmod 0755 "$updater_temporary" || ! mv -f -- "$updater_temporary" "$KPANEL_NODE_UPDATER"; then
 		rm -f -- "$updater_temporary"
@@ -11992,28 +12272,145 @@ KPANEL_NODE_UPDATE_TIMER
 		/etc/systemd/system/kejilion-node-update.timer
 }
 
-kpanel_node_cleanup_failed_join() {
-	if [ -x "$KPANEL_NODE_SYSTEMCTL" ]; then
-		"$KPANEL_NODE_SYSTEMCTL" stop kejilion-node.service >/dev/null 2>&1 || true
-		"$KPANEL_NODE_SYSTEMCTL" stop kejilion-node-terminal.service >/dev/null 2>&1 || true
-		"$KPANEL_NODE_SYSTEMCTL" stop kejilion-node-ssh-login.service >/dev/null 2>&1 || true
-		"$KPANEL_NODE_SYSTEMCTL" stop kejilion-node-file.service >/dev/null 2>&1 || true
-		"$KPANEL_NODE_SYSTEMCTL" stop kejilion-node-update.timer >/dev/null 2>&1 || true
-		"$KPANEL_NODE_SYSTEMCTL" disable kejilion-node.service >/dev/null 2>&1 || true
-		"$KPANEL_NODE_SYSTEMCTL" disable kejilion-node-terminal.service >/dev/null 2>&1 || true
-		"$KPANEL_NODE_SYSTEMCTL" disable kejilion-node-ssh-login.service >/dev/null 2>&1 || true
-		"$KPANEL_NODE_SYSTEMCTL" disable kejilion-node-file.service >/dev/null 2>&1 || true
-		"$KPANEL_NODE_SYSTEMCTL" disable kejilion-node-update.timer >/dev/null 2>&1 || true
+kpanel_node_stage_paths() {
+	KPANEL_NODE_STAGE_TOKEN="${KPANEL_NODE_ENROLLMENT_STAGE}/token.sha256"
+	KPANEL_NODE_STAGE_CONFIG="${KPANEL_NODE_ENROLLMENT_STAGE}/node.json"
+	KPANEL_NODE_STAGE_CONFIG_SHA="${KPANEL_NODE_ENROLLMENT_STAGE}/node.sha256"
+	KPANEL_NODE_STAGE_TERMINAL="${KPANEL_NODE_ENROLLMENT_STAGE}/terminal.json"
+	KPANEL_NODE_STAGE_TERMINAL_STATE="${KPANEL_NODE_ENROLLMENT_STAGE}/terminal.state"
+}
+
+kpanel_node_safe_regular_file() {
+	local path="$1"
+	[ -f "$path" ] && [ ! -L "$path" ] && [ "$(stat -c '%u:%h' "$path")" = "0:1" ]
+}
+
+kpanel_node_validate_config_dir() {
+	local gid
+	gid="$(id -g kejilion-node)" || return 1
+	[ -d "$KPANEL_NODE_CONFIG_DIR" ] && [ ! -L "$KPANEL_NODE_CONFIG_DIR" ] &&
+		[ "$(stat -c '%u:%g:%a' "$KPANEL_NODE_CONFIG_DIR")" = "0:${gid}:750" ]
+}
+
+kpanel_node_read_fingerprint() {
+	local path="$1" value
+	[ -e "$path" ] || [ -L "$path" ] || return 1
+	kpanel_node_safe_regular_file "$path" || return 1
+	IFS= read -r value <"$path" || return 1
+	[[ "$value" =~ ^[0-9a-f]{64}$ ]] || return 1
+	printf '%s\n' "$value"
+}
+
+kpanel_node_clear_enrollment_stage() {
+	local path
+	kpanel_node_stage_paths
+	[ -e "$KPANEL_NODE_ENROLLMENT_STAGE" ] || [ -L "$KPANEL_NODE_ENROLLMENT_STAGE" ] || return 0
+	[ -d "$KPANEL_NODE_ENROLLMENT_STAGE" ] && [ ! -L "$KPANEL_NODE_ENROLLMENT_STAGE" ] &&
+		[ "$(stat -c '%u:%a' "$KPANEL_NODE_ENROLLMENT_STAGE")" = "0:700" ] || return 1
+	for path in "$KPANEL_NODE_STAGE_TOKEN" "$KPANEL_NODE_STAGE_CONFIG" "$KPANEL_NODE_STAGE_CONFIG_SHA" \
+		"$KPANEL_NODE_STAGE_TERMINAL" "$KPANEL_NODE_STAGE_TERMINAL_STATE"; do
+		[ -e "$path" ] || [ -L "$path" ] || continue
+		kpanel_node_safe_regular_file "$path" || return 1
+		rm -f -- "$path" || return 1
+	done
+	rmdir -- "$KPANEL_NODE_ENROLLMENT_STAGE"
+}
+
+kpanel_node_prepare_stage_manifest() {
+	local config_hash terminal_state=absent
+	kpanel_node_stage_paths
+	kpanel_node_safe_regular_file "$KPANEL_NODE_STAGE_CONFIG" && [ -s "$KPANEL_NODE_STAGE_CONFIG" ] || return 1
+	for metadata in "$KPANEL_NODE_STAGE_CONFIG_SHA" "$KPANEL_NODE_STAGE_TERMINAL_STATE"; do
+		[ -e "$metadata" ] || [ -L "$metadata" ] || continue
+		kpanel_node_safe_regular_file "$metadata" || return 1
+	done
+	config_hash="$(sha256sum "$KPANEL_NODE_STAGE_CONFIG" | awk '{print $1}')"
+	[[ "$config_hash" =~ ^[0-9a-f]{64}$ ]] || return 1
+	printf '%s\n' "$config_hash" >"$KPANEL_NODE_STAGE_CONFIG_SHA" || return 1
+	chmod 0600 "$KPANEL_NODE_STAGE_CONFIG_SHA" || return 1
+	if [ -e "$KPANEL_NODE_STAGE_TERMINAL" ] || [ -L "$KPANEL_NODE_STAGE_TERMINAL" ]; then
+		kpanel_node_safe_regular_file "$KPANEL_NODE_STAGE_TERMINAL" && [ -s "$KPANEL_NODE_STAGE_TERMINAL" ] || return 1
+		terminal_state=present
 	fi
-	rm -f -- /etc/systemd/system/kejilion-node.service \
-		/etc/systemd/system/kejilion-node-terminal.service \
-		"$KPANEL_NODE_SSH_LOGIN_SERVICE" \
-		/etc/systemd/system/kejilion-node-file.service \
-		/etc/systemd/system/kejilion-node-update.service \
-		/etc/systemd/system/kejilion-node-update.timer
-	rm -rf -- "$KPANEL_NODE_HOME" "$KPANEL_NODE_CONFIG_DIR"
-	rmdir -- "$KPANEL_NODE_SSH_LOGIN_RUNTIME" 2>/dev/null || true
-	[ ! -x "$KPANEL_NODE_SYSTEMCTL" ] || "$KPANEL_NODE_SYSTEMCTL" daemon-reload >/dev/null 2>&1 || true
+	printf '%s\n' "$terminal_state" >"$KPANEL_NODE_STAGE_TERMINAL_STATE" || return 1
+	chmod 0600 "$KPANEL_NODE_STAGE_TERMINAL_STATE"
+}
+
+kpanel_node_write_fingerprint() {
+	local fingerprint="$1" pending="${KPANEL_NODE_CONFIG_DIR}/.enrollment-token.pending"
+	if [ -e "$KPANEL_NODE_ENROLLMENT_FINGERPRINT" ] || [ -L "$KPANEL_NODE_ENROLLMENT_FINGERPRINT" ]; then
+		kpanel_node_safe_regular_file "$KPANEL_NODE_ENROLLMENT_FINGERPRINT" || return 1
+	fi
+	if [ -e "$pending" ] || [ -L "$pending" ]; then
+		kpanel_node_safe_regular_file "$pending" || return 1
+		rm -f -- "$pending" || return 1
+	fi
+	(umask 077; set -C; printf '%s\n' "$fingerprint" >"$pending") || return 1
+	chown root:root "$pending" || return 1
+	chmod 0600 "$pending" || return 1
+	mv -f -- "$pending" "$KPANEL_NODE_ENROLLMENT_FINGERPRINT"
+}
+
+kpanel_node_finalize_enrollment() {
+	local fingerprint="$1" staged_fingerprint expected_hash actual_hash terminal_state
+	kpanel_node_stage_paths
+	staged_fingerprint="$(kpanel_node_read_fingerprint "$KPANEL_NODE_STAGE_TOKEN")" || return 1
+	[ "$staged_fingerprint" = "$fingerprint" ] || return 1
+	if [ -e "$KPANEL_NODE_STAGE_CONFIG" ] || [ -L "$KPANEL_NODE_STAGE_CONFIG" ]; then
+		kpanel_node_prepare_stage_manifest || return 1
+	elif ! kpanel_node_read_fingerprint "$KPANEL_NODE_STAGE_CONFIG_SHA" >/dev/null 2>&1 ||
+		[ ! -e "$KPANEL_NODE_STAGE_TERMINAL_STATE" ]; then
+		return 1
+	fi
+	expected_hash="$(kpanel_node_read_fingerprint "$KPANEL_NODE_STAGE_CONFIG_SHA")" || return 1
+	if [ -e "$KPANEL_NODE_STAGE_CONFIG" ] || [ -L "$KPANEL_NODE_STAGE_CONFIG" ]; then
+		kpanel_node_safe_regular_file "$KPANEL_NODE_STAGE_CONFIG" || return 1
+		actual_hash="$(sha256sum "$KPANEL_NODE_STAGE_CONFIG" | awk '{print $1}')"
+		[ "$actual_hash" = "$expected_hash" ] || return 1
+		if [ -e "$KPANEL_NODE_CONFIG" ] || [ -L "$KPANEL_NODE_CONFIG" ]; then
+			kpanel_node_safe_regular_file "$KPANEL_NODE_CONFIG" || return 1
+		fi
+		chown root:kejilion-node "$KPANEL_NODE_STAGE_CONFIG" || return 1
+		chmod 0640 "$KPANEL_NODE_STAGE_CONFIG" || return 1
+		mv -f -- "$KPANEL_NODE_STAGE_CONFIG" "$KPANEL_NODE_CONFIG" || return 1
+	else
+		kpanel_node_safe_regular_file "$KPANEL_NODE_CONFIG" || return 1
+		actual_hash="$(sha256sum "$KPANEL_NODE_CONFIG" | awk '{print $1}')"
+		[ "$actual_hash" = "$expected_hash" ] || return 1
+	fi
+	kpanel_node_safe_regular_file "$KPANEL_NODE_STAGE_TERMINAL_STATE" || return 1
+	IFS= read -r terminal_state <"$KPANEL_NODE_STAGE_TERMINAL_STATE" || return 1
+	case "$terminal_state" in
+		present)
+			if [ -e "$KPANEL_NODE_STAGE_TERMINAL" ] || [ -L "$KPANEL_NODE_STAGE_TERMINAL" ]; then
+				kpanel_node_safe_regular_file "$KPANEL_NODE_STAGE_TERMINAL" || return 1
+				if [ -e "$KPANEL_NODE_TERMINAL_CONFIG" ] || [ -L "$KPANEL_NODE_TERMINAL_CONFIG" ]; then
+					kpanel_node_safe_regular_file "$KPANEL_NODE_TERMINAL_CONFIG" || return 1
+				fi
+				chown root:root "$KPANEL_NODE_STAGE_TERMINAL" || return 1
+				chmod 0600 "$KPANEL_NODE_STAGE_TERMINAL" || return 1
+				mv -f -- "$KPANEL_NODE_STAGE_TERMINAL" "$KPANEL_NODE_TERMINAL_CONFIG" || return 1
+			else
+				kpanel_node_safe_regular_file "$KPANEL_NODE_TERMINAL_CONFIG" || return 1
+			fi
+			;;
+		absent)
+			if [ -e "$KPANEL_NODE_TERMINAL_CONFIG" ] || [ -L "$KPANEL_NODE_TERMINAL_CONFIG" ]; then
+				kpanel_node_safe_regular_file "$KPANEL_NODE_TERMINAL_CONFIG" || return 1
+				rm -f -- "$KPANEL_NODE_TERMINAL_CONFIG" || return 1
+			fi
+			;;
+		*) return 1 ;;
+	esac
+	kpanel_node_write_fingerprint "$fingerprint" || return 1
+	kpanel_node_clear_enrollment_stage
+}
+
+kpanel_node_stop_runtime() {
+	local service
+	for service in kejilion-node.service kejilion-node-terminal.service kejilion-node-ssh-login.service "$KPANEL_NODE_FILE_SERVICE"; do
+		"$KPANEL_NODE_SYSTEMCTL" stop "$service" >/dev/null 2>&1 || true
+	done
 }
 
 kpanel_node_activate() {
@@ -12050,7 +12447,19 @@ kpanel_node_activate() {
 
 kpanel_node_join() {
 	(
-	local token="${1:-}" node_name resume_enrollment=false update_mode=install
+	local token="${1:-}" node_name="" fingerprint="" saved_fingerprint="" staged_fingerprint="" update_mode=install
+	local enrollment_output="" node_id="" node_version=""
+	shift || true
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			--name)
+				[ "$#" -ge 2 ] && [ -n "$2" ] || { echo "轻量节点名称无效。" >&2; return 2; }
+				node_name="$2"
+				shift 2
+				;;
+			*) echo "轻量节点接入参数无效。" >&2; return 2 ;;
+		esac
+	done
 	kpanel_node_paths
 	kpanel_node_preflight || return 1
 	case "$token" in
@@ -12061,45 +12470,74 @@ kpanel_node_join() {
 		echo "轻量节点接入授权无效。" >&2
 		return 2
 	}
+	if [ -n "$node_name" ]; then
+		[ "${#node_name}" -le 80 ] && ! LC_ALL=C printf '%s' "$node_name" | grep -q '[[:cntrl:]]' || {
+			echo "轻量节点名称无效。" >&2
+			return 2
+		}
+	else
+		node_name="$(hostname 2>/dev/null | LC_ALL=C tr -cd '[:alnum:]_. -' | cut -c1-80)"
+	fi
 	kpanel_node_lock || return 1
 	if [ -e "$KPANEL_NODE_CONFIG" ]; then
 		if [ -f "$KPANEL_NODE_CONFIG" ] && [ ! -L "$KPANEL_NODE_CONFIG" ] && [ -x "$KPANEL_NODE_BINARY" ]; then
-			resume_enrollment=true
 			update_mode=update
-			echo "检测到已完成的节点授权，继续启用本机服务。"
 		else
 			echo "本机存在不完整的 KPanel 节点配置；请先执行 k kpanel node uninstall。" >&2
 			return 1
 		fi
 	fi
+	echo "正在接入 KPanel 轻量节点，请稍候..."
 	kpanel_node_ensure_account || return 1
 	"$KPANEL_NODE_INSTALL_BIN" -d -o root -g kejilion-node -m 0750 "$KPANEL_NODE_CONFIG_DIR" || return 1
-	if ! kpanel_node_write_updater || ! "$KPANEL_NODE_UPDATER" "$update_mode"; then
+	kpanel_node_validate_config_dir || {
+		echo "KPanel 节点配置目录不安全，拒绝继续。" >&2
+		return 1
+	}
+	if ! kpanel_node_write_updater || ! KPANEL_NODE_QUIET=1 "$KPANEL_NODE_UPDATER" "$update_mode"; then
 		# Preserve updater locks and migration identity; another updater may own
 		# them. The transactional updater already preserves the previous binary.
 		echo "KPanel 轻量节点安装未完成；请根据上面的提示处理后，再次执行接入命令。" >&2
 		return 1
 	fi
-	if [ "$resume_enrollment" != "true" ]; then
-		node_name="$(hostname 2>/dev/null | LC_ALL=C tr -cd '[:alnum:]_. -' | cut -c1-80)"
-		if ! "$KPANEL_NODE_BINARY" enroll --token "$token" --name "$node_name" --config "$KPANEL_NODE_CONFIG" --terminal-config "$KPANEL_NODE_TERMINAL_CONFIG"; then
-			kpanel_node_cleanup_failed_join
+	fingerprint="$(printf '%s' "$token" | sha256sum | awk '{print $1}')"
+	saved_fingerprint="$(kpanel_node_read_fingerprint "$KPANEL_NODE_ENROLLMENT_FINGERPRINT" 2>/dev/null || true)"
+	if [ "$saved_fingerprint" = "$fingerprint" ] && kpanel_node_safe_regular_file "$KPANEL_NODE_CONFIG"; then
+		kpanel_node_clear_enrollment_stage || return 1
+	else
+		kpanel_node_stage_paths
+		staged_fingerprint="$(kpanel_node_read_fingerprint "$KPANEL_NODE_STAGE_TOKEN" 2>/dev/null || true)"
+		if [ "$staged_fingerprint" != "$fingerprint" ]; then
+			kpanel_node_clear_enrollment_stage || {
+				echo "本机存在无法安全恢复的 KPanel 节点授权暂存；请检查 ${KPANEL_NODE_ENROLLMENT_STAGE}。" >&2
+				return 1
+			}
+			"$KPANEL_NODE_INSTALL_BIN" -d -o root -g root -m 0700 "$KPANEL_NODE_ENROLLMENT_STAGE" || return 1
+			printf '%s\n' "$fingerprint" >"$KPANEL_NODE_STAGE_TOKEN" || return 1
+			chmod 0600 "$KPANEL_NODE_STAGE_TOKEN" || return 1
+			if ! enrollment_output="$("$KPANEL_NODE_BINARY" enroll --token "$token" --name "$node_name" --config "$KPANEL_NODE_STAGE_CONFIG" --terminal-config "$KPANEL_NODE_STAGE_TERMINAL")"; then
+				if kpanel_node_safe_regular_file "$KPANEL_NODE_STAGE_CONFIG" && [ -s "$KPANEL_NODE_STAGE_CONFIG" ]; then
+					echo "新节点授权已取得但本地保存未完成，原有连接保持不变；再次执行同一条命令可继续。" >&2
+					return 1
+				fi
+				kpanel_node_clear_enrollment_stage || true
+				echo "新节点授权未生效，原有连接保持不变；请重新生成命令后重试。" >&2
+				return 1
+			fi
+			case "$enrollment_output" in
+				"KPanel lightweight node enrolled: "*)
+					node_id="${enrollment_output##*: }"
+					printf '%s' "$node_id" | grep -Eq '^[0-9a-f]{32}$' || node_id=""
+					;;
+			esac
+			kpanel_node_prepare_stage_manifest || return 1
+		fi
+		if ! kpanel_node_finalize_enrollment "$fingerprint"; then
+			echo "新节点授权已取得，但安全切换未完成；再次执行同一条命令可继续。" >&2
 			return 1
 		fi
 	fi
-	chown root:kejilion-node "$KPANEL_NODE_CONFIG" || {
-		echo "节点授权已保存，但配置权限修复失败；再次执行接入命令可继续。" >&2
-		return 1
-	}
-	chmod 0640 "$KPANEL_NODE_CONFIG"
-	if [ -e "$KPANEL_NODE_TERMINAL_CONFIG" ] || [ -L "$KPANEL_NODE_TERMINAL_CONFIG" ]; then
-		[ -f "$KPANEL_NODE_TERMINAL_CONFIG" ] && [ ! -L "$KPANEL_NODE_TERMINAL_CONFIG" ] || {
-			echo "终端身份配置不是普通文件，拒绝继续。" >&2
-			return 1
-		}
-		chown root:root "$KPANEL_NODE_TERMINAL_CONFIG" || return 1
-		chmod 0600 "$KPANEL_NODE_TERMINAL_CONFIG" || return 1
-	fi
+	kpanel_node_stop_runtime
 	if ! kpanel_node_write_units; then
 		echo "节点授权已保存，但 systemd 单元写入失败；再次执行接入命令可继续。" >&2
 		return 1
@@ -12108,7 +12546,13 @@ kpanel_node_join() {
 		echo "KPanel 轻量节点授权已保存，但服务启动失败；修复 systemd 后再次执行接入命令即可续装。" >&2
 		return 1
 	fi
-	echo "KPanel 轻量节点已接入，后续将自动更新。"
+	node_version="$("$KPANEL_NODE_BINARY" version 2>/dev/null | awk 'NR == 1 { print $1; exit }' || true)"
+	echo
+	echo "✓ KPanel 轻量节点接入成功"
+	[ -z "$node_id" ] || echo "  节点 ID：${node_id}"
+	[ -z "$node_version" ] || echo "  版本：${node_version}"
+	echo "  服务：运行中"
+	echo "  自动更新：已启用"
 	)
 }
 
@@ -12718,8 +13162,8 @@ docker_tato() {
 
 
 ldnmp_tato() {
-local cert_count=$(ls /home/web/certs/*_cert.pem 2>/dev/null | wc -l)
-local output="${gl_lv}${cert_count}${gl_bai}"
+local site_count=$(ldnmp_site_count)
+local output="${gl_lv}${site_count}${gl_bai}"
 
 local dbrootpasswd=$(grep -oP 'MYSQL_ROOT_PASSWORD:\s*\K.*' /home/web/docker-compose.yml 2>/dev/null | tr -d '[:space:]')
 if [ -n "$dbrootpasswd" ]; then
@@ -12756,10 +13200,177 @@ fix_phpfpm_conf() {
 
 
 
+KPANEL_WEB_HTTP_PROTOCOL_VERSION="1"
+
+kpanel_web_http_mode() {
+	[ "${KJ_WEB_NONINTERACTIVE:-0}" = "1" ] && [ "${KJ_WEB_HTTP_ACTIVE:-0}" = "1" ]
+}
+
+# Allow sharing a port with this Nginx, but never restart it into a port owned
+# by another service. A bridge mapping is already reserved by Docker.
+kpanel_web_http_port_available() {
+	local port="$1" mode listeners line pids pid owned
+	mode=$(docker inspect --format '{{.HostConfig.NetworkMode}}' nginx 2>/dev/null) || mode=""
+	if [ -n "$mode" ] && [ "$mode" != host ]; then
+		docker port nginx "$port/tcp" 2>/dev/null | grep -Eq ":${port}$" && return 0
+		echo "HTTP 端口 $port 尚未映射到 Nginx 容器。" >&2
+		return 1
+	fi
+	command -v ss >/dev/null 2>&1 || { echo '检查 HTTP 端口需要 ss（iproute2）。' >&2; return 1; }
+	listeners=$(ss -H -ltnp "sport = :$port") || return 1
+	[ -n "$listeners" ] || return 0
+	owned=$(docker top nginx -eo pid 2>/dev/null) || return 1
+	while IFS= read -r line; do
+		pids=$(printf '%s\n' "$line" | grep -oE 'pid=[0-9]+' | cut -d= -f2)
+		[ -n "$pids" ] || return 1
+		for pid in $pids; do
+			printf '%s\n' "$owned" | grep -Eq "^[[:space:]]*${pid}[[:space:]]*$" || {
+				echo "HTTP 端口 $port 已被其他服务占用。" >&2
+				return 1
+			}
+		done
+	done <<< "$listeners"
+}
+
+# Reload only sends a signal. Observe the socket in Nginx's network namespace
+# before reporting success, including bridge deployments.
+kpanel_web_http_wait_listener() {
+	local hex attempt sockets
+	printf -v hex '%04X' "$1"
+	for attempt in {1..30}; do
+		sockets=$(docker exec nginx cat /proc/net/tcp /proc/net/tcp6 2>/dev/null) || sockets=""
+		if printf '%s\n' "$sockets" | awk -v port="$hex" '$4 == "0A" && $2 ~ ":" port "$" {found=1} END {exit !found}'; then
+			return 0
+		fi
+		sleep 0.1
+	done
+	echo "Nginx 未能监听 HTTP 端口 $1。" >&2
+	return 1
+}
+
+# Only this explicit entry enables HTTP. The ordinary CLI and certificate paths
+# retain their defaults. The subshell contains every override and cleanup trap.
+kpanel_run_http_site() (
+	local http_port="${1:-}" command_name="${2:-}" domain="${3:-}" selector
+	[[ "$http_port" =~ ^[0-9]{1,5}$ ]] && ((10#$http_port >= 1 && 10#$http_port <= 65535)) || return 64
+	http_port=$((10#$http_port))
+	[[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]] || return 64
+	[ -z "${KJ_WEB_CERTIFICATE_FILE:-}${KJ_WEB_PRIVATE_KEY_FILE:-}" ] || return 64
+	case "$command_name" in
+		wp) selector=2 ;; discuz) selector=3 ;; kodbox) selector=4 ;;
+		maccms) selector=5 ;; dujiaoka) selector=6 ;; flarum) selector=7 ;;
+		typecho) selector=8 ;; linkstack) selector=9 ;; php-site) selector=20 ;;
+		redirect-site) selector=22 ;; fd) selector=23 ;; domain-proxy) selector=24 ;;
+		bitwarden-site) selector=25 ;; halo-site) selector=26 ;; ai-prompt) selector=27 ;;
+		loadbalance-site) selector=28 ;; static-site) selector=30 ;; *) return 64 ;;
+	esac
+	local KJ_WEB_NONINTERACTIVE=1 KJ_WEB_HTTP_ACTIVE=1 KJ_WEB_HTTP_PORT="$http_port"
+	local KJ_WEB_PROXY_HOST="" KJ_WEB_PROXY_PORT=""
+	if [ "$selector" = 23 ]; then
+		[ "$#" = 5 ] || return 64
+		KJ_WEB_PROXY_HOST="$4" KJ_WEB_PROXY_PORT="$5"
+	elif [ "$selector" = 22 ]; then
+		[ "$#" = 3 ] || [ "$#" = 4 ] || return 64
+	else
+		[ "$#" = 3 ] || return 64
+	fi
+	# Acquire the same environment lock before checking or creating any artifacts.
+	mkdir -p /run/lock || return 1
+	local http_lock_fd
+	exec {http_lock_fd}>/run/lock/kejilion-web-environment.lock || return 1
+	flock -n "$http_lock_fd" || return 75
+	[ ! -e "/home/web/conf.d/$domain.conf" ] && [ ! -L "/home/web/conf.d/$domain.conf" ] &&
+		[ ! -e "/home/web/html/$domain" ] && [ ! -L "/home/web/html/$domain" ] || return 1
+	kpanel_web_http_port_available "$http_port" || return 1
+	local http_complete=0 http_nginx_was_running
+	http_nginx_was_running=$(docker inspect --format '{{.State.Running}}' nginx 2>/dev/null) || http_nginx_was_running=false
+	trap 'if [ "$http_complete" != 1 ]; then
+		if [ -f "/home/web/conf.d/$domain.conf" ] && [ ! -L "/home/web/conf.d/$domain.conf" ]; then
+			rm -f -- "/home/web/conf.d/$domain.conf"
+		fi
+		if [ "$http_nginx_was_running" = true ] &&
+			[ "$(docker inspect --format "{{.State.Running}}" nginx 2>/dev/null)" != true ]; then
+			docker start nginx >/dev/null 2>&1 || echo "恢复原 Nginx 容器失败，请检查容器日志。" >&2
+		fi
+		docker exec nginx nginx -t >/dev/null 2>&1 && docker exec nginx nginx -s reload >/dev/null 2>&1 ||
+			echo "本次 HTTP 配置已撤回，原 Nginx 重载失败，请检查容器日志。" >&2
+	fi' EXIT
+	trap 'exit 130' INT
+	trap 'exit 143' TERM
+	local KJ_WEB_RECIPE="$selector" KJ_WEB_DOMAIN="$domain" KJ_WEB_REDIRECT_TARGET=""
+	if [ "$selector" = 22 ] && [ "$#" = 4 ]; then
+		KJ_WEB_REDIRECT_TARGET="${4,,}"
+		kpanel_web_redirect_target_valid "$KJ_WEB_REDIRECT_TARGET" &&
+			[ "$KJ_WEB_REDIRECT_TARGET" != "${domain,,}" ] || return 64
+	fi
+	linux_ldnmp || return $?
+	docker exec nginx nginx -t && docker exec nginx nginx -s reload || return 1
+	kpanel_web_http_wait_listener "$http_port" || return 1
+	kpanel_web_http_port_available "$http_port" || return 1
+	open_port "$http_port" || return 1
+	http_complete=1
+)
+
+# Transform the same official template used by the legacy path. Stage the
+# change and preserve the original on conversion failure; never rewrite imports.
+kpanel_web_http_config() (
+	local conf="/home/web/conf.d/${yuming}.conf" candidate mode
+	[ -f "$conf" ] && [ ! -L "$conf" ] || return 1
+	mode=$(docker inspect --format '{{.HostConfig.NetworkMode}}' nginx) || return 1
+	if [ "$mode" != host ]; then
+		docker port nginx "${KJ_WEB_HTTP_PORT}/tcp" 2>/dev/null | grep -Eq ":${KJ_WEB_HTTP_PORT}$" || {
+			echo "HTTP 端口 ${KJ_WEB_HTTP_PORT} 尚未映射到 Nginx 容器，请先配置相同端口映射。" >&2
+			return 1
+		}
+	fi
+	candidate=$(mktemp "${conf}.http.XXXXXX") || return 1
+	trap 'rm -f -- "$candidate"' EXIT
+	awk -v port="$KJ_WEB_HTTP_PORT" '
+		/^[[:space:]]*server[[:space:]]*\{/ {
+			servers++; print; print "    listen " port ";"; print "    listen [::]:" port ";"; next
+		}
+		/^[[:space:]]*if[[:space:]]*\(\$scheme = http\)[[:space:]]*\{/ { redirect=1; next }
+		redirect { if ($0 ~ /^[[:space:]]*}/) redirect=0; next }
+		/^[[:space:]]*(listen|ssl_[a-z_]+|http2|http3|quic_[a-z_]+)[[:space:]]/ { next }
+		/^[[:space:]]*add_header[[:space:]]+(Alt-Svc|Strict-Transport-Security)[[:space:]]/ { next }
+		{
+			sub(/fastcgi_param[[:space:]]+HTTPS[[:space:]]+on;/, "fastcgi_param HTTPS off;")
+			sub(/proxy_set_header[[:space:]]+Host[[:space:]]+\$host;/, "proxy_set_header Host $http_host;")
+			print
+		}
+		END { if (servers != 1 || redirect) exit 1 }
+	' "$conf" > "$candidate" || return 1
+	chmod "$(stat -c '%a' "$conf")" "$candidate" && mv -f -- "$candidate" "$conf"
+)
+
+
+KPANEL_WEB_REDIRECT_PROTOCOL_VERSION="1"
+
+kpanel_web_redirect_target_valid() {
+	local target="${1:-}" label
+	[ ${#target} -le 253 ] && [[ "$target" == *.* ]] || return 1
+	[[ "$target" =~ ^[a-zA-Z0-9.-]+$ ]] && [[ "$target" != *..* ]] || return 1
+	local -a labels
+	IFS=. read -r -a labels <<< "$target"
+	[[ "$target" != *. ]] || return 1
+	for label in "${labels[@]}"; do
+		[ ${#label} -le 63 ] && [[ "$label" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]] || return 1
+	done
+	[[ "${labels[-1]}" =~ [a-zA-Z] ]]
+}
+
 kpanel_run_web_recipe_cli() {
 	local selector="${1:-}"
 	local domain="${2:-}"
-	if [ "$#" -ne 2 ]; then
+	local KJ_WEB_REDIRECT_TARGET=""
+	if [ "$selector" = "22" ] && [ "$#" -eq 3 ]; then
+		KJ_WEB_REDIRECT_TARGET="${3,,}"
+		if ! kpanel_web_redirect_target_valid "$KJ_WEB_REDIRECT_TARGET" ||
+			[ "$KJ_WEB_REDIRECT_TARGET" = "${domain,,}" ]; then
+			echo "KPANEL_PROGRESS 100 跳转目标必须是不同于原域名的有效域名"
+			return 64
+		fi
+	elif [ "$#" -ne 2 ]; then
 		echo "用法: k <建站命令> <域名>"
 		return 64
 	fi
@@ -12857,7 +13468,7 @@ ldnmp_environment_status() {
 	[ -f /home/web/docker-compose.yml ] &&
 		docker compose -f /home/web/docker-compose.yml config -q >/dev/null 2>&1 && compose=true
 	docker exec nginx nginx -t >/dev/null 2>&1 && nginx_ok=true
-	[ -d /home/web/conf.d ] && sites=$(find /home/web/conf.d -maxdepth 1 -type f -name '*.conf' ! -name default.conf ! -name map.conf 2>/dev/null | wc -l)
+	sites=$(ldnmp_site_count)
 	[ -d /home/web/certs ] && certificates=$(find /home/web/certs -maxdepth 1 -type f -name '*_cert.pem' 2>/dev/null | wc -l)
 	if docker inspect mysql >/dev/null 2>&1; then
 		local password
@@ -13346,6 +13957,7 @@ linux_ldnmp() {
 	echo -e "${gl_huang}------------------------"
 	echo -e "${gl_huang}31.  ${gl_bai}站点数据管理 ${gl_huang}★${gl_bai}                    ${gl_huang}32.  ${gl_bai}备份全站数据"
 	echo -e "${gl_huang}33.  ${gl_bai}定时远程备份                      ${gl_huang}34.  ${gl_bai}还原全站数据"
+	echo "k. 通用加密备份与恢复 (.kpb，与 KPanel 互通)"
 	echo -e "${gl_huang}------------------------"
 	echo -e "${gl_huang}35.  ${gl_bai}防护LDNMP环境                     ${gl_huang}36.  ${gl_bai}优化LDNMP环境"
 	echo -e "${gl_huang}37.  ${gl_bai}更新LDNMP环境                     ${gl_huang}38.  ${gl_bai}卸载LDNMP环境"
@@ -13881,23 +14493,32 @@ linux_ldnmp() {
 	  webname="站点重定向"
 	  send_stats "安装$webname"
 	  echo "开始部署 $webname"
-	  add_yuming
-	  read -e -p "请输入跳转域名: " reverseproxy
-	  nginx_install_status
+	  add_yuming || return 1
+	  reverseproxy="${KJ_WEB_REDIRECT_TARGET:-}"
+	  if [ -z "$reverseproxy" ]; then
+		read -e -p "请输入跳转域名: " reverseproxy || return 1
+	  fi
+	  nginx_install_status || return 1
 
 
 
-	  install_ssltls
-	  certs_status
+	  if ! install_ssltls; then
+		# Preserve the script's retry/import dialog after issuance failure. A
+		# failure with an available pair (for example nginx start) must stop.
+		if kpanel_web_certificate_available; then return 1; fi
+	  fi
+	  certs_status || return 1
+	  if ! kpanel_web_http_mode; then kpanel_web_certificate_available || return 1; fi
 
 
-	  wget -O /home/web/conf.d/$yuming.conf ${gh_proxy}raw.githubusercontent.com/kejilion/nginx/main/rewrite.conf
-	  sed -i "s/yuming.com/$yuming/g" /home/web/conf.d/$yuming.conf
-	  sed -i "s/baidu.com/$reverseproxy/g" /home/web/conf.d/$yuming.conf
+	  wget -O /home/web/conf.d/$yuming.conf ${gh_proxy}raw.githubusercontent.com/kejilion/nginx/main/rewrite.conf || return 1
+	  sed -i "s/yuming.com/$yuming/g" /home/web/conf.d/$yuming.conf || return 1
+	  sed -i "s/baidu.com/$reverseproxy/g" /home/web/conf.d/$yuming.conf || return 1
 
 	  nginx_http_on
 
-	  docker exec nginx nginx -s reload
+	  docker exec nginx nginx -t || return 1
+	  docker exec nginx nginx -s reload || return 1
 
 	  nginx_web_on
 
@@ -13913,7 +14534,7 @@ linux_ldnmp() {
 	  else
 	  	ip_address
 		close_port "$port"
-		block_container_port "$docker_name" "$ipv4_address"
+		block_container_port "$docker_name" "$ipv4_address" || return 1
 	  fi
 
 		;;
@@ -14161,6 +14782,9 @@ linux_ldnmp() {
 
 	  ;;
 
+	k)
+	  kpanel_backup_center_dispatch menu web
+	  ;;
 	34)
 	  root_use
 	  send_stats "LDNMP环境还原"
@@ -14883,7 +15507,7 @@ PY
 		npm install -g openclaw@latest
 		openclaw onboard --install-daemon
 		start_gateway
-		add_app_id
+		add_app_id || return 1
 		break_end
 
 	}
@@ -19677,7 +20301,7 @@ openclaw_backup_restore_menu() {
 		crontab -l 2>/dev/null | grep -v "s gateway" | crontab -
 		start_gateway
 		hash -r
-		add_app_id
+		add_app_id || return 1
 		echo "更新完成"
 		break_end
 	}
@@ -19692,7 +20316,7 @@ openclaw_backup_restore_menu() {
 		rm -rf "$HOME/.openclaw"
 		[ "$HOME" != "/root" ] && [ -d /root/.openclaw ] && echo "⚠️ 检测到 root 目录下仍存在 /root/.openclaw，如需清理请手动处理"
 		hash -r
-		sed -i "/\b${app_id}\b/d" /home/docker/appno.txt
+		remove_app_id || return 1
 		echo "卸载完成"
 		break_end
 	}
@@ -19886,7 +20510,23 @@ openclaw_backup_restore_menu() {
 
 
 
+kpanel_app_source_config() {
+	local custom_app="$1" snapshot result
+	snapshot=$(mktemp "${TMPDIR:-/tmp}/kpanel-app.XXXXXX") || return 1
+	if ! kpanel_app_with_lock catalog cp -- "$custom_app" "$snapshot"; then
+		rm -f -- "$snapshot"
+		return 1
+	fi
+	# Keep the menu on its PTY; only snapshot creation holds the catalog lock.
+	if . "$snapshot"; then result=0; else result=$?; fi
+	rm -f -- "$snapshot"
+	return "$result"
+}
+
 refresh_apps_catalog() {
+	if [ "${KJ_APP_CONCURRENCY:-}" = "1" ] && ! kpanel_app_lock_held catalog; then
+		kpanel_app_with_lock catalog refresh_apps_catalog "$@"; return $?
+	fi
 	local apps_dir="$HOME/apps"
 	local apps_remote="${gh_proxy}github.com/kejilion/apps.git"
 
@@ -20031,6 +20671,7 @@ while true; do
 
 	  echo -e "${gl_kjlan}-------------------------"
 	  echo -e "${gl_kjlan}b.   ${gl_bai}备份全部应用数据                    ${gl_kjlan}r.   ${gl_bai}还原全部应用数据"
+	  echo "k. 通用加密备份与恢复 (.kpb，与 KPanel 互通)"
 	  echo -e "${gl_kjlan}------------------------"
 	  echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
 	  echo -e "${gl_kjlan}------------------------${gl_bai}"
@@ -20373,7 +21014,7 @@ while true; do
 						-d analogic/poste.io
 
 
-					add_app_id
+					add_app_id || return 1
 
 					clear
 					echo "poste.io已经安装完成"
@@ -20398,7 +21039,7 @@ while true; do
 						-d analogic/poste.i
 
 
-					add_app_id
+					add_app_id || return 1
 
 					clear
 					echo "poste.io已经安装完成"
@@ -20413,7 +21054,7 @@ while true; do
 					rm /home/docker/mail.txt
 					rm -rf /home/docker/mail
 
-					sed -i "/\b${app_id}\b/d" /home/docker/appno.txt
+					remove_app_id || return 1
 					echo "应用已卸载"
 					;;
 
@@ -20740,7 +21381,7 @@ while true; do
 					check_disk_space 5
 					bash -c "$(curl -fsSLk https://waf-ce.chaitin.cn/release/latest/setup.sh)"
 
-					add_app_id
+					add_app_id || return 1
 					clear
 					echo "雷池WAF面板已经安装完成"
 					check_docker_app_ip
@@ -20753,7 +21394,7 @@ while true; do
 					docker rmi $(docker images | grep "safeline" | grep "none" | awk '{print $3}')
 					echo ""
 
-					add_app_id
+					add_app_id || return 1
 					clear
 					echo "雷池WAF面板已经更新完成"
 					check_docker_app_ip
@@ -20765,7 +21406,7 @@ while true; do
 					cd /data/safeline
 					docker compose down --rmi all
 
-					sed -i "/\b${app_id}\b/d" /home/docker/appno.txt
+					remove_app_id || return 1
 					echo "如果你是默认安装目录那现在项目已经卸载。如果你是自定义安装目录你需要到安装目录下自行执行:"
 					echo "docker compose down && docker compose down --rmi all"
 					;;
@@ -21905,7 +22546,7 @@ while true; do
 			  docker.n8n.io/n8nio/n8n
 
 			ldnmp_Proxy ${yuming} 127.0.0.1 ${docker_port}
-			block_container_port "$docker_name" "$ipv4_address"
+			block_container_port "$docker_name" "$ipv4_address" || return 1
 
 		}
 
@@ -22756,7 +23397,7 @@ while true; do
 			docker restart matrix
 
 			ldnmp_Proxy ${yuming} 127.0.0.1 ${docker_port}
-			block_container_port "$docker_name" "$ipv4_address"
+			block_container_port "$docker_name" "$ipv4_address" || return 1
 
 		}
 
@@ -22984,7 +23625,7 @@ while true; do
 			docker compose up -d
 
 			ldnmp_Proxy ${yuming} 127.0.0.1 ${docker_port}
-			block_container_port "$docker_name" "$ipv4_address"
+			block_container_port "$docker_name" "$ipv4_address" || return 1
 
 			clear
 			echo "已经安装完成"
@@ -23749,6 +24390,9 @@ discourse,yunsou,ahhhhfs,nsgame,gying" \
 
 		  ;;
 
+	  k)
+		kpanel_backup_center_dispatch menu apps
+		;;
 	  b)
 	  	clear
 	  	send_stats "全部应用备份"
@@ -23822,17 +24466,22 @@ discourse,yunsou,ahhhhfs,nsgame,gying" \
 		refresh_apps_catalog || return 1
 		local custom_app="$HOME/apps/${sub_choice}.conf"
 		if [ -f "$custom_app" ]; then
-			. "$custom_app"
+			if [ "${KJ_APP_CONCURRENCY:-}" = "1" ]; then
+				kpanel_app_source_config "$custom_app"
+			else
+				. "$custom_app"
+			fi
 		else
 			echo -e "${gl_hong}错误: 未找到编号为 ${sub_choice} 的应用配置${gl_bai}"
 		fi
 		  ;;
 	esac
+	local app_action_status=$?
 	if [ "${KJ_APP_NONINTERACTIVE:-}" = "1" ]; then
-		return
+		return "$app_action_status"
 	fi
 	if [ "${KJ_APP_INTERACTIVE:-}" = "1" ]; then
-		return
+		return "$app_action_status"
 	fi
 	break_end
 	sub_choice=""
@@ -31387,12 +32036,30 @@ echo "SSH公钥导入(GitHub) k sshkey github <user> "
 
 
 
+# Versioned shared backup adapter. No downloaded helper or caller-supplied path.
+kpanel_backup_center_dispatch() {
+    local binary="/usr/local/libexec/kejilion-agent" metadata owner mode protocol
+    [ "$(id -u)" = "0" ] || { echo "备份适配器需要 root" >&2; return 1; }
+    [ -f "$binary" ] && [ -x "$binary" ] && [ ! -L "$binary" ] || { echo "缺少 KPanel 备份适配器，请安装匹配版本的 Agent" >&2; return 1; }
+    metadata=$(stat -c '%u %a' "$binary") || return 1
+    read -r owner mode <<< "$metadata"
+    [[ "$owner" = "0" && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    (( (8#$mode & 0022) == 0 )) || { echo "备份适配器权限无效" >&2; return 1; }
+    protocol=$("$binary" backup-center protocol) || return 1
+    [ "$protocol" = '{"protocol":1,"format":1}' ] || { echo "备份适配器协议不兼容" >&2; return 1; }
+    "$binary" backup-center "$@"
+}
+
 if [ "$#" -eq 0 ]; then
 	# 如果没有参数，运行交互式逻辑
 	kejilion_sh
 else
 	# 如果有参数，执行相应函数
 	case $1 in
+		backup-center)
+			shift
+			kpanel_backup_center_dispatch "$@"
+			;;
 		install|add|安装)
 			shift
 			send_stats "安装软件"
@@ -31447,6 +32114,10 @@ else
 			disk_manager
 			;;
 
+		http-site)
+			shift
+			kpanel_run_http_site "$@"
+			;;
 		wp|wordpress)
 			shift
 			ldnmp_wp "$@"
@@ -31522,7 +32193,7 @@ else
 	  		else
 			  ip_address
 			  close_port "$port"
-	  		  block_container_port "$docker_name" "$ipv4_address"
+			block_container_port "$docker_name" "$ipv4_address" || return 1
 	  		fi
 			;;
 
