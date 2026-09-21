@@ -1,5 +1,5 @@
 #!/bin/bash
-sh_v="4.5.8"
+sh_v="4.5.10"
 
 
 gl_hui='\e[37m'
@@ -95,6 +95,7 @@ kpanel_protocol_active() {
 	[ "${KJ_ACCOUNT_MANAGEMENT_NONINTERACTIVE:-}" = "1" ] ||
 	[ "${KJ_F2B_NONINTERACTIVE:-}" = "1" ] ||
 	[ "${KJ_SYSTEM_TUNING_NONINTERACTIVE:-}" = "1" ] ||
+	[ "${KJ_VIRUS_SCAN_NONINTERACTIVE:-}" = "1" ] ||
 	[ "${KJ_BBRV3_NONINTERACTIVE:-}" = "1" ] ||
 	[ "${KJ_APP_NONINTERACTIVE:-}" = "1" ] ||
 	[ "${KJ_APP_INTERACTIVE:-}" = "1" ] ||
@@ -933,20 +934,34 @@ docker_ipv6_off() {
 
 
 
+ip6tables_available() {
+	command -v ip6tables >/dev/null 2>&1 && ip6tables -L >/dev/null 2>&1
+}
+
 save_iptables_rules() {
 	if [ "${KJ_APP_CONCURRENCY:-}" = "1" ] && ! kpanel_app_lock_held system; then
 		kpanel_app_with_lock system save_iptables_rules "$@"; return $?
 	fi
 	mkdir -p /etc/iptables
-	local rules_temp
+	local rules_temp rules6_temp
 	rules_temp=$(mktemp /etc/iptables/.rules.v4.XXXXXX) || return 1
+	ip6tables_available && rules6_temp=$(mktemp /etc/iptables/.rules.v6.XXXXXX)
 	if ! iptables-save > "$rules_temp" || ! mv -f -- "$rules_temp" /etc/iptables/rules.v4; then
-		rm -f -- "$rules_temp"
+		rm -f -- "$rules_temp" "$rules6_temp"
 		return 1
 	fi
+	if [ -n "${rules6_temp:-}" ]; then
+		if ! ip6tables-save > "$rules6_temp" || ! mv -f -- "$rules6_temp" /etc/iptables/rules.v6; then
+			rm -f -- "$rules6_temp"
+			return 1
+		fi
+	fi
 	check_crontab_installed || return 1
-	crontab -l | grep -v 'iptables-restore' | crontab - > /dev/null 2>&1 || return 1
+	crontab -l | grep -v 'iptables-restore' | grep -v 'ip6tables-restore' | crontab - > /dev/null 2>&1 || return 1
 	(crontab -l ; echo '@reboot iptables-restore < /etc/iptables/rules.v4') | crontab - > /dev/null 2>&1 || return 1
+	if [ -n "${rules6_temp:-}" ]; then
+		(crontab -l ; echo '@reboot ip6tables-restore < /etc/iptables/rules.v6') | crontab - > /dev/null 2>&1 || return 1
+	fi
 
 }
 
@@ -984,6 +999,8 @@ open_port() {
 	fi
 
 	install iptables || return 1
+	local ipv6_ready=false
+	ip6tables_available && ipv6_ready=true
 
 	for port in "${ports[@]}"; do
 		# 删除已存在的关闭规则
@@ -1001,6 +1018,21 @@ open_port() {
 		fi
 	done
 
+	if [ "$ipv6_ready" = true ]; then
+		for port in "${ports[@]}"; do
+			ip6tables -D INPUT -p tcp --dport $port -j DROP 2>/dev/null
+			ip6tables -D INPUT -p udp --dport $port -j DROP 2>/dev/null
+
+			if ! ip6tables -C INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null; then
+				ip6tables -I INPUT 1 -p tcp --dport $port -j ACCEPT || return 1
+			fi
+
+			if ! ip6tables -C INPUT -p udp --dport $port -j ACCEPT 2>/dev/null; then
+				ip6tables -I INPUT 1 -p udp --dport $port -j ACCEPT || return 1
+			fi
+		done
+	fi
+
 	save_iptables_rules || return 1
 	send_stats "已打开端口"
 }
@@ -1017,6 +1049,8 @@ close_port() {
 	fi
 
 	install iptables || return 1
+	local ipv6_ready=false
+	ip6tables_available && ipv6_ready=true
 
 	for port in "${ports[@]}"; do
 		# 删除已存在的打开规则
@@ -1033,6 +1067,29 @@ close_port() {
 			echo "已关闭端口 $port"
 		fi
 	done
+
+	if [ "$ipv6_ready" = true ]; then
+		for port in "${ports[@]}"; do
+			ip6tables -D INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null
+			ip6tables -D INPUT -p udp --dport $port -j ACCEPT 2>/dev/null
+
+			if ! ip6tables -C INPUT -p tcp --dport $port -j DROP 2>/dev/null; then
+				ip6tables -I INPUT 1 -p tcp --dport $port -j DROP || return 1
+			fi
+
+			if ! ip6tables -C INPUT -p udp --dport $port -j DROP 2>/dev/null; then
+				ip6tables -I INPUT 1 -p udp --dport $port -j DROP || return 1
+			fi
+		done
+
+		# 删除已存在的规则（如果有）
+		ip6tables -D INPUT -i lo -j ACCEPT 2>/dev/null
+		ip6tables -D FORWARD -i lo -j ACCEPT 2>/dev/null
+
+		# 插入新规则到第一条
+		ip6tables -I INPUT 1 -i lo -j ACCEPT || return 1
+		ip6tables -I FORWARD 1 -i lo -j ACCEPT || return 1
+	fi
 
 	# 删除已存在的规则（如果有）
 	iptables -D INPUT -i lo -j ACCEPT 2>/dev/null
@@ -1269,6 +1326,20 @@ iptables_panel() {
 				  iptables -A FORWARD -i lo -j ACCEPT
 				  iptables -A INPUT -p tcp --dport $current_port -j ACCEPT
 				  iptables-save > /etc/iptables/rules.v4
+				  if ip6tables_available; then
+					  ip6tables -F
+					  ip6tables -X
+					  ip6tables -P INPUT ACCEPT
+					  ip6tables -P FORWARD ACCEPT
+					  ip6tables -P OUTPUT ACCEPT
+					  ip6tables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+					  ip6tables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+					  ip6tables -A INPUT -i lo -j ACCEPT
+					  ip6tables -A FORWARD -i lo -j ACCEPT
+					  ip6tables -A INPUT -p tcp --dport $current_port -j ACCEPT
+					  ip6tables-save > /etc/iptables/rules.v6
+				  fi
+				  save_iptables_rules
 				  send_stats "开放所有端口"
 				  ;;
 			  4)
@@ -1285,6 +1356,20 @@ iptables_panel() {
 				  iptables -A FORWARD -i lo -j ACCEPT
 				  iptables -A INPUT -p tcp --dport $current_port -j ACCEPT
 				  iptables-save > /etc/iptables/rules.v4
+				  if ip6tables_available; then
+					  ip6tables -F
+					  ip6tables -X
+					  ip6tables -P INPUT DROP
+					  ip6tables -P FORWARD DROP
+					  ip6tables -P OUTPUT ACCEPT
+					  ip6tables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+					  ip6tables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+					  ip6tables -A INPUT -i lo -j ACCEPT
+					  ip6tables -A FORWARD -i lo -j ACCEPT
+					  ip6tables -A INPUT -p tcp --dport $current_port -j ACCEPT
+					  ip6tables-save > /etc/iptables/rules.v6
+				  fi
+				  save_iptables_rules
 				  send_stats "关闭所有端口"
 				  ;;
 
@@ -4284,7 +4369,13 @@ f2b_install_sshd() {
 		/bin/systemctl enable --now fail2ban.service || return 1
 	fi
 	fail2ban-client -t >/dev/null 2>&1 || return 1
-	fail2ban-client reload >/dev/null 2>&1 || /bin/systemctl restart fail2ban.service
+	if ! fail2ban-client reload >/dev/null 2>&1; then
+		if command -v apk >/dev/null 2>&1; then
+			rc-service fail2ban restart || return 1
+		else
+			/bin/systemctl restart fail2ban.service || return 1
+		fi
+	fi
 
 }
 
@@ -5014,8 +5105,11 @@ kpanel_system_tuning_prepare_ssh_service() {
 		else
 			"$systemctl_bin" enable --now sshd.service >/dev/null 2>&1 || return 1
 		fi
-	elif command -v rc-service >/dev/null 2>&1; then
+	elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
+		rc-update add sshd default >/dev/null 2>&1 || return 1
 		rc-service sshd start >/dev/null 2>&1 || return 1
+	else
+		return 1
 	fi
 }
 
@@ -8832,6 +8926,37 @@ elrepo() {
 
 
 
+KPANEL_VIRUS_SCAN_PROTOCOL_VERSION="1"
+
+kpanel_virus_scan_emit() {
+	local status="$1" mode="${2:-}" report="/home/docker/clamav/log/scan.log"
+	local scanned=0 infected=0 errors=0
+	if [ -f "$report" ] && [ ! -L "$report" ]; then
+		scanned="$(awk -F: '/^Scanned files:/ { gsub(/^[[:space:]]+/, "", $2); value=$2 } END { print value+0 }' "$report" 2>/dev/null)"
+		infected="$(awk -F: '/^Infected files:/ { gsub(/^[[:space:]]+/, "", $2); value=$2 } END { print value+0 }' "$report" 2>/dev/null)"
+		errors="$(awk -F: '/^Total errors:/ { gsub(/^[[:space:]]+/, "", $2); value=$2 } END { print value+0 }' "$report" 2>/dev/null)"
+	fi
+	printf '%s\n' \
+		"KPANEL_VIRUS_SCAN_PROTOCOL $KPANEL_VIRUS_SCAN_PROTOCOL_VERSION" \
+		"KPANEL_VIRUS_SCAN_STATUS=$status" \
+		"KPANEL_VIRUS_SCAN_MODE=$mode" \
+		"KPANEL_VIRUS_SCAN_SCANNED=$scanned" \
+		"KPANEL_VIRUS_SCAN_INFECTED=$infected" \
+		"KPANEL_VIRUS_SCAN_ERRORS=$errors" \
+		"KPANEL_VIRUS_SCAN_REPORT=$report"
+}
+
+kpanel_virus_scan_prepare_log() {
+	local root="/home/docker/clamav" log_dir
+	log_dir="$root/log"
+	[ ! -L "$root" ] && { [ ! -e "$root" ] || [ -d "$root" ]; } || return 1
+	[ ! -L "$log_dir" ] && { [ ! -e "$log_dir" ] || [ -d "$log_dir" ]; } || return 1
+	install -d -m 700 "$log_dir" || return 1
+	[ ! -L "$log_dir/scan.log" ] && { [ ! -e "$log_dir/scan.log" ] || [ -f "$log_dir/scan.log" ]; } || return 1
+	: > "$log_dir/scan.log" || return 1
+	chmod 600 "$log_dir/scan.log" || return 1
+}
+
 clamav_freshclam() {
 	echo -e "${gl_kjlan}正在更新病毒库...${gl_bai}"
 	docker run --rm \
@@ -8839,6 +8964,101 @@ clamav_freshclam() {
 		--mount source=clam_db,target=/var/lib/clamav \
 		clamav/clamav-debian:latest \
 		freshclam
+}
+
+kpanel_virus_scan_update_db() {
+	docker volume create clam_db >/dev/null || return 1
+	docker run --rm \
+		--name "kpanel-clamav-update-$$" \
+		--mount source=clam_db,target=/var/lib/clamav,volume-nocopy \
+		--security-opt no-new-privileges \
+		--cap-drop ALL \
+		--cap-add SETUID \
+		--cap-add SETGID \
+		--pids-limit 256 \
+		--tmpfs /var/log/clamav:rw,noexec,nosuid,nodev,size=16m,mode=0750 \
+		--entrypoint freshclam \
+		clamav/clamav-debian:latest \
+		--user root
+}
+
+kpanel_virus_scan_valid_path() {
+	local path="$1"
+	[[ "$path" == /* ]] || return 1
+	[[ "$path" != *','* && "$path" != *[[:cntrl:]]* ]] || return 1
+	if [ "$path" != / ]; then
+		[[ "$path" != */ && "$path" != *'//'* && "$path" != *'/./'* && "$path" != *'/../'* && "$path" != */. && "$path" != */.. ]] || return 1
+	fi
+	[ -d "$path" ]
+}
+
+kpanel_virus_scan_run() {
+	local mode="$1" rc status index=0 path
+	shift
+	local -a paths=() mounts=() targets=()
+	local -A seen_paths=()
+	case "$mode" in
+		full) [ "$#" -eq 0 ] || return 2; paths=(/) ;;
+		important) [ "$#" -eq 0 ] || return 2; paths=(/etc /var /usr /home /root) ;;
+		custom) [ "$#" -ge 1 ] && [ "$#" -le 8 ] || return 2; paths=("$@") ;;
+		*) return 2 ;;
+	esac
+	for path in "${paths[@]}"; do
+		kpanel_virus_scan_valid_path "$path" || return 2
+		[ -z "${seen_paths[$path]:-}" ] || return 2
+		seen_paths["$path"]=1
+		mounts+=(--mount "type=bind,source=$path,target=/mnt/scan/$index,readonly")
+		targets+=("/mnt/scan/$index")
+		index=$((index + 1))
+	done
+	kpanel_virus_scan_prepare_log || return 1
+	docker volume create clam_db >/dev/null || return 1
+	docker run --rm \
+		--name "kpanel-clamav-scan-$$" \
+		--network none \
+		--read-only \
+		--security-opt no-new-privileges \
+		--cap-drop ALL \
+		--pids-limit 256 \
+		--mount source=clam_db,target=/var/lib/clamav,readonly \
+		"${mounts[@]}" \
+		--mount type=bind,source=/home/docker/clamav/log,target=/var/log/clamav \
+		--tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
+		--entrypoint clamscan \
+		clamav/clamav-debian:latest \
+		-r --infected --log=/var/log/clamav/scan.log "${targets[@]}"
+	rc=$?
+	case "$rc" in
+		0) status=clean ;;
+		1) status=infected ;;
+		*) kpanel_virus_scan_emit failed "$mode"; return "$rc" ;;
+	esac
+	kpanel_virus_scan_emit "$status" "$mode"
+}
+
+kpanel_virus_scan_dispatch() {
+	local action="${1:-probe}" lock_file
+	shift || true
+	[ "${KJ_VIRUS_SCAN_NONINTERACTIVE:-}" = "1" ] || { echo "KPanel virus-scan 协议环境未启用" >&2; return 2; }
+	[ "$EUID" -eq 0 ] || { echo "KPanel virus-scan 协议必须以 root 运行" >&2; return 1; }
+	[ "$(uname -s)" = Linux ] || { echo "KPanel virus-scan 协议仅支持 Linux" >&2; return 1; }
+	command -v docker >/dev/null 2>&1 || { echo "Docker 不可用" >&2; return 1; }
+	case "$action" in
+		probe) [ "$#" -eq 0 ] || return 2; kpanel_virus_scan_emit ready; return 0 ;;
+		update-db) [ "$#" -eq 0 ] || return 2 ;;
+		scan) [ "$#" -ge 1 ] || return 2 ;;
+		*) echo "用法: k kpanel virus-scan <probe|update-db|scan mode [paths...]>" >&2; return 2 ;;
+	esac
+	lock_file="/var/lock/kejilion-virus-scan.lock"
+	install -d -m 755 /var/lock || return 1
+	[ ! -L "$lock_file" ] || return 1
+	exec 9>"$lock_file" || return 1
+	flock -w 5 9 || { echo "病毒扫描任务正在运行" >&2; return 2; }
+	if [ "$action" = update-db ]; then
+		if kpanel_virus_scan_update_db; then kpanel_virus_scan_emit updated; else kpanel_virus_scan_emit failed; return 1; fi
+	else
+		kpanel_virus_scan_run "$@"
+	fi
 }
 
 clamav_scan() {
@@ -11596,7 +11816,10 @@ kpanel_node_paths() {
 	KPANEL_NODE_BINARY="${KPANEL_NODE_HOME}/kejilion-node"
 	KPANEL_NODE_UPDATER="${KPANEL_NODE_HOME}/update.sh"
 	KPANEL_NODE_FILE_SERVICE="kejilion-node-file.service"
-	KPANEL_NODE_SSH_LOGIN_SERVICE="/etc/systemd/system/kejilion-node-ssh-login.service"
+	KPANEL_NODE_SYSTEMD_DIR="/etc/systemd/system"
+	KPANEL_NODE_OPENRC_DIR="/etc/init.d"
+	KPANEL_NODE_UPDATE_PERIODIC="/etc/periodic/hourly/kejilion-node-update"
+	KPANEL_NODE_SSH_LOGIN_SERVICE="${KPANEL_NODE_SYSTEMD_DIR}/kejilion-node-ssh-login.service"
 	KPANEL_NODE_SSH_LOGIN_RUNTIME="/run/kejilion-node-ssh"
 	KPANEL_NODE_SSH_LOGIN_EVENT="${KPANEL_NODE_SSH_LOGIN_RUNTIME}/ssh-login.json"
 	KPANEL_NODE_CONFIG_DIR="/etc/kejilion-node"
@@ -11605,6 +11828,100 @@ kpanel_node_paths() {
 	KPANEL_NODE_ENROLLMENT_FINGERPRINT="${KPANEL_NODE_CONFIG_DIR}/enrollment-token.sha256"
 	KPANEL_NODE_ENROLLMENT_STAGE="${KPANEL_NODE_CONFIG_DIR}/.enrollment-stage"
 	KPANEL_NODE_SYSTEMCTL="$(type -P systemctl 2>/dev/null || true)"
+	KPANEL_NODE_RC_SERVICE="$(type -P rc-service 2>/dev/null || true)"
+	KPANEL_NODE_RC_UPDATE="$(type -P rc-update 2>/dev/null || true)"
+	KPANEL_NODE_SUPERVISE_DAEMON="$(type -P supervise-daemon 2>/dev/null || true)"
+	KPANEL_NODE_INIT_SYSTEM=""
+}
+
+kpanel_node_detect_init_system() {
+	if [ -d /run/systemd/system ] && [ -n "$KPANEL_NODE_SYSTEMCTL" ] && [ -x "$KPANEL_NODE_SYSTEMCTL" ]; then
+		KPANEL_NODE_INIT_SYSTEM=systemd
+		KPANEL_NODE_SSH_LOGIN_SERVICE="${KPANEL_NODE_SYSTEMD_DIR}/kejilion-node-ssh-login.service"
+		return 0
+	fi
+	if [ -d /run/openrc ] && [ -n "$KPANEL_NODE_RC_SERVICE" ] && [ -x "$KPANEL_NODE_RC_SERVICE" ] &&
+		[ -n "$KPANEL_NODE_RC_UPDATE" ] && [ -x "$KPANEL_NODE_RC_UPDATE" ] &&
+		[ -n "$KPANEL_NODE_SUPERVISE_DAEMON" ] && [ -x "$KPANEL_NODE_SUPERVISE_DAEMON" ] &&
+		command -v logger >/dev/null 2>&1; then
+		KPANEL_NODE_INIT_SYSTEM=openrc
+		KPANEL_NODE_SSH_LOGIN_SERVICE="${KPANEL_NODE_OPENRC_DIR}/kejilion-node-ssh-login"
+		return 0
+	fi
+	echo "当前系统需要运行 systemd 或 OpenRC，无法安装 KPanel 轻量节点。" >&2
+	return 1
+}
+
+kpanel_node_service_name() {
+	case "$KPANEL_NODE_INIT_SYSTEM" in
+		openrc) printf '%s\n' "${1%.service}" ;;
+		*) printf '%s\n' "$1" ;;
+	esac
+}
+
+kpanel_node_service_exists() {
+	local service
+	service="$(kpanel_node_service_name "$1")" || return 1
+	case "$KPANEL_NODE_INIT_SYSTEM" in
+		systemd) "$KPANEL_NODE_SYSTEMCTL" cat "$service" >/dev/null 2>&1 ;;
+		openrc) [ -f "${KPANEL_NODE_OPENRC_DIR}/${service}" ] && [ ! -L "${KPANEL_NODE_OPENRC_DIR}/${service}" ] && [ -x "${KPANEL_NODE_OPENRC_DIR}/${service}" ] ;;
+		*) return 1 ;;
+	esac
+}
+
+kpanel_node_service_action() {
+	local action="$1" service
+	service="$(kpanel_node_service_name "$2")" || return 1
+	case "$KPANEL_NODE_INIT_SYSTEM" in
+		systemd) "$KPANEL_NODE_SYSTEMCTL" "$action" "$service" ;;
+		openrc)
+			case "$action" in
+				enable) "$KPANEL_NODE_RC_UPDATE" add "$service" default ;;
+				disable) "$KPANEL_NODE_RC_UPDATE" del "$service" default ;;
+				start|stop|restart|status) "$KPANEL_NODE_RC_SERVICE" "$service" "$action" ;;
+				is-active) "$KPANEL_NODE_RC_SERVICE" "$service" status >/dev/null 2>&1 ;;
+				*) return 2 ;;
+			esac
+			;;
+		*) return 1 ;;
+	esac
+}
+
+kpanel_node_service_reload_manager() {
+	case "$KPANEL_NODE_INIT_SYSTEM" in
+		systemd) "$KPANEL_NODE_SYSTEMCTL" daemon-reload ;;
+		openrc) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+kpanel_node_update_schedule_enable() {
+	case "$KPANEL_NODE_INIT_SYSTEM" in
+		systemd) kpanel_node_service_action enable kejilion-node-update.timer ;;
+		openrc)
+			[ -f "$KPANEL_NODE_UPDATE_PERIODIC" ] && [ ! -L "$KPANEL_NODE_UPDATE_PERIODIC" ] && [ -x "$KPANEL_NODE_UPDATE_PERIODIC" ] || return 1
+			kpanel_node_service_action enable crond
+			;;
+		*) return 1 ;;
+	esac
+}
+
+kpanel_node_update_schedule_start() {
+	case "$KPANEL_NODE_INIT_SYSTEM" in
+		systemd) kpanel_node_service_action start kejilion-node-update.timer ;;
+		openrc)
+			kpanel_node_service_action is-active crond || kpanel_node_service_action start crond
+			;;
+		*) return 1 ;;
+	esac
+}
+
+kpanel_node_update_schedule_stop() {
+	[ "$KPANEL_NODE_INIT_SYSTEM" != systemd ] || kpanel_node_service_action stop kejilion-node-update.timer
+}
+
+kpanel_node_update_schedule_disable() {
+	[ "$KPANEL_NODE_INIT_SYSTEM" != systemd ] || kpanel_node_service_action disable kejilion-node-update.timer
 }
 
 kpanel_node_preflight() {
@@ -11618,10 +11935,7 @@ kpanel_node_preflight() {
 			return 1
 		}
 	done
-	[ -n "$KPANEL_NODE_SYSTEMCTL" ] && [ -x "$KPANEL_NODE_SYSTEMCTL" ] || {
-		echo "缺少必要命令: systemctl" >&2
-		return 1
-	}
+	kpanel_node_detect_init_system || return 1
 	KPANEL_NODE_INSTALL_BIN="$(type -P install 2>/dev/null || true)"
 	[ -n "$KPANEL_NODE_INSTALL_BIN" ] && [ -x "$KPANEL_NODE_INSTALL_BIN" ] || {
 		echo "缺少必要命令: install (coreutils)" >&2
@@ -11633,10 +11947,13 @@ kpanel_node_preflight() {
 		echo "缺少系统账户创建工具: useradd、systemd-sysusers 或 adduser" >&2
 		return 1
 	fi
-	[ -d /run/systemd/system ] || {
-		echo "当前系统未运行 systemd，无法安装 KPanel 轻量节点。" >&2
-		return 1
-	}
+	if [ "$KPANEL_NODE_INIT_SYSTEM" = openrc ]; then
+		[ -d "$KPANEL_NODE_OPENRC_DIR" ] && [ -d "${KPANEL_NODE_UPDATE_PERIODIC%/*}" ] &&
+			[ -x "${KPANEL_NODE_OPENRC_DIR}/crond" ] || {
+			echo "OpenRC 系统缺少 crond 服务或 /etc/periodic/hourly，无法启用安全自动更新。" >&2
+			return 1
+		}
+	fi
 	case "$(uname -m)" in
 		x86_64|amd64) KPANEL_NODE_ARCH="amd64" ;;
 		aarch64|arm64) KPANEL_NODE_ARCH="arm64" ;;
@@ -11781,7 +12098,7 @@ kpanel_node_write_updater() {
 	printf '#!/bin/bash\n' >"$updater_temporary" || return 1
 	kpanel_node_lock_template >>"$updater_temporary" || return 1
 	cat >>"$updater_temporary" <<'KPANEL_NODE_UPDATE'
-# KPANEL_NODE_RUNTIME_GENERATION=3
+# KPANEL_NODE_RUNTIME_GENERATION=4
 set -euo pipefail
 
 mode="${1:-update}"
@@ -11884,8 +12201,54 @@ release_url="$(awk 'tolower($1) == "location:" { sub(/\r$/, "", $2); print $2 }'
 release_base="${release_url%/SHA256SUMS}"
 
 file_service="kejilion-node-file.service"
-file_service_path="/etc/systemd/system/${file_service}"
-file_service_unit_changed=false
+update_init_system=""
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+	update_init_system=systemd
+elif [ -d /run/openrc ] && command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1 &&
+	command -v supervise-daemon >/dev/null 2>&1 && command -v logger >/dev/null 2>&1; then
+	update_init_system=openrc
+else
+	echo "KPanel lightweight node requires a running systemd or OpenRC service manager" >&2
+	exit 1
+fi
+if [ "$update_init_system" = systemd ]; then
+	file_service_path="/etc/systemd/system/${file_service}"
+else
+	file_service_path="/etc/init.d/${file_service%.service}"
+fi
+file_service_definition_changed=false
+
+updater_service_name() {
+	case "$update_init_system" in
+		openrc) printf '%s\n' "${1%.service}" ;;
+		*) printf '%s\n' "$1" ;;
+	esac
+}
+
+updater_service_exists() {
+	local service
+	service="$(updater_service_name "$1")" || return 1
+	case "$update_init_system" in
+		systemd) systemctl cat "$service" >/dev/null 2>&1 ;;
+		openrc) [ -f "/etc/init.d/${service}" ] && [ ! -L "/etc/init.d/${service}" ] && [ -x "/etc/init.d/${service}" ] ;;
+	esac
+}
+
+updater_service_action() {
+	local action="$1" service
+	service="$(updater_service_name "$2")" || return 1
+	case "$update_init_system" in
+		systemd) systemctl "$action" "$service" ;;
+		openrc)
+			case "$action" in
+				enable) rc-update add "$service" default ;;
+				is-active) rc-service "$service" status >/dev/null 2>&1 ;;
+				restart) rc-service "$service" restart ;;
+				*) return 2 ;;
+			esac
+			;;
+	esac
+}
 
 ensure_file_service_unit() {
 	if [ -e "$file_service_path" ] || [ -L "$file_service_path" ]; then
@@ -11893,7 +12256,54 @@ ensure_file_service_unit() {
 		[ "$(stat -c '%u' "$file_service_path")" = "0" ] || return 1
 		[ $(( 8#$(stat -c '%a' "$file_service_path") & 8#022 )) -eq 0 ] || return 1
 	fi
-	local template="${temporary_dir}/file.service" legacy_template="${temporary_dir}/file.legacy.service" unit_temporary
+	local template legacy_template="" unit_temporary
+	if [ "$update_init_system" = openrc ]; then
+		template="${temporary_dir}/file.openrc"
+		cat >"$template" <<'KPANEL_NODE_FILE_OPENRC'
+#!/sbin/openrc-run
+
+name="KPanel Lightweight Node File Manager"
+description="Privileged file broker for KPanel lightweight node"
+command="/usr/local/lib/kejilion-node/kejilion-node"
+command_args="file-broker --config /etc/kejilion-node/node.json --terminal-config /etc/kejilion-node/terminal.json"
+command_user="root:root"
+directory="/"
+pidfile="/run/kejilion-node/kejilion-node-file.pid"
+supervisor="supervise-daemon"
+respawn_delay=15
+respawn_max=0
+retry="TERM/30/KILL/5"
+stopgroup=true
+umask=0077
+output_logger="logger -t kejilion-node-file"
+error_logger="logger -t kejilion-node-file"
+no_new_privs=true
+
+depend() {
+	need localmount
+	use net logger
+}
+
+start_pre() {
+	[ -f /etc/kejilion-node/node.json ] || return 1
+	checkpath --directory --mode 0750 --owner root:root /run/kejilion-node
+}
+KPANEL_NODE_FILE_OPENRC
+		if [ -f "$file_service_path" ]; then
+			cmp -s "$file_service_path" "$template" && return 0
+			echo "KPanel file service has custom settings; retaining the existing OpenRC service" >&2
+			return 0
+		fi
+		unit_temporary="$(mktemp "${file_service_path}.XXXXXX")" || return 1
+		if ! install -o root -g root -m 0755 "$template" "$unit_temporary" || ! mv -f -- "$unit_temporary" "$file_service_path"; then
+			rm -f -- "$unit_temporary"
+			return 1
+		fi
+		file_service_definition_changed=true
+		return 0
+	fi
+	template="${temporary_dir}/file.service"
+	legacy_template="${temporary_dir}/file.legacy.service"
 	cat >"$template" <<'KPANEL_NODE_FILE_SERVICE'
 [Unit]
 Description=KPanel Lightweight Node File Manager
@@ -11945,14 +12355,17 @@ KPANEL_NODE_FILE_SERVICE
 		rm -f -- "$unit_temporary"
 		return 1
 	fi
-	file_service_unit_changed=true
+	file_service_definition_changed=true
 	systemctl daemon-reload
 }
 
 service_running_current() {
 	local service="$1" pid
-	systemctl is-active --quiet "$service" || return 1
-	pid="$(systemctl show "$service" --property=MainPID --value)" || return 1
+	updater_service_action is-active "$service" || return 1
+	case "$update_init_system" in
+		systemd) pid="$(systemctl show "$service" --property=MainPID --value)" || return 1 ;;
+		openrc) pid="$(cat "/run/kejilion-node/$(updater_service_name "$service").pid" 2>/dev/null)" || return 1 ;;
+	esac
 	[[ "$pid" =~ ^[1-9][0-9]*$ ]] && [ "/proc/${pid}/exe" -ef "$binary_path" ]
 }
 wait_for_service() {
@@ -11982,7 +12395,7 @@ repair_config_access() {
 	chown "root:${gid}" "$config" && chmod 0640 "$config"
 }
 restart_required=false
-if [ "$mode" = "update" ] && systemctl cat kejilion-node.service >/dev/null 2>&1; then
+if [ "$mode" = "update" ] && updater_service_exists kejilion-node.service; then
 	restart_required=true
 fi
 
@@ -11991,14 +12404,14 @@ restart_optional_services() {
 		optional_degraded=true
 		echo "KPanel lightweight node updated; file service unit is unavailable" >&2
 	fi
-	systemctl enable "$file_service" >/dev/null 2>&1 || optional_degraded=true
+	updater_service_action enable "$file_service" >/dev/null 2>&1 || optional_degraded=true
 	# Telemetry is the core update contract. Optional brokers can be unavailable
 	# on older centers; their failure must not roll back a healthy reporting node.
 	local service
 	for service in kejilion-node-terminal.service kejilion-node-ssh-login.service kejilion-node-file.service; do
-		if systemctl cat "$service" >/dev/null 2>&1; then
-			if service_running_current "$service" && { [ "$service" != "$file_service" ] || [ "$file_service_unit_changed" != true ]; }; then continue; fi
-			if ! systemctl restart "$service" || ! wait_for_service "$service"; then
+		if updater_service_exists "$service"; then
+			if service_running_current "$service" && { [ "$service" != "$file_service" ] || [ "$file_service_definition_changed" != true ]; }; then continue; fi
+			if ! updater_service_action restart "$service" || ! wait_for_service "$service"; then
 				optional_degraded=true
 				echo "KPanel lightweight node updated; optional service unavailable: ${service}" >&2
 			fi
@@ -12009,7 +12422,7 @@ restart_services() {
 	update_error=config
 	repair_config_access || return 1
 	update_error=restart
-	systemctl restart kejilion-node.service || return 1
+	updater_service_action restart kejilion-node.service || return 1
 	wait_for_service kejilion-node.service || return 1
 	restart_optional_services
 }
@@ -12084,7 +12497,156 @@ KPANEL_NODE_UPDATE
 	fi
 }
 
+kpanel_node_write_openrc_units() {
+	cat >"${KPANEL_NODE_OPENRC_DIR}/kejilion-node" <<'KPANEL_NODE_OPENRC_SERVICE'
+#!/sbin/openrc-run
+
+name="KPanel Lightweight Monitoring Node"
+description="Low-privilege telemetry service for KPanel"
+command="/usr/local/lib/kejilion-node/kejilion-node"
+command_args="run --config /etc/kejilion-node/node.json"
+command_user="kejilion-node:kejilion-node"
+directory="/"
+pidfile="/run/kejilion-node/kejilion-node.pid"
+supervisor="supervise-daemon"
+respawn_delay=15
+respawn_max=0
+retry="TERM/30/KILL/5"
+stopgroup=true
+umask=0077
+output_logger="logger -t kejilion-node"
+error_logger="logger -t kejilion-node"
+no_new_privs=true
+
+depend() {
+	need localmount
+	use net logger
+	after kejilion-node-terminal
+}
+
+start_pre() {
+	[ -f /etc/kejilion-node/node.json ] || return 1
+	checkpath --directory --mode 0750 --owner root:root /run/kejilion-node
+}
+KPANEL_NODE_OPENRC_SERVICE
+
+	cat >"${KPANEL_NODE_OPENRC_DIR}/kejilion-node-terminal" <<'KPANEL_NODE_OPENRC_TERMINAL_SERVICE'
+#!/sbin/openrc-run
+
+name="KPanel Lightweight Node Root PTY Broker"
+description="Privileged terminal broker for KPanel lightweight node"
+command="/usr/local/lib/kejilion-node/kejilion-node"
+command_args="terminal-broker --config /etc/kejilion-node/node.json --terminal-config /etc/kejilion-node/terminal.json"
+command_user="root:root"
+directory="/"
+pidfile="/run/kejilion-node/kejilion-node-terminal.pid"
+supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=0
+retry="TERM/30/KILL/5"
+stopgroup=true
+umask=0077
+output_logger="logger -t kejilion-node-terminal"
+error_logger="logger -t kejilion-node-terminal"
+
+depend() {
+	need localmount
+	use net logger
+}
+
+start_pre() {
+	[ -f /etc/kejilion-node/node.json ] && [ -f /etc/kejilion-node/terminal.json ] || return 1
+	checkpath --directory --mode 0750 --owner root:root /run/kejilion-node
+}
+KPANEL_NODE_OPENRC_TERMINAL_SERVICE
+
+	cat >"$KPANEL_NODE_SSH_LOGIN_SERVICE" <<'KPANEL_NODE_OPENRC_SSH_LOGIN_SERVICE'
+#!/sbin/openrc-run
+
+name="KPanel SSH Login Event Collector"
+description="SSH login event collector for KPanel lightweight node"
+command="/usr/local/lib/kejilion-node/kejilion-node"
+command_args="ssh-login-broker --output /run/kejilion-node-ssh/ssh-login.json"
+command_user="root:kejilion-node"
+directory="/"
+pidfile="/run/kejilion-node/kejilion-node-ssh-login.pid"
+supervisor="supervise-daemon"
+respawn_delay=15
+respawn_max=0
+retry="TERM/30/KILL/5"
+stopgroup=true
+umask=0027
+output_logger="logger -t kejilion-node-ssh-login"
+error_logger="logger -t kejilion-node-ssh-login"
+no_new_privs=true
+
+depend() {
+	need localmount
+	use logger
+	after sshd dropbear
+}
+
+start_pre() {
+	checkpath --directory --mode 0750 --owner root:root /run/kejilion-node
+	checkpath --directory --mode 0750 --owner root:kejilion-node /run/kejilion-node-ssh
+}
+KPANEL_NODE_OPENRC_SSH_LOGIN_SERVICE
+
+	cat >"${KPANEL_NODE_OPENRC_DIR}/kejilion-node-file" <<'KPANEL_NODE_OPENRC_FILE_SERVICE'
+#!/sbin/openrc-run
+
+name="KPanel Lightweight Node File Manager"
+description="Privileged file broker for KPanel lightweight node"
+command="/usr/local/lib/kejilion-node/kejilion-node"
+command_args="file-broker --config /etc/kejilion-node/node.json --terminal-config /etc/kejilion-node/terminal.json"
+command_user="root:root"
+directory="/"
+pidfile="/run/kejilion-node/kejilion-node-file.pid"
+supervisor="supervise-daemon"
+respawn_delay=15
+respawn_max=0
+retry="TERM/30/KILL/5"
+stopgroup=true
+umask=0077
+output_logger="logger -t kejilion-node-file"
+error_logger="logger -t kejilion-node-file"
+no_new_privs=true
+
+depend() {
+	need localmount
+	use net logger
+}
+
+start_pre() {
+	[ -f /etc/kejilion-node/node.json ] || return 1
+	checkpath --directory --mode 0750 --owner root:root /run/kejilion-node
+}
+KPANEL_NODE_OPENRC_FILE_SERVICE
+
+	cat >"$KPANEL_NODE_UPDATE_PERIODIC" <<'KPANEL_NODE_OPENRC_UPDATE'
+#!/bin/sh
+set -eu
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+umask 077
+random_value="$(od -An -N2 -tu2 /dev/urandom 2>/dev/null | tr -d ' ' || true)"
+case "$random_value" in *[!0-9]*|'') random_value=0 ;; esac
+sleep "$((random_value % 901))"
+exec /usr/local/lib/kejilion-node/update.sh update
+KPANEL_NODE_OPENRC_UPDATE
+
+	chmod 0755 "${KPANEL_NODE_OPENRC_DIR}/kejilion-node" \
+		"${KPANEL_NODE_OPENRC_DIR}/kejilion-node-terminal" \
+		"$KPANEL_NODE_SSH_LOGIN_SERVICE" \
+		"${KPANEL_NODE_OPENRC_DIR}/kejilion-node-file" \
+		"$KPANEL_NODE_UPDATE_PERIODIC"
+}
+
 kpanel_node_write_units() {
+	if [ "$KPANEL_NODE_INIT_SYSTEM" = openrc ]; then
+		kpanel_node_write_openrc_units
+		return
+	fi
 	cat >/etc/systemd/system/kejilion-node.service <<'KPANEL_NODE_SERVICE'
 [Unit]
 Description=KPanel Lightweight Monitoring Node
@@ -12278,6 +12840,7 @@ kpanel_node_stage_paths() {
 	KPANEL_NODE_STAGE_CONFIG_SHA="${KPANEL_NODE_ENROLLMENT_STAGE}/node.sha256"
 	KPANEL_NODE_STAGE_TERMINAL="${KPANEL_NODE_ENROLLMENT_STAGE}/terminal.json"
 	KPANEL_NODE_STAGE_TERMINAL_STATE="${KPANEL_NODE_ENROLLMENT_STAGE}/terminal.state"
+	KPANEL_NODE_STAGE_BATCH_ATTEMPT="${KPANEL_NODE_ENROLLMENT_STAGE}/batch-enrollment-attempt.json"
 }
 
 kpanel_node_safe_regular_file() {
@@ -12308,7 +12871,14 @@ kpanel_node_clear_enrollment_stage() {
 	[ -d "$KPANEL_NODE_ENROLLMENT_STAGE" ] && [ ! -L "$KPANEL_NODE_ENROLLMENT_STAGE" ] &&
 		[ "$(stat -c '%u:%a' "$KPANEL_NODE_ENROLLMENT_STAGE")" = "0:700" ] || return 1
 	for path in "$KPANEL_NODE_STAGE_TOKEN" "$KPANEL_NODE_STAGE_CONFIG" "$KPANEL_NODE_STAGE_CONFIG_SHA" \
-		"$KPANEL_NODE_STAGE_TERMINAL" "$KPANEL_NODE_STAGE_TERMINAL_STATE"; do
+		"$KPANEL_NODE_STAGE_TERMINAL" "$KPANEL_NODE_STAGE_TERMINAL_STATE" "$KPANEL_NODE_STAGE_BATCH_ATTEMPT"; do
+		[ -e "$path" ] || [ -L "$path" ] || continue
+		kpanel_node_safe_regular_file "$path" || return 1
+		rm -f -- "$path" || return 1
+	done
+	for path in "$KPANEL_NODE_ENROLLMENT_STAGE"/.node.json.tmp-* \
+		"$KPANEL_NODE_ENROLLMENT_STAGE"/.terminal.json.tmp-* \
+		"$KPANEL_NODE_ENROLLMENT_STAGE"/.batch-enrollment-attempt.tmp-*; do
 		[ -e "$path" ] || [ -L "$path" ] || continue
 		kpanel_node_safe_regular_file "$path" || return 1
 		rm -f -- "$path" || return 1
@@ -12409,46 +12979,47 @@ kpanel_node_finalize_enrollment() {
 kpanel_node_stop_runtime() {
 	local service
 	for service in kejilion-node.service kejilion-node-terminal.service kejilion-node-ssh-login.service "$KPANEL_NODE_FILE_SERVICE"; do
-		"$KPANEL_NODE_SYSTEMCTL" stop "$service" >/dev/null 2>&1 || true
+		kpanel_node_service_action stop "$service" >/dev/null 2>&1 || true
 	done
 }
 
 kpanel_node_activate() {
-	"$KPANEL_NODE_SYSTEMCTL" daemon-reload || return 1
+	kpanel_node_service_reload_manager || return 1
 	if [ -f "$KPANEL_NODE_TERMINAL_CONFIG" ]; then
-		"$KPANEL_NODE_SYSTEMCTL" enable kejilion-node-terminal.service || return 1
+		kpanel_node_service_action enable kejilion-node-terminal.service || return 1
 	else
-		"$KPANEL_NODE_SYSTEMCTL" disable kejilion-node-terminal.service >/dev/null 2>&1 || true
-		"$KPANEL_NODE_SYSTEMCTL" stop kejilion-node-terminal.service >/dev/null 2>&1 || true
+		kpanel_node_service_action disable kejilion-node-terminal.service >/dev/null 2>&1 || true
+		kpanel_node_service_action stop kejilion-node-terminal.service >/dev/null 2>&1 || true
 	fi
-	"$KPANEL_NODE_SYSTEMCTL" enable kejilion-node.service || return 1
-	"$KPANEL_NODE_SYSTEMCTL" enable kejilion-node-ssh-login.service || return 1
-	"$KPANEL_NODE_SYSTEMCTL" enable kejilion-node-update.timer || return 1
+	kpanel_node_service_action enable kejilion-node.service || return 1
+	kpanel_node_service_action enable kejilion-node-ssh-login.service || return 1
+	kpanel_node_update_schedule_enable || return 1
 	if [ -f "$KPANEL_NODE_TERMINAL_CONFIG" ]; then
-		if ! "$KPANEL_NODE_SYSTEMCTL" start kejilion-node-terminal.service; then
+		if ! kpanel_node_service_action start kejilion-node-terminal.service; then
 			echo "KPanel 轻量节点终端 broker 启动失败；文件管理和遥测服务仍将继续。" >&2
 		fi
 	fi
-	if ! "$KPANEL_NODE_SYSTEMCTL" start kejilion-node-ssh-login.service; then
+	if ! kpanel_node_service_action start kejilion-node-ssh-login.service; then
 		echo "KPanel SSH 登录采集服务启动失败；普通遥测仍将继续。" >&2
 	fi
-	"$KPANEL_NODE_SYSTEMCTL" start kejilion-node.service || return 1
-	"$KPANEL_NODE_SYSTEMCTL" start kejilion-node-update.timer || return 1
-	if [ -f "$KPANEL_NODE_TERMINAL_CONFIG" ] && ! "$KPANEL_NODE_SYSTEMCTL" is-active kejilion-node-terminal.service >/dev/null; then
+	kpanel_node_service_action start kejilion-node.service || return 1
+	kpanel_node_update_schedule_start || return 1
+	if [ -f "$KPANEL_NODE_TERMINAL_CONFIG" ] && ! kpanel_node_service_action is-active kejilion-node-terminal.service >/dev/null; then
 		echo "KPanel 轻量节点终端 broker 当前不可用；文件管理和遥测服务仍在运行。" >&2
 	fi
-	"$KPANEL_NODE_SYSTEMCTL" enable "$KPANEL_NODE_FILE_SERVICE" || return 1
-	{ "$KPANEL_NODE_SYSTEMCTL" start "$KPANEL_NODE_FILE_SERVICE" >/dev/null 2>&1 || true; }
-	if ! "$KPANEL_NODE_SYSTEMCTL" is-active kejilion-node-ssh-login.service >/dev/null; then
+	kpanel_node_service_action enable "$KPANEL_NODE_FILE_SERVICE" || return 1
+	{ kpanel_node_service_action start "$KPANEL_NODE_FILE_SERVICE" >/dev/null 2>&1 || true; }
+	if ! kpanel_node_service_action is-active kejilion-node-ssh-login.service >/dev/null; then
 		echo "KPanel SSH 登录采集服务当前不可用；普通遥测仍在运行。" >&2
 	fi
-	"$KPANEL_NODE_SYSTEMCTL" is-active kejilion-node.service >/dev/null
+	kpanel_node_service_action is-active kejilion-node.service >/dev/null
 }
 
 kpanel_node_join() {
 	(
 	local token="${1:-}" node_name="" fingerprint="" saved_fingerprint="" staged_fingerprint="" update_mode=install
-	local enrollment_output="" node_id="" node_version=""
+	local enrollment_output="" node_id="" node_version="" batch_token=false enroll_required=false
+	local -a enrollment_attempt_args=()
 	shift || true
 	while [ "$#" -gt 0 ]; do
 		case "$1" in
@@ -12464,6 +13035,7 @@ kpanel_node_join() {
 	kpanel_node_preflight || return 1
 	case "$token" in
 		kpl1.*) ;;
+		kpb1.*) batch_token=true ;;
 		*) echo "轻量节点接入授权无效。" >&2; return 2 ;;
 	esac
 	[ "${#token}" -le 2048 ] || {
@@ -12515,9 +13087,29 @@ kpanel_node_join() {
 			"$KPANEL_NODE_INSTALL_BIN" -d -o root -g root -m 0700 "$KPANEL_NODE_ENROLLMENT_STAGE" || return 1
 			printf '%s\n' "$fingerprint" >"$KPANEL_NODE_STAGE_TOKEN" || return 1
 			chmod 0600 "$KPANEL_NODE_STAGE_TOKEN" || return 1
-			if ! enrollment_output="$("$KPANEL_NODE_BINARY" enroll --token "$token" --name "$node_name" --config "$KPANEL_NODE_STAGE_CONFIG" --terminal-config "$KPANEL_NODE_STAGE_TERMINAL")"; then
+			enroll_required=true
+		elif [ "$batch_token" = true ] &&
+			[ ! -e "$KPANEL_NODE_STAGE_CONFIG" ] && [ ! -L "$KPANEL_NODE_STAGE_CONFIG" ] &&
+			[ ! -e "$KPANEL_NODE_STAGE_CONFIG_SHA" ] && [ ! -L "$KPANEL_NODE_STAGE_CONFIG_SHA" ]; then
+			if [ -e "$KPANEL_NODE_STAGE_BATCH_ATTEMPT" ] || [ -L "$KPANEL_NODE_STAGE_BATCH_ATTEMPT" ]; then
+				kpanel_node_safe_regular_file "$KPANEL_NODE_STAGE_BATCH_ATTEMPT" || {
+					echo "本机存在无法安全恢复的 KPanel 批量接入状态；请检查 ${KPANEL_NODE_ENROLLMENT_STAGE}。" >&2
+					return 1
+				}
+			fi
+			enroll_required=true
+		fi
+		if [ "$enroll_required" = true ]; then
+			if [ "$batch_token" = true ]; then
+				enrollment_attempt_args=(--attempt-file "$KPANEL_NODE_STAGE_BATCH_ATTEMPT")
+			fi
+			if ! enrollment_output="$("$KPANEL_NODE_BINARY" enroll --token "$token" --name "$node_name" --config "$KPANEL_NODE_STAGE_CONFIG" --terminal-config "$KPANEL_NODE_STAGE_TERMINAL" "${enrollment_attempt_args[@]}")"; then
 				if kpanel_node_safe_regular_file "$KPANEL_NODE_STAGE_CONFIG" && [ -s "$KPANEL_NODE_STAGE_CONFIG" ]; then
 					echo "新节点授权已取得但本地保存未完成，原有连接保持不变；再次执行同一条命令可继续。" >&2
+					return 1
+				fi
+				if [ "$batch_token" = true ] && kpanel_node_safe_regular_file "$KPANEL_NODE_STAGE_BATCH_ATTEMPT"; then
+					echo "批量接入请求尚未确认，已安全保留本机身份；再次执行同一条命令可继续。" >&2
 					return 1
 				fi
 				kpanel_node_clear_enrollment_stage || true
@@ -12539,11 +13131,11 @@ kpanel_node_join() {
 	fi
 	kpanel_node_stop_runtime
 	if ! kpanel_node_write_units; then
-		echo "节点授权已保存，但 systemd 单元写入失败；再次执行接入命令可继续。" >&2
+		echo "节点授权已保存，但 ${KPANEL_NODE_INIT_SYSTEM} 服务定义写入失败；再次执行接入命令可继续。" >&2
 		return 1
 	fi
 	if ! kpanel_node_activate; then
-		echo "KPanel 轻量节点授权已保存，但服务启动失败；修复 systemd 后再次执行接入命令即可续装。" >&2
+		echo "KPanel 轻量节点授权已保存，但服务启动失败；修复 ${KPANEL_NODE_INIT_SYSTEM} 后再次执行接入命令即可续装。" >&2
 		return 1
 	fi
 	node_version="$("$KPANEL_NODE_BINARY" version 2>/dev/null | awk 'NR == 1 { print $1; exit }' || true)"
@@ -12562,10 +13154,23 @@ kpanel_node_status() {
 		echo "KPanel 轻量节点未安装。" >&2
 		return 1
 	}
+	kpanel_node_detect_init_system || return 1
 	"$KPANEL_NODE_BINARY" version
-	"$KPANEL_NODE_SYSTEMCTL" --no-pager --full status kejilion-node.service
+	kpanel_node_service_action status kejilion-node.service
 	main_status=$?
-	"$KPANEL_NODE_SYSTEMCTL" --no-pager --full status kejilion-node-update.timer kejilion-node-terminal.service kejilion-node-file.service kejilion-node-ssh-login.service || true
+	for service in kejilion-node-terminal.service kejilion-node-file.service kejilion-node-ssh-login.service; do
+		kpanel_node_service_action status "$service" || true
+	done
+	if [ "$KPANEL_NODE_INIT_SYSTEM" = systemd ]; then
+		kpanel_node_service_action status kejilion-node-update.timer || true
+	else
+		kpanel_node_service_action status crond || true
+		if [ -x "$KPANEL_NODE_UPDATE_PERIODIC" ] && [ ! -L "$KPANEL_NODE_UPDATE_PERIODIC" ]; then
+			echo "KPanel lightweight node updater: enabled (${KPANEL_NODE_UPDATE_PERIODIC})"
+		else
+			echo "KPanel lightweight node updater: disabled" >&2
+		fi
+	fi
 	local health_output
 	# Old release binaries do not support this optional read-only summary yet.
 	if health_output="$("$KPANEL_NODE_BINARY" health 2>/dev/null)"; then printf '%s\n' "$health_output"; fi
@@ -12596,27 +13201,29 @@ kpanel_node_uninstall() {
 		return 1
 	}
 	kpanel_node_lock || return 1
-	if [ -x "$KPANEL_NODE_SYSTEMCTL" ]; then
-		"$KPANEL_NODE_SYSTEMCTL" stop kejilion-node.service >/dev/null 2>&1 || true
-		"$KPANEL_NODE_SYSTEMCTL" stop kejilion-node-terminal.service >/dev/null 2>&1 || true
-		"$KPANEL_NODE_SYSTEMCTL" stop kejilion-node-ssh-login.service >/dev/null 2>&1 || true
-		"$KPANEL_NODE_SYSTEMCTL" stop kejilion-node-file.service >/dev/null 2>&1 || true
-		"$KPANEL_NODE_SYSTEMCTL" stop kejilion-node-update.timer >/dev/null 2>&1 || true
-		"$KPANEL_NODE_SYSTEMCTL" disable kejilion-node.service >/dev/null 2>&1 || true
-		"$KPANEL_NODE_SYSTEMCTL" disable kejilion-node-terminal.service >/dev/null 2>&1 || true
-		"$KPANEL_NODE_SYSTEMCTL" disable kejilion-node-ssh-login.service >/dev/null 2>&1 || true
-		"$KPANEL_NODE_SYSTEMCTL" disable kejilion-node-file.service >/dev/null 2>&1 || true
-		"$KPANEL_NODE_SYSTEMCTL" disable kejilion-node-update.timer >/dev/null 2>&1 || true
+	kpanel_node_detect_init_system >/dev/null 2>&1 || true
+	if [ -n "$KPANEL_NODE_INIT_SYSTEM" ]; then
+		for service in kejilion-node.service kejilion-node-terminal.service kejilion-node-ssh-login.service kejilion-node-file.service; do
+			kpanel_node_service_action stop "$service" >/dev/null 2>&1 || true
+			kpanel_node_service_action disable "$service" >/dev/null 2>&1 || true
+		done
+		kpanel_node_update_schedule_stop >/dev/null 2>&1 || true
+		kpanel_node_update_schedule_disable >/dev/null 2>&1 || true
 	fi
 	rm -f -- /etc/systemd/system/kejilion-node.service \
 		/etc/systemd/system/kejilion-node-terminal.service \
 		"$KPANEL_NODE_SSH_LOGIN_SERVICE" \
 		/etc/systemd/system/kejilion-node-file.service \
 		/etc/systemd/system/kejilion-node-update.service \
-		/etc/systemd/system/kejilion-node-update.timer
+		/etc/systemd/system/kejilion-node-update.timer \
+		/etc/init.d/kejilion-node \
+		/etc/init.d/kejilion-node-terminal \
+		/etc/init.d/kejilion-node-ssh-login \
+		/etc/init.d/kejilion-node-file \
+		"$KPANEL_NODE_UPDATE_PERIODIC"
 	rm -rf -- "$KPANEL_NODE_HOME" "$KPANEL_NODE_CONFIG_DIR"
 	rmdir -- "$KPANEL_NODE_SSH_LOGIN_RUNTIME" 2>/dev/null || true
-	[ ! -x "$KPANEL_NODE_SYSTEMCTL" ] || "$KPANEL_NODE_SYSTEMCTL" daemon-reload >/dev/null 2>&1 || true
+	[ "$KPANEL_NODE_INIT_SYSTEM" != systemd ] || kpanel_node_service_reload_manager >/dev/null 2>&1 || true
 	echo "KPanel 轻量节点已从本机卸载；中心端的离线记录需在集群页面删除。"
 	)
 }
@@ -20671,7 +21278,6 @@ while true; do
 
 	  echo -e "${gl_kjlan}-------------------------"
 	  echo -e "${gl_kjlan}b.   ${gl_bai}备份全部应用数据                    ${gl_kjlan}r.   ${gl_bai}还原全部应用数据"
-	  echo "k. 通用加密备份与恢复 (.kpb，与 KPanel 互通)"
 	  echo -e "${gl_kjlan}------------------------"
 	  echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
 	  echo -e "${gl_kjlan}------------------------${gl_bai}"
@@ -24390,9 +24996,6 @@ discourse,yunsou,ahhhhfs,nsgame,gying" \
 
 		  ;;
 
-	  k)
-		kpanel_backup_center_dispatch menu apps
-		;;
 	  b)
 	  	clear
 	  	send_stats "全部应用备份"
@@ -32026,6 +32629,7 @@ echo "阻止IP              k zzip 177.5.25.36 |k 阻止IP 177.5.25.36"
 echo "命令收藏夹          k fav | k 命令收藏夹"
 echo "应用市场管理        k app"
 echo "应用编号快捷管理    k app 26 | k app 1panel | k app npm"
+echo "KPanel管理          k app kpanel"
 echo "fail2ban管理        k fail2ban | k f2b [status|enable|disable]"
 echo "显示系统信息        k info"
 echo "ROOT密钥管理        k sshkey"
@@ -32388,8 +32992,11 @@ else
 			elif [ "${1:-}" = "system-tuning" ]; then
 				shift
 				kpanel_system_tuning_dispatch "$@"
+			elif [ "${1:-}" = "virus-scan" ]; then
+				shift
+				kpanel_virus_scan_dispatch "$@"
 			else
-				echo "用法: k kpanel node ... | system-resource ... | disk-management ... | network-operations ... | account-management ... | system-tuning ..." >&2
+				echo "用法: k kpanel node ... | system-resource ... | disk-management ... | network-operations ... | account-management ... | system-tuning ... | virus-scan ..." >&2
 				return 2 2>/dev/null || exit 2
 			fi
 			;;
