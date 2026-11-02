@@ -1,5 +1,5 @@
 #!/bin/bash
-sh_v="4.5.14"
+sh_v="4.5.17"
 
 
 gl_hui='\e[37m'
@@ -107,6 +107,53 @@ kpanel_protocol_active() {
 	[ "${KJ_TEST_NONINTERACTIVE:-}" = "1" ]
 }
 
+
+# LinuxMirrors uses the non-portable [:ascii:] regex class in its progress
+# renderer. Restrict that fast path to printable ASCII on all libc variants.
+linuxmirrors_run_script() {
+	local source="$1" script result
+	shift
+	script="$(mktemp)" || return 1
+	if ! LC_ALL=C sed 's/\[\[:ascii:\]\]/[\\ -~]/g' "$source" > "$script"; then
+		rm -f -- "$script"
+		return 1
+	fi
+	if bash "$script" "$@"; then result=0; else result=$?; fi
+	rm -f -- "$script"
+	return "$result"
+}
+
+linuxmirrors_run_url() {
+	local url="$1" script result
+	shift
+	script="$(mktemp)" || return 1
+	if ! curl -fsSL "$url" -o "$script"; then
+		rm -f -- "$script"
+		return 1
+	fi
+	if linuxmirrors_run_script "$script" "$@"; then result=0; else result=$?; fi
+	rm -f -- "$script"
+	return "$result"
+}
+
+# Armbian can identify as Debian or Ubuntu; preserve its configured mirrors.
+is_armbian_system() {
+	local armbian_release="${1:-/etc/armbian-release}" os_release="${2:-/etc/os-release}"
+	[ -f "$armbian_release" ] || grep -Eiq '^(ID|NAME|PRETTY_NAME)="?armbian([" ]|$)' "$os_release" 2>/dev/null
+}
+
+preserve_armbian_mirrors() {
+	if is_armbian_system; then
+		echo "Armbian detected; keeping existing system package sources."
+		return 0
+	fi
+	return 1
+}
+
+run_linuxmirrors_manual() {
+	preserve_armbian_mirrors && return 0
+	linuxmirrors_run_url https://linuxmirrors.cn/main.sh "$@"
+}
 
 quanju_canshu() {
 if [ "$canshu" = "CN" ]; then
@@ -548,7 +595,7 @@ linuxmirrors_install_docker() {
 
 local country=$(curl -s ipinfo.io/country)
 if [ "$country" = "CN" ]; then
-	bash <(curl -sSL https://linuxmirrors.cn/docker.sh) \
+	linuxmirrors_run_url https://linuxmirrors.cn/docker.sh \
 	  --source mirrors.huaweicloud.com/docker-ce \
 	  --source-registry docker.1ms.run \
 	  --protocol https \
@@ -557,7 +604,7 @@ if [ "$country" = "CN" ]; then
 	  --close-firewall false \
 	  --ignore-backup-tips
 else
-	bash <(curl -sSL https://linuxmirrors.cn/docker.sh) \
+	linuxmirrors_run_url https://linuxmirrors.cn/docker.sh \
 	  --source download.docker.com \
 	  --source-registry registry.hub.docker.com \
 	  --protocol https \
@@ -1177,31 +1224,53 @@ block_ip() {
 
 
 
+ddos_rule_add_once() {
+	local chain="$1"
+	shift
+	if iptables -C "$chain" "$@" >/dev/null 2>&1; then
+		return 0
+	fi
+	iptables -A "$chain" "$@"
+}
+
+ddos_rule_remove_all() {
+	local chain="$1" status
+	shift
+	while true; do
+		if iptables -C "$chain" "$@" >/dev/null 2>&1; then
+			iptables -D "$chain" "$@" || return $?
+		else
+			status=$?
+			[ "$status" -eq 1 ] && return 0
+			return "$status"
+		fi
+	done
+}
+
 enable_ddos_defense() {
-	# 开启防御 DDoS
-	iptables -A DOCKER-USER -p tcp --syn -m limit --limit 500/s --limit-burst 100 -j ACCEPT
-	iptables -A DOCKER-USER -p tcp --syn -j DROP
-	iptables -A DOCKER-USER -p udp -m limit --limit 3000/s -j ACCEPT
-	iptables -A DOCKER-USER -p udp -j DROP
-	iptables -A INPUT -p tcp --syn -m limit --limit 500/s --limit-burst 100 -j ACCEPT
-	iptables -A INPUT -p tcp --syn -j DROP
-	iptables -A INPUT -p udp -m limit --limit 3000/s -j ACCEPT
-	iptables -A INPUT -p udp -j DROP
+	# Ensure each fixed DDoS rule exists once, so enabling repairs partial state safely.
+	ddos_rule_add_once DOCKER-USER -p tcp --syn -m limit --limit 500/s --limit-burst 100 -j ACCEPT || return $?
+	ddos_rule_add_once DOCKER-USER -p tcp --syn -j DROP || return $?
+	ddos_rule_add_once DOCKER-USER -p udp -m limit --limit 3000/s -j ACCEPT || return $?
+	ddos_rule_add_once DOCKER-USER -p udp -j DROP || return $?
+	ddos_rule_add_once INPUT -p tcp --syn -m limit --limit 500/s --limit-burst 100 -j ACCEPT || return $?
+	ddos_rule_add_once INPUT -p tcp --syn -j DROP || return $?
+	ddos_rule_add_once INPUT -p udp -m limit --limit 3000/s -j ACCEPT || return $?
+	ddos_rule_add_once INPUT -p udp -j DROP || return $?
 
 	send_stats "开启DDoS防御"
 }
 
 # 关闭DDoS防御
 disable_ddos_defense() {
-	# 关闭防御 DDoS
-	iptables -D DOCKER-USER -p tcp --syn -m limit --limit 500/s --limit-burst 100 -j ACCEPT 2>/dev/null
-	iptables -D DOCKER-USER -p tcp --syn -j DROP 2>/dev/null
-	iptables -D DOCKER-USER -p udp -m limit --limit 3000/s -j ACCEPT 2>/dev/null
-	iptables -D DOCKER-USER -p udp -j DROP 2>/dev/null
-	iptables -D INPUT -p tcp --syn -m limit --limit 500/s --limit-burst 100 -j ACCEPT 2>/dev/null
-	iptables -D INPUT -p tcp --syn -j DROP 2>/dev/null
-	iptables -D INPUT -p udp -m limit --limit 3000/s -j ACCEPT 2>/dev/null
-	iptables -D INPUT -p udp -j DROP 2>/dev/null
+	# Remove all copies of the fixed rules, including duplicates from earlier enables.
+	local chain
+	for chain in DOCKER-USER INPUT; do
+		ddos_rule_remove_all "$chain" -p tcp --syn -m limit --limit 500/s --limit-burst 100 -j ACCEPT || return $?
+		ddos_rule_remove_all "$chain" -p tcp --syn -j DROP || return $?
+		ddos_rule_remove_all "$chain" -p udp -m limit --limit 3000/s -j ACCEPT || return $?
+		ddos_rule_remove_all "$chain" -p udp -j DROP || return $?
+	done
 
 	send_stats "关闭DDoS防御"
 }
@@ -1547,10 +1616,21 @@ ldnmp_v() {
 
 
 install_ldnmp_conf() {
+  # Re-entry must preserve the installed stack, database credentials and WAF hooks.
+  if [ -e /home/web/docker-compose.yml ] || [ -L /home/web/docker-compose.yml ]; then
+    [ -f /home/web/docker-compose.yml ] && [ ! -L /home/web/docker-compose.yml ] || return 1
+    if [ -s /home/web/docker-compose.yml ]; then
+      [ -f /home/web/nginx.conf ] && [ ! -L /home/web/nginx.conf ] && [ -s /home/web/nginx.conf ] || {
+        echo "Existing stack has no usable nginx.conf; restore its configuration before retrying." >&2
+        return 1
+      }
+      return 0
+    fi
+  fi
 
   # 创建必要的目录和文件
   cd /home && mkdir -p web/html web/mysql web/certs web/conf.d web/stream.d web/redis web/log/nginx web/letsencrypt && touch web/docker-compose.yml
-  wget -O /home/web/nginx.conf ${gh_proxy}raw.githubusercontent.com/kejilion/nginx/main/nginx10.conf
+  nginx_template_install || return $?
   wget -O /home/web/conf.d/default.conf ${gh_proxy}raw.githubusercontent.com/kejilion/nginx/main/default10.conf
 
   default_server_ssl
@@ -2474,6 +2554,9 @@ import time
 import urllib.parse
 import urllib.request
 
+# Multi-arch manifest verified from the published 1.31.8-alpine tag.
+WAF_CANDIDATE_IMAGE = 'kjlion/nginx:alpine@sha256:065a40f37e508787769513aca655fc541acf687afffd57b25241b1a6bac53ef8'
+
 LEGACY = '99f7169d84901be3f34452f375b3e0079cd86b4c'
 PREVIOUS = '8773850871f991b027f62841fde2795121251620'
 REVISION = 'bdb8cc42fb123b09b02dc5940d2596354efebb87'
@@ -3163,7 +3246,9 @@ def waf_image_plan(root, model, container):
     """Edit only the active nginx image declaration, then verify the full model."""
     official = r'(?:(?:docker\.io/)?library/|docker\.io/)?nginx(?::[\w.-]+|@sha256:[0-9a-f]{64})?'
     service = model['services']['nginx']
-    if service.get('build') or not re.fullmatch(official, service.get('image', '')):
+    image = service.get('image', '')
+    owned_waf_image = image in {'kjlion/nginx:alpine', 'docker.io/kjlion/nginx:alpine', WAF_CANDIDATE_IMAGE}
+    if service.get('build') or not (re.fullmatch(official, image) or owned_waf_image):
         raise ValueError('仅自动迁移官方 nginx 镜像；自定义镜像请先核对 ModSecurity 兼容性')
     sources = container['Config'].get('Labels', {}).get('com.docker.compose.project.config_files', '')
     paths = [Path(name) for name in sources.split(',') if name]
@@ -3200,7 +3285,7 @@ def waf_image_plan(root, model, container):
             if 'nginx' not in document.get('services', {}):
                 continue
             explicit = 'image' in document['services']['nginx']
-            document['services']['nginx']['image'] = 'kjlion/nginx:alpine'
+            document['services']['nginx']['image'] = WAF_CANDIDATE_IMAGE
             candidate = path.name, (json.dumps(document, ensure_ascii=False) + '\n').encode()
             if explicit:
                 return candidate
@@ -3231,9 +3316,9 @@ def waf_image_plan(root, model, container):
             newline = '\r\n' if line.endswith('\r\n') else '\n'
             for offset in range(index + 1, end):
                 if re.match(r'^ {%d}image\s*:' % child, lines[offset]):
-                    lines[offset] = ' ' * child + 'image: kjlion/nginx:alpine' + newline
+                    lines[offset] = ' ' * child + 'image: ' + WAF_CANDIDATE_IMAGE + newline
                     return path.name, ''.join(lines).encode()
-            lines.insert(index + 1, ' ' * child + 'image: kjlion/nginx:alpine' + newline)
+            lines.insert(index + 1, ' ' * child + 'image: ' + WAF_CANDIDATE_IMAGE + newline)
             if insertion is None:
                 insertion = path.name, ''.join(lines).encode()
             break
@@ -3273,21 +3358,30 @@ def execute_update(root, directory, component, prefix):
             previous[name] = {'image': containers[0]['Image'],
                               'running': any(item['State']['Running'] for item in containers)}
     json_write(directory / 'images.json', {'services': services, 'previous': previous})
-    if component == 'waf':
+    managed_waf_tag = bool(
+        component != 'waf' and nginx_container is not None and
+        model['services']['nginx'].get('image') in {'kjlion/nginx:alpine', 'docker.io/kjlion/nginx:alpine'}
+    )
+    if component == 'waf' or managed_waf_tag:
         if nginx_container is None or not nginx_container['State']['Running']:
-            raise ValueError('WAF 自动迁移需要单个运行中的 nginx 容器')
-        journal = json.loads((directory / 'journal.json').read_text(encoding='utf-8'))
-        journal['component'] = 'waf'
-        json_write(directory / 'journal.json', journal)
+            if component == 'waf':
+                raise ValueError('WAF 自动迁移需要单个运行中的 nginx 容器')
+        if component == 'waf':
+            journal = json.loads((directory / 'journal.json').read_text(encoding='utf-8'))
+            journal['component'] = 'waf'
+            json_write(directory / 'journal.json', journal)
         name, data = waf_image_plan(root, model, nginx_container)
         remember(root, directory)
         install_configuration(root, directory, name, data, inventory(root)[name]['mode'])
         desired = copy.deepcopy(model)
-        desired['services']['nginx']['image'] = 'kjlion/nginx:alpine'
+        desired['services']['nginx']['image'] = WAF_CANDIDATE_IMAGE
         model = json.loads(command('docker', 'compose', '--project-directory', str(root), 'config', '--format', 'json'))
         if model != desired:
             raise ValueError('镜像迁移改变了其他有效 Compose 参数，已中止: ' + ', '.join(changed_paths(desired, model)[:10]))
-        compose = compose_file(directory, 'target.json', model)
+        if component == 'waf':
+            compose = compose_file(directory, 'target.json', model)
+        else:
+            compose = compose_file(directory, 'pinned.json', model)
     if component == 'all':
         snapshot_runtime(directory, compose, previous)
     command(*compose, 'pull', *services)
@@ -3584,6 +3678,13 @@ nginx_update_transaction() {
   )
 }
 
+nginx_install_update_dependencies() {
+	install python3 || return $?
+	if ! command -v flock >/dev/null 2>&1; then
+		install util-linux || return $?
+	fi
+}
+
 nginx_upgrade() {
   nginx_update_transaction nginx
 }
@@ -3749,14 +3850,15 @@ kpanel_app_delete_sites() {
 
 
 shared_waf_revision() {
-	printf '%s\n' '16620161a319443747ac0fc89242cbf510e89716'
+	printf '%s\n' '041d91ac33e8c74d8fcf97d30a73cef5910e6528'
 }
 
 shared_waf_manifest() {
 	cat <<'WAF_MANIFEST'
-3c425c2214370e2ef68eab7ab629ebf7c0841c77c0c35716790a9fb329590360  configure.py
-7c1f19aad330622eca3c7d3ae3b735d2875113375f7318327cb1f44fa1bbeec6  policy.py
-954e6f6a590a5bafee495b708b8f0876bc612020ba50704d3c41020a53319d31  nginx_edit.py
+7be23f9abbeb83427b1a138a97e9fd1fdbb0c0ad357d4d02f604699a2a24dffe  configure.py
+116d6f22dacae66f8e146ebe701e030693db0ec94bef37999a24e6950d21f39d  policy.py
+93adcf667d3bab494dea93681524c6828dab9d5c36b0c9147229e02e7433360e  nginx_edit.py
+e0aab32f1386a2180288f748c4f0643f9c252c5ddb2dedbf06befc4e36fd6a60  ban.py
 aee6fd651ceb6441acce6dc6b510e504d7127b2bba1ce84ca361655590c615b0  example-policy.json
 e6be6df199bc4ad607b6bcd7273a62a4884e5aa841786db1d8d5a2284f573179  cloudflare-ips.json
 6fd82147b99201beebe7b1a983f146e5c23ade7f9454ac883830848b7f753e30  legacy-jails.local
@@ -3773,7 +3875,7 @@ shared_waf_verified() {
 		[[ "$checksum" =~ ^[0-9a-f]{64}$ ]] || return 1
 		case "$seen" in *"|$filename|"*) return 1 ;; esac
 		seen="${seen}${filename}|"; count=$((count + 1))
-		case "$filename" in configure.py|policy.py|nginx_edit.py|example-policy.json|cloudflare-ips.json|legacy-jails.local) ;;
+		case "$filename" in configure.py|policy.py|nginx_edit.py|ban.py|example-policy.json|cloudflare-ips.json|legacy-jails.local) ;;
 			*) return 1 ;;
 		esac
 		[ -f "$directory/$filename" ] && [ ! -L "$directory/$filename" ] || return 1
@@ -3782,124 +3884,432 @@ shared_waf_verified() {
 		(( (8#$mode & 8#022) == 0 )) || return 1
 		[ "$(sha256sum "$directory/$filename" | awk '{print $1}')" = "$checksum" ] || return 1
 	done < <(shared_waf_manifest)
-	[ "$count" -eq 6 ] && [ "$(find "$directory" -mindepth 1 -maxdepth 1 | wc -l)" -eq 6 ]
+	[ "$count" -eq 7 ] && [ "$(find "$directory" -mindepth 1 -maxdepth 1 | wc -l)" -eq 7 ]
+}
+
+shared_waf_python() {
+    local interpreter
+    for interpreter in python3 python3.13 python3.12 python3.11; do
+        if command -v "$interpreter" >/dev/null 2>&1 && "$interpreter" -I -c 'import sys; raise SystemExit(sys.version_info < (3,11))' >/dev/null 2>&1; then
+            WAF_PYTHON=$(command -v "$interpreter"); return 0
+        fi
+    done
+    echo "WAF 配置工具需要 Python 3.11+" >&2; return 1
+}
+
+shared_waf_runtime() {
+    shared_waf_python || return 1
+    "$WAF_PYTHON" -I - /home/web "${gh_proxy:-https://}" "$@" 3<&0 <<'WAF_RUNTIME'
+#!/usr/bin/env python3
+"""Trusted bootstrap, embedded verbatim in both native scripts. Linux/root only."""
+import base64
+import contextlib
+import fcntl
+import hashlib
+import importlib
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+import urllib.request
+
+PUBLIC_KEY = '-----BEGIN PUBLIC KEY-----\nMIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAyq8p95fmcKVyOfUAar4l\nLsztlRIx9rsEYJzoYlT0RTacFlYfGGfBt3w8KL5AgvCeFuqdrB48NVw7bWM+x5pj\ntGKHRk61UHP01vinZlp6tyQ9gCeKtCtmok9anFssdtGI48cFurY3q7lOrQalmEyb\nJ+Cr9+Oy9egLLE8Lbv/32j/qbQoUgmuHC9Tnn25g1G1Dn5N9UgxZgexDGKdtqli2\ndg2qb7J39nRcbbWioKbeJSAKef0ATz0RSygoG4974Ibn8naC2DkDtS7nT4DAmcts\nw25VNLZ3P2iZIgHQwqYBWFy8llrFNpK/e/NDYHUh7ctDxiHrBEsfrQZevKjmXqdI\nAd24aBbQxM1sCGoDYOfue+ridalr4TftDYxa8o//hLir2g9e9NmWHQDkEA2tG9Ne\nLs+GC20/eE4byS5zXXFiMjfvRmUNAEjD2O9r/ELtmDCrAJGKneZYJeWwswvhTn4Q\nlE1Xk3bXQIyAua3THx9/XODJ1bUgGaQf5JyrWPhwdGznAgMBAAE=\n-----END PUBLIC KEY-----\n'
+BASELINE = {'sequence': 0, 'revision': '041d91ac33e8c74d8fcf97d30a73cef5910e6528', 'files': {'configure.py': '7be23f9abbeb83427b1a138a97e9fd1fdbb0c0ad357d4d02f604699a2a24dffe', 'policy.py': '116d6f22dacae66f8e146ebe701e030693db0ec94bef37999a24e6950d21f39d', 'nginx_edit.py': '93adcf667d3bab494dea93681524c6828dab9d5c36b0c9147229e02e7433360e', 'ban.py': 'e0aab32f1386a2180288f748c4f0643f9c252c5ddb2dedbf06befc4e36fd6a60', 'example-policy.json': 'aee6fd651ceb6441acce6dc6b510e504d7127b2bba1ce84ca361655590c615b0', 'cloudflare-ips.json': 'e6be6df199bc4ad607b6bcd7273a62a4884e5aa841786db1d8d5a2284f573179', 'legacy-jails.local': '6fd82147b99201beebe7b1a983f146e5c23ade7f9454ac883830848b7f753e30'}}
+FILES = ('configure.py', 'policy.py', 'nginx_edit.py', 'ban.py',
+         'example-policy.json', 'cloudflare-ips.json', 'legacy-jails.local')
+CHANNEL = 'raw.githubusercontent.com/kejilion/nginx/main/waf/channels/stable-v1.json'
+ACTIONS = {'plan','apply','configure','doctor','rollback','refresh-ips','retire-jails',
+           'existing-filters','rotation','trust-cloudflare','ban-preflight','ban-install',
+           'ban-clear','ban-remove','cf-on','cf-off','status','ban-status'}
+
+def unique(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result: raise ValueError('Duplicate JSON key')
+        result[key] = value
+    return result
+
+def decode(data):
+    return json.loads(data, object_pairs_hook=unique)
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+def sync(path):
+    fd=os.open(path,os.O_RDONLY | os.O_NOFOLLOW)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+
+def sync_changes(paths,root):
+    parents=set()
+    for path in paths:
+        if path.exists():sync(path)
+        for parent in path.parents:
+            if parent.exists():parents.add(parent)
+            if parent==root:break
+    for parent in sorted(parents,key=lambda p:len(p.parts),reverse=True):sync(parent)
+
+def safe(path, directory=False, missing=False):
+    path = Path(path).absolute()
+    for parent in reversed(path.parents):
+        if not parent.exists():
+            if missing: continue
+            raise ValueError('Missing trusted parent')
+        info = parent.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise ValueError('Untrusted parent: '+str(parent))
+    try: info = path.lstat()
+    except FileNotFoundError:
+        if missing: return
+        raise
+    kind = stat.S_ISDIR if directory else stat.S_ISREG
+    if not kind(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise ValueError('Untrusted path: '+str(path))
+
+def read(path, limit=32768):
+    safe(path)
+    with open(path, 'rb') as stream: data = stream.read(limit+1)
+    if len(data) > limit: raise ValueError('File exceeds budget')
+    return data
+
+def atomic(path, data):
+    safe(path, missing=True)
+    fd, temporary = tempfile.mkstemp(prefix='.state-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(data); stream.flush(); os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try: os.fsync(fd)
+        finally: os.close(fd)
+    finally:
+        if os.path.exists(temporary): os.unlink(temporary)
+
+def verify(envelope, fresh=False):
+    if envelope == {'baseline': True}: return BASELINE
+    if not isinstance(envelope, dict) or set(envelope) != {'payload','signature'}:
+        raise ValueError('Invalid signed envelope')
+    raw = base64.b64decode(envelope['payload'], validate=True)
+    signature = base64.b64decode(envelope['signature'], validate=True)
+    if len(raw) > 8192 or len(signature) != 384: raise ValueError('Invalid signature size')
+    # OpenSSL verifies raw bytes before any publisher-controlled field is used.
+    with tempfile.TemporaryDirectory(prefix='waf-signature-') as tmp:
+        key = Path(tmp)/'public.pem'; sig = Path(tmp)/'signature'
+        key.write_text(PUBLIC_KEY); sig.write_bytes(signature)
+        result = subprocess.run(['openssl','dgst','-sha256','-verify',str(key),
+                                 '-signature',str(sig)], input=raw, capture_output=True, timeout=10)
+    if result.returncode: raise ValueError('Shared package signature rejected')
+    manifest = decode(raw)
+    if set(manifest) != {'schema','api','channel','sequence','revision','files','issued','expires'}:
+        raise ValueError('Invalid manifest fields')
+    for key in ('schema','api','sequence','issued','expires'):
+        if type(manifest[key]) is not int: raise ValueError('Invalid manifest number')
+    if manifest['schema'] != 1 or manifest['api'] != 1 or manifest['channel'] != 'stable':
+        raise ValueError('Incompatible shared package; update the native script')
+    if not 1 <= manifest['sequence'] <= 2**53: raise ValueError('Invalid sequence')
+    if not isinstance(manifest['revision'], str) or not re.fullmatch('[a-f0-9]{40}', manifest['revision']):
+        raise ValueError('Invalid source revision')
+    files = manifest['files']
+    if not isinstance(files, dict) or set(files) != set(FILES): raise ValueError('Invalid package file list')
+    if any(not isinstance(v,str) or not re.fullmatch('[a-f0-9]{64}',v) for v in files.values()):
+        raise ValueError('Invalid package digest')
+    if not 0 < manifest['expires']-manifest['issued'] <= 366*86400:
+        raise ValueError('Invalid publication lifetime')
+    if fresh and not manifest['issued']-300 <= time.time() < manifest['expires']:
+        raise ValueError('Expired or future shared package manifest')
+    return manifest
+
+def fetch(url, limit):
+    class HTTPSOnly(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, url):
+            if urllib.parse.urlsplit(url).scheme != 'https': raise ValueError('HTTPS required')
+            return super().redirect_request(req,fp,code,msg,headers,url)
+    if urllib.parse.urlsplit(url).scheme != 'https': raise ValueError('HTTPS required')
+    def expired(*args): raise TimeoutError('Download deadline exceeded')
+    previous = signal.signal(signal.SIGALRM, expired)
+    signal.alarm(45)
+    try:
+        with urllib.request.build_opener(HTTPSOnly()).open(url, timeout=10) as response:
+            data = response.read(limit+1)
+        if len(data) > limit: raise ValueError('Download exceeds budget')
+        return data
+    finally:
+        signal.alarm(0); signal.signal(signal.SIGALRM, previous)
+
+class Runtime:
+    def __init__(self, root, prefix='https://'):
+        self.root = Path(root).absolute()
+        self.control = self.root/'config/waf'
+        self.state_path = self.control/'package-state.json'
+        self.prefix = prefix
+
+    @contextlib.contextmanager
+    def locked(self, create):
+        safe(self.control, directory=True, missing=True)
+        if not self.control.exists():
+            if not create:
+                yield; return
+            self.control.mkdir(parents=True, mode=0o700)
+        lock = self.control/'package-update.lock'
+        safe(lock, missing=True)
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            # Bounded contention, never wait indefinitely behind another updater.
+            deadline = time.monotonic()+30
+            while True:
+                try: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB); break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline: raise ValueError('Shared package operation busy')
+                    time.sleep(.1)
+            yield
+        finally: os.close(fd)
+
+    def state(self):
+        if not self.state_path.exists():
+            safe(self.state_path, missing=True)
+            return {'active':{'baseline':True}, 'previous':None, 'maximum':0, 'latest':None, 'pending':None}
+        state = decode(read(self.state_path))
+        if set(state) != {'active','previous','maximum','latest','pending'}:
+            raise ValueError('Invalid package state')
+        if type(state['maximum']) is not int or not 0 <= state['maximum'] <= 2**53:
+            raise ValueError('Invalid update watermark')
+        if state['pending'] is not None and (not isinstance(state['pending'], str) or len(state['pending'])>512):
+            raise ValueError('Invalid recovery state')
+        for field in ('active','previous','latest'):
+            if state[field] is not None:
+                if verify(state[field])['sequence'] > state['maximum']: raise ValueError('Invalid update watermark')
+        return state
+
+    def save(self, state):
+        atomic(self.state_path, (json.dumps(state, sort_keys=True)+'\n').encode())
+
+    def remote(self, state):
+        envelope = decode(fetch(self.prefix+CHANNEL, 16384))
+        # The local baseline sentinel is never accepted from the network.
+        if set(envelope) != {'payload','signature'}: raise ValueError('Unsigned channel')
+        manifest = verify(envelope, fresh=True)
+        if manifest['sequence'] < state['maximum']: raise ValueError('Shared package replay rejected')
+        if manifest['sequence'] == state['maximum'] and envelope != state['latest']:
+            raise ValueError('Shared package sequence was reused')
+        return envelope
+
+    def package(self, envelope, download=False):
+        manifest = verify(envelope)
+        base = self.control/'packages'
+        directory = base/manifest['revision']
+        safe(directory, directory=True, missing=True)
+        if directory.exists():
+            if set(p.name for p in directory.iterdir()) != set(FILES): raise ValueError('Unknown package cache file')
+            for name in FILES:
+                if digest(read(directory/name, 2097152)) != manifest['files'][name]:
+                    raise ValueError('Shared package cache hash mismatch')
+            return directory
+        if not download: raise ValueError('共享 WAF 包尚未导入；状态查询不会自动下载')
+        base.mkdir(parents=True, exist_ok=True, mode=0o700)
+        entries = list(base.iterdir())
+        if len(entries) >= 16: raise ValueError('WAF cache limit reached; archive an inactive version first')
+        total = 0
+        for entry in entries:
+            safe(entry, directory=True)
+            if not re.fullmatch('[a-f0-9]{40}',entry.name): raise ValueError('Unknown cache directory')
+            for item in entry.iterdir():
+                if item.name not in FILES: raise ValueError('Unknown cache file')
+                safe(item); total += item.stat().st_size
+        if total > 48*1024*1024: raise ValueError('WAF cache byte limit reached')
+        # One reserved, bounded staging directory outside the legacy seven-file
+        # package cache. A killed downloader can be retried under the same lock.
+        stage=self.control/'package-download-stage'
+        safe(stage,directory=True,missing=True)
+        stage.mkdir(mode=0o700,exist_ok=True)
+        for item in stage.iterdir():
+            if item.name not in FILES: raise ValueError('Unknown staging file; preserve for inspection')
+            safe(item)
+            if item.stat().st_size>2097152: raise ValueError('Staging file exceeds budget')
+        for item in stage.iterdir():item.unlink()
+        for name in FILES:
+            url = self.prefix+'raw.githubusercontent.com/kejilion/nginx/'+manifest['revision']+'/waf/'+name
+            data = fetch(url, 2097152)
+            if digest(data) != manifest['files'][name]: raise ValueError('Downloaded package hash mismatch')
+            path=stage/name
+            with path.open('xb') as stream:
+                os.fchmod(stream.fileno(),0o600);stream.write(data);stream.flush();os.fsync(stream.fileno())
+        sync(stage)
+        # All bytes are verified and durable before candidate execution/state commit.
+        os.rename(stage,directory);sync(base);sync(self.control)
+        return self.package(envelope)
+
+    def execute(self, envelope, args):
+        directory = self.package(envelope)
+        with os.fdopen(os.dup(3),'rb') as source:
+            result = subprocess.run([sys.executable,'-E','-s','-B',str(directory/'configure.py'),
+                                     '--root',str(self.root),*args], stdin=source, capture_output=True, timeout=180)
+        if result.returncode:
+            raise ValueError('WAF '+args[0]+' failed: '+result.stderr.decode(errors='replace')[-1500:])
+        return result.stdout
+
+    def module(self, envelope):
+        directory = self.package(envelope)
+        sys.dont_write_bytecode = True
+        for name in ('configure','policy','nginx_edit','ban'): sys.modules.pop(name,None)
+        sys.path.insert(0,str(directory))
+        try: return importlib.import_module('configure')
+        finally: sys.path.pop(0)
+
+    def doctor(self, module):
+        config = module.policy.validate(module.load_json(self.control/'policy.json'))
+        module.execute('docker','exec',config['container'],'nginx','-t')
+        status = module.configured_status(self.root,config)
+        if not status['methodOverride']['synchronized'] or not status['requestSemantics']['synchronized']:
+            raise ValueError('Managed configuration is not synchronized')
+
+    def restore(self, state, module=None):
+        module = module or self.module(state['active'])
+        backup = Path(state['pending'])
+        records = module.load_json(backup/'manifest.json')['files']
+        # After a crash another root manager may have acted. Do not overwrite
+        # changes that match neither the recorded preimage nor candidate bytes.
+        for relative, item in records.items():
+            path = self.root/relative
+            if path.resolve()!=path or self.root not in path.parents: raise ValueError('Unsafe recovery path')
+            before = base64.b64decode(item['before']) if item['before'] is not None else None
+            actual = digest(read(path,2097152)) if path.exists() else None
+            if actual not in {digest(before) if before is not None else None,item['afterSha256']}:
+                raise ValueError('Recovery conflict: '+relative)
+        module.restore(self.root,backup,verify=False)
+        config = module.policy.validate(module.load_json(self.control/'policy.json'))
+        module.execute('docker','exec',config['container'],'nginx','-t')
+        module.reload_nginx(config['container'])
+        self.doctor(module)
+        sync_changes([self.root/relative for relative in records],self.root)
+        state['pending'] = None
+        self.save(state)
+
+    def activate(self, state, target):
+        self.package(target, download=True)
+        self.package(state['active'], download=True)
+        old = self.module(state['active'])
+        # Same lock as existing configure/manage/ban writers. The outer package
+        # lock is always acquired first; no child process waits on our own lock.
+        with old.locked(self.control/'install.lock',timeout=30):
+            # Freeze legacy adoption under the very same lock as activation.
+            if not self.state_path.exists():self.check_legacy_baseline(state,old)
+            candidate = self.module(target)
+            config = candidate.policy.validate(candidate.load_json(self.control/'policy.json'))
+            config = candidate.reconcile_native_switch(self.root,config)
+            changes,_ = candidate.make_plan(self.root,config)
+            # Snapshot exact preimages, including newly created files, before
+            # executing the candidate transaction. It uses the existing format.
+            backup = old.snapshot(self.root,changes,'package-update')
+            sync(backup/'manifest.json')
+            for parent in (backup,*backup.parents):
+                sync(parent)
+                if parent==self.root:break
+            state['pending'] = str(backup)
+            self.save(state)
+            try:
+                candidate.apply(self.root,config,respect_native=True,lock_held=True)
+                self.doctor(candidate)
+                sync_changes(changes,self.root)
+                previous=state['previous'] if target==state['active'] else state['active']
+                new = dict(state,active=target,previous=previous,pending=None)
+                self.save(new)
+            except Exception:
+                try: self.restore(state,old)
+                except Exception as recovery:
+                    raise ValueError('Update failed and recovery incomplete; run package-recover: '+str(recovery))
+                raise
+        return verify(target)['revision']
+
+    def check_legacy_baseline(self,state,module):
+        config=module.policy.validate(module.load_json(self.control/'policy.json'))
+        config=module.reconcile_native_switch(self.root,config)
+        changes,_=module.make_plan(self.root,config)
+        if any(not p.exists() or p.read_bytes()!=data for p,data in changes.items()):
+            raise ValueError('Older/unidentified installation: first run k web waf apply, then package-update')
+
+    def run(self, command, args):
+        read_only = command in {'cached','package-status'} or (command=='run' and args and args[0] in {'status','ban-status'})
+        with self.locked(not read_only):
+            state = self.state()
+            if command=='package-status':
+                return json.dumps({'active':verify(state['active'])['revision'],
+                                   'previous':verify(state['previous'])['revision'] if state['previous'] else None,
+                                   'maximumSequence':state['maximum'],'recoveryRequired':bool(state['pending'])})
+            if command=='package-recover':
+                if not state['pending']: return 'No interrupted package update'
+                module = self.module(state['active'])
+                with module.locked(self.control/'install.lock',timeout=30): self.restore(state,module)
+                return 'Previous shared package restored'
+            if state['pending']: raise ValueError('Interrupted update; run k web waf package-recover')
+            if command=='package-check':
+                target = self.remote(state)
+                return json.dumps({'available':verify(target)['revision'], 'active':verify(state['active'])['revision']})
+            if command=='package-update':
+                if not (self.control/'policy.json').exists(): raise ValueError('Install/configure WAF before hot update')
+                self.package(state['active'],download=True)
+                target = self.remote(state)
+                state['maximum'] = verify(target)['sequence']; state['latest'] = target
+                # activate persists the replay floor with pending before code can
+                # change live resources, under the common installation lock.
+                if target == state['active']:
+                    self.activate(state,target)
+                    return 'Shared package current; managed files reconciled'
+                return 'Shared package updated: '+self.activate(state,target)
+            if command=='package-rollback':
+                if state['previous'] is None: raise ValueError('No previous shared package')
+                return 'Shared package rolled back: '+self.activate(state,state['previous'])
+            if command not in {'prepare','cached','run'}: raise ValueError('Unknown package command')
+            if command=='run' and (not args or args[0] not in ACTIONS): raise ValueError('Action-first WAF syntax required')
+            # Adopt existing installations without changing their rules. New installs
+            # require a fresh signed channel, not a silent stale fallback.
+            if not self.state_path.exists() and not (self.control/'policy.json').exists() and not read_only:
+                target = self.remote(state)
+                self.package(target, download=True)
+                state.update(active=target, maximum=verify(target)['sequence'], latest=target)
+                self.save(state)
+            directory = self.package(state['active'], download=not read_only)
+            if command in {'prepare','cached'}: return str(directory)
+            return self.execute(state['active'], args).decode()
+
+def main():
+    if os.geteuid()!=0 or sys.version_info<(3,11): raise ValueError('Root and Python 3.11+ required')
+    # Arguments are supplied only by the trusted shell wrapper; no remote URL is executable input.
+    if len(sys.argv)<4: raise ValueError('Missing runtime arguments')
+    print(Runtime(sys.argv[1],sys.argv[2]).run(sys.argv[3],sys.argv[4:]))
+
+if __name__=='__main__':
+    try: main()
+    except Exception as error:
+        print('Shared WAF: '+str(error),file=sys.stderr); raise SystemExit(1)
+WAF_RUNTIME
 }
 
 shared_waf_prepare() {
-	local revision base stage checksum filename interpreter
-	revision=$(shared_waf_revision)
-	[[ "$revision" =~ ^[0-9a-f]{40}$ ]] || { echo "WAF 来源版本尚未冻结" >&2; return 1; }
-	WAF_PYTHON=""
-	for interpreter in python3 python3.13 python3.12 python3.11; do
-		if command -v "$interpreter" >/dev/null 2>&1 && "$interpreter" -I -c 'import sys; raise SystemExit(sys.version_info < (3,11))' >/dev/null 2>&1; then
-			WAF_PYTHON=$(command -v "$interpreter"); break
-		fi
-	done
-	[ -n "$WAF_PYTHON" ] || { echo "WAF 配置工具需要 Python 3.11+，不会替换系统 Python" >&2; return 1; }
-	base=/home/web/config/waf/packages
-	# The same directory trust check used by the configuration tool, before mkdir/download.
-	"$WAF_PYTHON" -I - "$base" "$revision" <<'WAF_PATH'
-import os,pathlib,stat,sys
-path=pathlib.Path(sys.argv[1])
-for parent in [path,*path.parents]:
- if not parent.exists() and not parent.is_symlink():continue
- info=parent.lstat()
- if not stat.S_ISDIR(info.st_mode) or info.st_uid!=0 or info.st_mode & 0o022:
-  raise SystemExit('WAF 配置目录所有权或权限不可信')
-if path.exists():
- count=total=0
- for entry in path.iterdir():
-  count+=1
-  if count>16:raise SystemExit('WAF 版本缓存上限16份，请先归档旧版本')
-  info=entry.lstat()
-  if entry.is_symlink() or not entry.is_dir() or info.st_uid!=0 or info.st_mode & 0o022:raise SystemExit('WAF 缓存含不可信条目')
-  children=0
-  for child in entry.iterdir():
-   children+=1
-   if children>6:raise SystemExit('WAF 缓存含未知文件')
-   if child.is_symlink() or not child.is_file():raise SystemExit('WAF 缓存含未知文件类型')
-   total+=child.stat().st_size
-   if total>64*1024*1024:raise SystemExit('WAF 版本缓存超过64MiB，请先归档')
- if not (path/sys.argv[2]).exists() and (count>=16 or total>52*1024*1024):
-  raise SystemExit('WAF 版本缓存余量不足，请先归档旧版本')
-WAF_PATH
-	[ "$?" -eq 0 ] || return 1
-	mkdir -p "$base" || return 1
-	WAF_DIRECTORY="$base/$revision"
-	if [ -e "$WAF_DIRECTORY" ] || [ -L "$WAF_DIRECTORY" ]; then
-		shared_waf_verified "$WAF_DIRECTORY" || { echo "WAF 缓存校验失败，已保留现场" >&2; return 1; }
-		return 0
-	fi
-	(
-	stage=$(mktemp -d "$base/.stage.XXXXXX") || return 1
-	trap 'for filename in configure.py policy.py nginx_edit.py example-policy.json cloudflare-ips.json legacy-jails.local; do rm -f -- "$stage/$filename"; done; rmdir -- "$stage" 2>/dev/null || true' EXIT
-	chmod 700 "$stage" || exit 1
-	while read -r checksum filename; do
-		if ! "$WAF_PYTHON" -I - "${gh_proxy:-https://}raw.githubusercontent.com/kejilion/nginx/$revision/waf/$filename" "$stage/$filename" <<'WAF_DOWNLOAD'
-import os,signal,sys,urllib.parse,urllib.request
-class HTTPSOnly(urllib.request.HTTPRedirectHandler):
- def redirect_request(self,req,fp,code,msg,headers,url):
-  if urllib.parse.urlsplit(url).scheme!='https':raise ValueError('HTTPS required')
-  return super().redirect_request(req,fp,code,msg,headers,url)
-def expired(*args):raise TimeoutError('Download deadline exceeded')
-try:
- if urllib.parse.urlsplit(sys.argv[1]).scheme!='https':raise ValueError('HTTPS required')
- signal.signal(signal.SIGALRM,expired);signal.alarm(45)
- with urllib.request.build_opener(HTTPSOnly()).open(sys.argv[1],timeout=10) as response:
-  data=response.read(2097153)
- if len(data)>2097152:raise ValueError('Download exceeds budget')
- fd=os.open(sys.argv[2],os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,'O_NOFOLLOW',0),0o600)
- with os.fdopen(fd,'wb') as stream:stream.write(data)
-except Exception:raise SystemExit(1)
-finally:signal.alarm(0)
-WAF_DOWNLOAD
-		then
-			echo "WAF 下载失败，未执行候选代码：$filename" >&2
-			return 1
-		fi
-		chmod 600 "$stage/$filename" || return 1
-	done < <(shared_waf_manifest)
-	shared_waf_verified "$stage" || { echo "WAF 来源摘要不符，未执行候选代码" >&2; return 1; }
-	# No replace of an existing revision; concurrent callers must verify the winner.
-	if ! mv -T "$stage" "$WAF_DIRECTORY" 2>/dev/null; then
-		shared_waf_verified "$WAF_DIRECTORY" || return 1
-	fi
-	shared_waf_verified "$WAF_DIRECTORY"
-	)
+    shared_waf_python || return 1
+    WAF_DIRECTORY=$(shared_waf_runtime prepare) || return 1
 }
 
 shared_waf_cached() {
-	local revision interpreter
-	revision=$(shared_waf_revision)
-	[[ "$revision" =~ ^[0-9a-f]{40}$ ]] || return 1
-	WAF_DIRECTORY="/home/web/config/waf/packages/$revision"
-	WAF_PYTHON=""
-	for interpreter in python3 python3.13 python3.12 python3.11; do
-		if command -v "$interpreter" >/dev/null 2>&1 && "$interpreter" -I -c 'import sys; raise SystemExit(sys.version_info < (3,11))' >/dev/null 2>&1; then
-			WAF_PYTHON=$(command -v "$interpreter"); break
-		fi
-	done
-	[ -n "$WAF_PYTHON" ] || return 1
-	# No mkdir or download: every ancestor must be stable before root execution.
-	"$WAF_PYTHON" -I - "$WAF_DIRECTORY" <<'WAF_CACHED_PATH'
-import pathlib,stat,sys
-path=pathlib.Path(sys.argv[1])
-for parent in [path,*path.parents]:
- info=parent.lstat()
- if not stat.S_ISDIR(info.st_mode) or info.st_uid!=0 or info.st_mode & 0o022:
-  raise SystemExit('WAF 配置目录所有权或权限不可信')
-WAF_CACHED_PATH
-	[ "$?" -eq 0 ] && shared_waf_verified "$WAF_DIRECTORY"
+    shared_waf_python || return 1
+    WAF_DIRECTORY=$(shared_waf_runtime cached) || return 1
 }
 
 shared_waf() {
-	# Native CLI requires action-first syntax; reject options before any preparation.
-	case "${1:-}" in
-		status) shared_waf_cached || return 1 ;;
-		plan|apply|configure|doctor|rollback|refresh-ips|retire-jails|existing-filters|rotation|trust-cloudflare) shared_waf_prepare || return 1 ;;
-		*) echo "用法: k web waf <action> [options]；状态查询: k web waf status" >&2; return 2 ;;
-	esac
-	"$WAF_PYTHON" -E -s -B "$WAF_DIRECTORY/configure.py" --root /home/web "$@"
+    case "${1:-}" in
+        package-check|package-update|package-status|package-rollback|package-recover)
+            [ "$#" -eq 1 ] || { echo "共享包命令不接受额外参数" >&2; return 2; }
+            shared_waf_runtime "$1" ;;
+        status|ban-status|plan|apply|configure|doctor|rollback|refresh-ips|retire-jails|existing-filters|rotation|trust-cloudflare|ban-preflight|ban-install|ban-clear|ban-remove|cf-on|cf-off)
+            shared_waf_runtime run "$@" ;;
+        *) echo "用法: k web waf <action>；共享包更新: k web waf package-update" >&2; return 2 ;;
+    esac
 }
 
 shared_waf_refresh() {
@@ -4020,10 +4430,75 @@ check_waf_status() {
 
 
 check_cf_mode() {
-	if [ -f "/etc/fail2ban/action.d/cloudflare-docker.conf" ]; then
-		CFmessage=" cf模式已开启"
+	CFmessage=""
+	[ -f /home/web/config/waf/ban-cf.json ] || {
+		[ ! -f /etc/fail2ban/action.d/cloudflare-docker.conf ] || CFmessage=" CF旧配置待迁移"
+		return 0
+	}
+	local state
+	shared_waf_cached || { CFmessage=" CF状态异常"; return 0; }
+	state=$(shared_waf ban-status 2>/dev/null) || { CFmessage=" CF状态异常"; return 0; }
+	CFmessage=$(printf '%s' "$state" | "$WAF_PYTHON" -I -X utf8 -c 'import json,sys; s=json.load(sys.stdin); print(" CF关闭清理待重试" if s.get("cleanupPending") else (" CF同步待核验" if not s["healthy"] else " CF等待同步" if s["pending"] else " CF模式已开启") if s["mode"]=="cloudflare" else " 源站封禁模式")')
+}
+
+web_ban_cron_ready() {
+	if pgrep -x cron >/dev/null 2>&1 || pgrep -x crond >/dev/null 2>&1; then return 0; fi
+	if [ -d /run/systemd/system ]; then
+		local unit
+		for unit in cron.service crond.service; do
+			if systemctl cat "$unit" >/dev/null 2>&1; then
+				systemctl enable --now "$unit" || return 1
+				systemctl is-active --quiet "$unit" && return 0
+			fi
+		done
+	elif command -v rc-service >/dev/null 2>&1; then
+		rc-update add crond default && rc-service crond start && rc-service crond status && return 0
+	fi
+	echo "定时服务未就绪，请启动 cron/crond 后重试；封禁到期和CF同步需要它运行。" >&2
+	return 1
+}
+
+web_ban_install() {
+	# Validate and classify legacy state before touching Fail2Ban or Nginx.
+	shared_waf ban-preflight || return $?
+	f2b_install_sshd || return $?
+	if ! ip -j address show >/dev/null 2>&1; then
+		if command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+			install iproute || return $?
+		else
+			install iproute2 || return $?
+		fi
+	fi
+	ip -j address show >/dev/null 2>&1 || return 1
+	check_crontab_installed || return $?
+	web_ban_cron_ready || return $?
+	if [ -f /home/web/config/waf/policy.json ]; then
+		shared_waf ban-install
 	else
-		CFmessage=""
+		# New installs begin in detection mode; existing WAF modes stay unchanged.
+		nginx_waf detect || return $?
+		shared_waf ban-install
+	fi
+}
+
+web_cf_enable() {
+	web_ban_install || return $?
+	# Credentials travel over stdin, never through command arguments or logs.
+	printf '%s\n%s\n' "$1" "$2" |
+		"$WAF_PYTHON" -I -c 'import json,sys; print(json.dumps(dict(email=sys.stdin.readline().rstrip("\n"),key=sys.stdin.readline().rstrip("\n"))))' |
+		shared_waf cf-on
+}
+
+web_ban_clear() {
+	if [ -f /home/web/config/waf/bans.json ] || [ -f /home/web/config/waf/ban-cf.json ]; then
+		shared_waf ban-clear || return $?
+	fi
+	fail2ban-client unban --all
+}
+
+web_ban_remove() {
+	if [ -f /home/web/config/waf/bans.json ] || [ -f /home/web/config/waf/ban-cf.json ]; then
+		shared_waf ban-remove || return $?
 	fi
 }
 
@@ -4133,12 +4608,49 @@ define('WP_SITEURL', '$SITE_URL');
 
 
 
+nginx_template_install() {
+	(
+	set -euo pipefail
+	local revision='bdb8cc42fb123b09b02dc5940d2596354efebb87'
+	local expected_sha='c1d5d9706c9f1965c1af3664979cf54e0c9173b9b1c3924aeea49da228347d22'
+	local target=/home/web/nginx.conf download backup='' url size actual_sha
+	local gh_prefix="${gh_proxy:-https://}"
+	[ -d /home/web ] && [ ! -L /home/web ] || { echo "Nginx 配置目录无效" >&2; exit 1; }
+	if [ -e "$target" ] || [ -L "$target" ]; then
+		[ -f "$target" ] && [ ! -L "$target" ] || { echo "Nginx 配置文件类型无效" >&2; exit 1; }
+		# Existing WAF/custom configuration is migrated by the updater, never reset here.
+        [ ! -s "$target" ] || exit 0
+	fi
+	download=$(mktemp /home/web/.nginx10.conf.download.XXXXXX) || exit 1
+	trap 'rm -f -- "$download" ${backup:+"$backup"}' EXIT
+	url="${gh_prefix}raw.githubusercontent.com/kejilion/nginx/${revision}/nginx10.conf"
+	curl --fail --location --silent --show-error --connect-timeout 10 --max-time 45 --output "$download" "$url" || {
+		echo "Nginx 配置模板下载失败" >&2; exit 1;
+	}
+	size=$(wc -c < "$download")
+	[[ "$size" =~ ^[0-9]+$ ]] && [ "$size" -le 2097152 ] || { echo "Nginx 配置模板大小异常" >&2; exit 1; }
+	actual_sha=$(sha256sum -- "$download" | awk '{print $1}')
+	[ "$actual_sha" = "$expected_sha" ] || { echo "Nginx 配置模板摘要校验失败" >&2; exit 1; }
+	if [ -e "$target" ]; then
+		backup=$(mktemp /home/web/.nginx10.conf.backup.XXXXXX) || exit 1
+		cp -p -- "$target" "$backup" || exit 1
+		if ! cat -- "$download" > "$target"; then
+			cat -- "$backup" > "$target" || { echo "Nginx 配置恢复失败" >&2; exit 86; }
+			echo "Nginx 配置写入失败，已恢复原文件" >&2; exit 1
+		fi
+	else
+		command install -m 0644 -- "$download" "$target" || exit 1
+	fi
+	)
+}
+
+
 nginx_br() {
 
 	local mode=$1
 
 	if ! grep -q "kjlion/nginx:alpine" /home/web/docker-compose.yml; then
-		wget -O /home/web/nginx.conf "${gh_proxy}raw.githubusercontent.com/kejilion/nginx/main/nginx10.conf"
+		nginx_template_install || return $?
 	fi
 
 	if [ "$mode" == "on" ]; then
@@ -4194,7 +4706,7 @@ nginx_zstd() {
 	local mode=$1
 
 	if ! grep -q "kjlion/nginx:alpine" /home/web/docker-compose.yml; then
-		wget -O /home/web/nginx.conf "${gh_proxy}raw.githubusercontent.com/kejilion/nginx/main/nginx10.conf"
+		nginx_template_install || return $?
 	fi
 
 	if [ "$mode" == "on" ]; then
@@ -4289,8 +4801,10 @@ web_security() {
 			  echo "------------------------"
 			  echo "11. 配置拦截参数                  12. 清除所有拉黑的IP"
 			  echo "------------------------"
-			  echo "21. cloudflare模式                22. 高负载开启5秒盾"
+			  echo "21. 开启CF封禁模式                22. 高负载开启5秒盾"
 			  echo "------------------------"
+			  echo "23. 关闭CF封禁模式（保留源站防护）"
+			  echo "24. 关闭高负载5秒盾"
 			  echo "31. 开启WAF                       32. 关闭WAF"
 			  echo "33. 开启DDOS防御                  34. 关闭DDOS防御"
 			  echo "------------------------"
@@ -4301,18 +4815,7 @@ web_security() {
 			  read -e -p "请输入你的选择: " sub_choice
 			  case $sub_choice in
 				  1)
-					  f2b_install_sshd
-					  cd /etc/fail2ban/filter.d
-					  curl -sS -O ${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/fail2ban-nginx-cc.conf
-					  wget ${gh_proxy}raw.githubusercontent.com/linuxserver/fail2ban-confs/master/filter.d/nginx-418.conf
-					  wget ${gh_proxy}raw.githubusercontent.com/linuxserver/fail2ban-confs/master/filter.d/nginx-deny.conf
-					  wget ${gh_proxy}raw.githubusercontent.com/linuxserver/fail2ban-confs/master/filter.d/nginx-unauthorized.conf
-					  wget ${gh_proxy}raw.githubusercontent.com/linuxserver/fail2ban-confs/master/filter.d/nginx-bad-request.conf
-
-					  cd /etc/fail2ban/jail.d/
-					  curl -sS -O ${gh_proxy}raw.githubusercontent.com/kejilion/config/main/fail2ban/nginx-docker-cc.conf
-					  sed -i "/cloudflare/d" /etc/fail2ban/jail.d/nginx-docker-cc.conf
-					  f2b_status
+					  web_ban_install || { echo "防护链路配置失败" >&2; continue; }
 					  ;;
 				  5)
 					  echo "------------------------"
@@ -4320,38 +4823,24 @@ web_security() {
 					  echo "------------------------"
 					  ;;
 				  6)
-
-					  echo "------------------------"
-					  local xxx="fail2ban-nginx-cc"
-					  f2b_status_xxx
-					  echo "------------------------"
-					  local xxx="nginx-418"
-					  f2b_status_xxx
-					  echo "------------------------"
-					  local xxx="nginx-bad-request"
-					  f2b_status_xxx
-					  echo "------------------------"
-					  local xxx="nginx-badbots"
-					  f2b_status_xxx
-					  echo "------------------------"
-					  local xxx="nginx-botsearch"
-					  f2b_status_xxx
-					  echo "------------------------"
-					  local xxx="nginx-deny"
-					  f2b_status_xxx
-					  echo "------------------------"
-					  local xxx="nginx-http-auth"
-					  f2b_status_xxx
-					  echo "------------------------"
-					  local xxx="nginx-unauthorized"
-					  f2b_status_xxx
-					  echo "------------------------"
-					  local xxx="php-url-fopen"
-					  f2b_status_xxx
-					  echo "------------------------"
-
+					  if command -v fail2ban-client >/dev/null 2>&1 && fail2ban-client ping >/dev/null 2>&1 &&
+							  jail_overview=$(fail2ban-client status 2>/dev/null); then
+						  jail_list=$(printf '%s\n' "$jail_overview" | sed -n 's/^.*Jail list:[[:space:]]*//p' | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+						  for jail in waf-attack waf-rate; do
+							  if printf '%s\n' "$jail_list" | grep -Fxq -- "$jail" && jail_status=$(fail2ban-client status "$jail" 2>/dev/null); then
+								  printf '%s\n' "$jail_status"
+							  else
+								  echo "网站 Jail $jail 未安装或未加载，请选择 1 安装防御程序后重试。"
+							  fi
+						  done
+						  if printf '%s\n' "$jail_list" | grep -Fxq -- waf-api-invalid && jail_status=$(fail2ban-client status waf-api-invalid 2>/dev/null); then
+							  printf '%s\n' "$jail_status"
+						  fi
+					  else
+						  echo "Fail2Ban 未运行，无法读取网站拦截记录。"
+					  fi
+					  shared_waf ban-status || echo "WAF/CF 状态读取失败，请检查缓存和配置。" >&2
 					  ;;
-
 				  7)
 					  fail2ban-client status
 					  ;;
@@ -4360,6 +4849,7 @@ web_security() {
 
 					  ;;
 				  9)
+					  web_ban_remove || { echo "封禁清理未完成，停止卸载" >&2; continue; }
 					  remove fail2ban
 					  rm -rf /etc/fail2ban
 					  crontab -l | grep -v "CF-Under-Attack.sh" | crontab - 2>/dev/null
@@ -4369,38 +4859,39 @@ web_security() {
 
 				  11)
 					  install nano
-					  nano /etc/fail2ban/jail.d/nginx-docker-cc.conf
-					  f2b_status
+					  echo "调整 waf-attack / waf-rate 的 maxretry、findtime、bantime（首次封禁秒数）；不修改过滤器和动作。"
+					  echo "默认递进：10分钟、1小时、6小时、24小时；实际时间以各规则配置为准。"
+					  echo "bantime.increment=false 可关闭该规则递进；历史保留时间由 Fail2Ban 数据库配置决定。"
+					  nano /etc/fail2ban/jail.d/zz-waf-managed.local
+					  fail2ban-client -t || { echo "配置检查失败" >&2; continue; }
+					  shared_waf ban-install || { echo "防护参数未完整应用，请检查上方错误并修正配置。" >&2; continue; }
+					  fail2ban-client status
 					  break
 					  ;;
 
 				  12)
-					  fail2ban-client unban --all
+					  web_ban_clear || continue
 					  ;;
 
 				  21)
-					  send_stats "cloudflare模式"
-					  echo "到cf后台右上角我的个人资料，选择左侧API令牌，获取Global API Key"
-					  echo "https://dash.cloudflare.com/login"
-					  read -e -p "输入CF的账号: " cfuser
-					  read -e -p "输入CF的Global API Key: " cftoken
-
-					  wget -O /home/web/conf.d/default.conf ${gh_proxy}raw.githubusercontent.com/kejilion/nginx/main/default11.conf
-					  docker exec nginx nginx -s reload
-
-					  cd /etc/fail2ban/jail.d/
-					  curl -sS -O ${gh_proxy}raw.githubusercontent.com/kejilion/config/main/fail2ban/nginx-docker-cc.conf
-
-					  cd /etc/fail2ban/action.d
-					  curl -sS -O ${gh_proxy}raw.githubusercontent.com/kejilion/config/main/fail2ban/cloudflare-docker.conf
-
-					  sed -i "s/kejilion@outlook.com/$cfuser/g" /etc/fail2ban/action.d/cloudflare-docker.conf
-					  sed -i "s/APIKEY00000/$cftoken/g" /etc/fail2ban/action.d/cloudflare-docker.conf
-					  f2b_status
-
-					  echo "已配置cloudflare模式，可在cf后台，站点-安全性-事件中查看拦截记录"
+					  echo "使用邮箱和 Global API Key；API Token 用户邮箱留空，需要 Zone Read / Zone WAF Edit。"
+					  echo "按域名同步封禁，不再创建账号级 IP 黑名单。"
+					  read -r -p "输入CF邮箱（Token留空）: " cfuser
+					  read -r -s -p "输入CF Key或Token: " cftoken; echo
+					  if web_cf_enable "$cfuser" "$cftoken"; then
+						  echo "CF封禁模式已配置，事件按分钟同步，源站封禁持续有效"
+					  else
+						  echo "CF同步未完成，请检查 k web waf ban-status" >&2
+					  fi
+					  unset cfuser cftoken
 					  ;;
-
+				  23)
+					  shared_waf cf-off || { echo "CF规则清理未完成，凭据已保留供重试" >&2; continue; }
+					  ;;
+				  24)
+					  kpanel_ldnmp_cloudflare_shield_off || { echo "高负载5秒盾关闭失败，请检查定时任务" >&2; continue; }
+					  echo "高负载5秒盾已关闭，CF封禁模式与源站防护保持不变"
+					  ;;
 				  22)
 					  send_stats "高负载开启5秒盾"
 					  echo -e "${gl_huang}网站每5分钟自动检测，当达检测到高负载会自动开盾，低负载也会自动关闭5秒盾。${gl_bai}"
@@ -4417,15 +4908,15 @@ web_security() {
 					  cd ~
 					  install jq bc
 					  check_crontab_installed
-					  curl -sS -O ${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/CF-Under-Attack.sh
-					  chmod +x CF-Under-Attack.sh
-					  sed -i "s/AAAA/$cfuser/g" ~/CF-Under-Attack.sh
-					  sed -i "s/BBBB/$cftoken/g" ~/CF-Under-Attack.sh
-					  sed -i "s/CCCC/$cfzonID/g" ~/CF-Under-Attack.sh
+					  if ! cf_shield_install_script "$cfuser" "$cftoken" "$cfzonID"; then
+						  unset cfuser cftoken cfzonID
+						  continue
+					  fi
 
-					  local cron_job="*/5 * * * * ~/CF-Under-Attack.sh"
+					  local cron_job="*/5 * * * * /root/CF-Under-Attack.sh"
 
-					  local existing_cron=$(crontab -l 2>/dev/null | grep -F "$cron_job")
+					  local existing_cron
+					  existing_cron=$(crontab -l 2>/dev/null | grep -F "CF-Under-Attack.sh" || true)
 
 					  if [ -z "$existing_cron" ]; then
 						  (crontab -l 2>/dev/null; echo "$cron_job") | crontab -
@@ -4433,6 +4924,7 @@ web_security() {
 					  else
 						  echo "自动开盾脚本已存在，无需添加"
 					  fi
+					  unset cfuser cftoken cfzonID
 
 					  ;;
 
@@ -5811,6 +6303,15 @@ check_f2b_status() {
 
 f2b_install_sshd() {
 
+	if command -v apt &>/dev/null; then
+		install rsyslog || return 1
+		/bin/systemctl enable --now rsyslog.service || return 1
+		if [ ! -e /var/log/auth.log ]; then
+			touch /var/log/auth.log || return 1
+			chmod 0640 /var/log/auth.log || return 1
+		fi
+	fi
+
 	docker rm -f fail2ban >/dev/null 2>&1
 	install fail2ban || return 1
 
@@ -5826,11 +6327,6 @@ f2b_install_sshd() {
 			chmod 0600 /var/log/secure || return 1
 			command -v restorecon >/dev/null 2>&1 && restorecon /var/log/secure || true
 		fi
-	fi
-
-	if command -v apt &>/dev/null; then
-		install rsyslog || return 1
-		/bin/systemctl enable --now rsyslog.service || return 1
 	fi
 
 	if command -v apk >/dev/null 2>&1; then
@@ -6445,17 +6941,18 @@ kpanel_system_tuning_download_verified() {
 }
 
 kpanel_system_tuning_switch_mirror() {
+	preserve_armbian_mirrors && return 0
 	local script country url
 	script="$(mktemp /tmp/kejilion-system-tuning-mirror.XXXXXX)" || return 1
 	url="${gh_proxy}raw.githubusercontent.com/SuperManito/LinuxMirrors/${KPANEL_SYSTEM_TUNING_MIRROR_COMMIT}/ChangeMirrors.sh"
 	kpanel_system_tuning_download_verified "$url" "$KPANEL_SYSTEM_TUNING_MIRROR_SHA256" "$script" || { rm -f -- "$script"; return 1; }
 	country="$(kpanel_system_tuning_curl --fail --silent --show-error --max-time 10 https://ipinfo.io/country 2>/dev/null | tr -d '\r\n' || true)"
 	if [ "$country" = CN ]; then
-		kpanel_system_tuning_run_command bash "$script" --source mirrors.huaweicloud.com --protocol https --use-intranet-source false --backup true --upgrade-software false --clean-cache false --ignore-backup-tips --install-epel false --pure-mode
+		kpanel_system_tuning_run_command linuxmirrors_run_script "$script" --source mirrors.huaweicloud.com --protocol https --use-intranet-source false --backup true --upgrade-software false --clean-cache false --ignore-backup-tips --install-epel false --pure-mode
 	elif grep -qi oracle /etc/os-release 2>/dev/null; then
-		kpanel_system_tuning_run_command bash "$script" --source mirrors.xtom.com --protocol https --use-intranet-source false --backup true --upgrade-software false --clean-cache false --ignore-backup-tips --install-epel false --pure-mode
+		kpanel_system_tuning_run_command linuxmirrors_run_script "$script" --source mirrors.xtom.com --protocol https --use-intranet-source false --backup true --upgrade-software false --clean-cache false --ignore-backup-tips --install-epel false --pure-mode
 	else
-		kpanel_system_tuning_run_command bash "$script" --use-official-source true --protocol https --use-intranet-source false --backup true --upgrade-software false --clean-cache false --ignore-backup-tips --install-epel false --pure-mode
+		kpanel_system_tuning_run_command linuxmirrors_run_script "$script" --use-official-source true --protocol https --use-intranet-source false --backup true --upgrade-software false --clean-cache false --ignore-backup-tips --install-epel false --pure-mode
 	fi
 	local result=$?
 	rm -f -- "$script"
@@ -6672,7 +7169,19 @@ kpanel_system_tuning_run_item() {
 		timezone-shanghai) set_timedate Asia/Shanghai ;;
 		dns-auto) kpanel_system_tuning_dns_auto ;;
 		ipv4-preferred) prefer_ipv4 ;;
-		basic-tools) install_docker && install wget sudo tar unzip socat btop nano vim ;;
+		basic-tools)
+			local tool missing_tools=()
+			install_docker || true
+			for tool in wget sudo tar unzip socat btop nano vim; do
+				install "$tool" || true
+			done
+			for tool in docker wget sudo tar unzip socat btop nano vim; do
+				command -v "$tool" >/dev/null 2>&1 || missing_tools+=("$tool")
+			done
+			if [ "${#missing_tools[@]}" -gt 0 ]; then
+				echo "提示: 以下基础工具未安装成功: ${missing_tools[*]}。" >&2
+			fi
+			;;
 		kernel-auto) kpanel_system_tuning_kernel_auto ;;
 		*) return 2 ;;
 	esac
@@ -6684,6 +7193,10 @@ kpanel_system_tuning_menu_item() {
 	if ! kpanel_system_tuning_run_item "$item"; then
 		echo -e "[${gl_hong}FAIL${gl_bai}] ${index}/12. ${label}，一条龙调优已停止"
 		return 1
+	fi
+	if [ "$item" = basic-tools ] && ! kpanel_system_tuning_item_ready "$item"; then
+		echo -e "[${gl_huang}WARN${gl_bai}] ${index}/12. ${label}，部分工具未安装，继续调优"
+		return 0
 	fi
 	case "$item" in system-update|system-cleanup|dns-auto) ;; *)
 		if ! kpanel_system_tuning_item_ready "$item"; then
@@ -6702,7 +7215,7 @@ kpanel_system_tuning_apply_item() {
 		kpanel_system_tuning_emit needs-attention "$item"
 		return 1
 	fi
-	case "$item" in system-update|system-cleanup|dns-auto) ;; *)
+	case "$item" in system-update|system-cleanup|dns-auto|basic-tools) ;; *)
 		kpanel_system_tuning_item_ready "$item" || { kpanel_system_tuning_emit needs-attention "$item"; return 1; }
 	;; esac
 	kpanel_system_tuning_emit "$status" "$item"
@@ -6881,10 +7394,11 @@ root_use
 clear
 echo -e "${gl_huang}LDNMP环境未安装，开始安装LDNMP环境...${gl_bai}"
 check_disk_space 3 /home
-install_dependency
-install_docker
-install_certbot
-install_ldnmp_conf
+install_dependency || return $?
+install_docker || return $?
+install_certbot || return $?
+nginx_install_update_dependencies || return $?
+install_ldnmp_conf || return $?
 install_ldnmp
 
 }
@@ -6896,10 +7410,11 @@ send_stats "安装nginx环境"
 root_use
 clear
 echo -e "${gl_huang}nginx未安装，开始安装nginx环境...${gl_bai}"
-install_dependency
-install_docker
-install_certbot
-install_ldnmp_conf
+install_dependency || return $?
+install_docker || return $?
+install_certbot || return $?
+nginx_install_update_dependencies || return $?
+install_ldnmp_conf || return $?
 nginx_upgrade || return $?
 # First-install housekeeping stays here; routine updates preserve existing jobs
 # and website ownership instead of reapplying installation defaults.
@@ -7052,7 +7567,7 @@ ldnmp_Proxy() {
 		add_yuming
 	fi
 
-	check_ip_and_get_access_port "$yuming"
+	check_ip_and_get_access_port "$yuming" || return $?
 
 	if [ -z "$reverseproxy" ]; then
 		read -e -p "请输入你的反代IP (回车默认本机IP 127.0.0.1): " reverseproxy
@@ -7063,12 +7578,12 @@ ldnmp_Proxy() {
 		read -e -p "请输入你的反代端口: " port
 	fi
 	kpanel_web_progress 25 "正在准备 kejilion.sh Nginx 环境"
-	nginx_install_status
+	nginx_install_status || return $?
 
 
 	kpanel_web_progress 40 "正在签发并配置反向代理证书"
 	install_ssltls
-	certs_status
+	certs_status || return $?
 
 	kpanel_app_write_proxy
 }
@@ -7078,14 +7593,14 @@ kpanel_app_write_proxy() {
 		kpanel_app_with_lock system kpanel_app_write_proxy "$@"; return $?
 	fi
 	kpanel_web_progress 60 "正在获取 kejilion.sh 反向代理配置"
-	wget -O /home/web/conf.d/map.conf ${gh_proxy}raw.githubusercontent.com/kejilion/nginx/main/map.conf
-	wget -O /home/web/conf.d/$yuming.conf ${gh_proxy}raw.githubusercontent.com/kejilion/nginx/main/reverse-proxy-backend.conf
+	wget -O /home/web/conf.d/map.conf ${gh_proxy}raw.githubusercontent.com/kejilion/nginx/main/map.conf || return $?
+	wget -O /home/web/conf.d/$yuming.conf ${gh_proxy}raw.githubusercontent.com/kejilion/nginx/main/reverse-proxy-backend.conf || return $?
 
 	backend=$(tr -dc 'A-Za-z' < /dev/urandom | head -c 8)
-	sed -i "s/backend_yuming_com/backend_$backend/g" /home/web/conf.d/"$yuming".conf
+	sed -i "s/backend_yuming_com/backend_$backend/g" /home/web/conf.d/"$yuming".conf || return $?
 
 
-	sed -i "s/yuming.com/$yuming/g" /home/web/conf.d/$yuming.conf
+	sed -i "s/yuming.com/$yuming/g" /home/web/conf.d/$yuming.conf || return $?
 
 	reverseproxy_port="$reverseproxy:$port"
 	upstream_servers=""
@@ -7093,18 +7608,34 @@ kpanel_app_write_proxy() {
 		upstream_servers="$upstream_servers    server $server;\n"
 	done
 
-	sed -i "s/# 动态添加/$upstream_servers/g" /home/web/conf.d/$yuming.conf
-	sed -i '/remote_addr/d' /home/web/conf.d/$yuming.conf
+	sed -i "s/# 动态添加/$upstream_servers/g" /home/web/conf.d/$yuming.conf || return $?
+	sed -i '/remote_addr/d' /home/web/conf.d/$yuming.conf || return $?
 
-	update_nginx_listen_port "$yuming" "$access_port"
+	update_nginx_listen_port "$yuming" "$access_port" || return $?
 
 	kpanel_web_progress 85 "正在校验并重载反向代理配置"
-	nginx_http_on
-	docker exec nginx nginx -s reload
+	nginx_http_on || return $?
+	docker exec nginx nginx -s reload || return $?
 	nginx_web_on
 }
 
 
+
+# Panel domain checks precede its explicit direct-access change.
+# Interactive CLI callers keep the historical block after successful creation.
+kpanel_proxy_cli() {
+	ldnmp_Proxy "$@" || return $?
+	if [ "${KJ_WEB_PROXY_KEEP_DIRECT:-0}" = 1 ]; then return 0; fi
+	find_container_by_host_port "$port"
+	if [ -z "$docker_name" ]; then
+		close_port "$port" || return $?
+		echo "已阻止IP+端口访问该服务"
+	else
+		ip_address
+		close_port "$port" || return $?
+		block_container_port "$docker_name" "$ipv4_address" || return $?
+	fi
+}
 
 ldnmp_Proxy_backend() {
 	clear
@@ -13211,7 +13742,7 @@ linux_docker() {
 		  8)
 			  clear
 			  send_stats "Docker源"
-			  bash <(curl -sSL https://linuxmirrors.cn/docker.sh)
+			  linuxmirrors_run_url https://linuxmirrors.cn/docker.sh
 			  ;;
 
 		  9)
@@ -15922,7 +16453,7 @@ kpanel_run_http_site() (
 	case "$command_name" in
 		wp) selector=2 ;; discuz) selector=3 ;; kodbox) selector=4 ;;
 		maccms) selector=5 ;; dujiaoka) selector=6 ;; flarum) selector=7 ;;
-		typecho) selector=8 ;; linkstack) selector=9 ;; php-site) selector=20 ;;
+		typecho) selector=8 ;; linkstack) selector=9 ;; fastadmin) selector=10 ;; php-site) selector=20 ;;
 		redirect-site) selector=22 ;; fd) selector=23 ;; domain-proxy) selector=24 ;;
 		bitwarden-site) selector=25 ;; halo-site) selector=26 ;; ai-prompt) selector=27 ;;
 		loadbalance-site) selector=28 ;; static-site) selector=30 ;; *) return 64 ;;
@@ -16057,7 +16588,7 @@ kpanel_run_web_recipe_cli() {
 
 kpanel_web_recipe_requires_document_root() {
 	case "${1:-}" in
-		2|3|4|5|6|7|8|9|20|25|26|27|30) return 0 ;;
+		2|3|4|5|6|7|8|9|10|20|25|26|27|30) return 0 ;;
 		*) return 1 ;;
 	esac
 }
@@ -16080,7 +16611,7 @@ kpanel_ldnmp_result() {
 		"$1" "$2" "$(kpanel_ldnmp_escape "$3")" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')")
 	printf 'KPANEL_LDNMP_RESULT %s\n' "$payload"
 	case "${KJ_LDNMP_RECEIPT:-}" in
-		/var/lib/kejilion-panel/environment-jobs/*.receipt)
+		/var/lib/kejilion-panel/environment-jobs/*.receipt|/home/docker/kpanel/data/agent/environment-jobs/*.receipt)
 			umask 077
 			printf '%s\n' "$payload" > "${KJ_LDNMP_RECEIPT}.tmp.$$" &&
 				mv -f "${KJ_LDNMP_RECEIPT}.tmp.$$" "$KJ_LDNMP_RECEIPT"
@@ -16110,6 +16641,167 @@ kpanel_ldnmp_component() {
 	printf '{"name":"%s","required":%s,"exists":%s,"running":%s,"state":"%s","image":"%s","version":"%s","repoDigest":"%s","updateStatus":"unknown","updateReason":"Registry 状态仅在更新任务中实时确认"}' \
 		"$name" "$required" "$exists" "$running" "$(kpanel_ldnmp_escape "$state")" \
 		"$(kpanel_ldnmp_escape "$image")" "$(kpanel_ldnmp_escape "$version")" "$(kpanel_ldnmp_escape "$digest")"
+}
+
+kpanel_ldnmp_site_jail_json() {
+	local jail="$1" running="${2:-false}" status="" jails="" value="" current=0 total=0
+	if [ "$running" = true ] && jails=$(fail2ban-client status 2>/dev/null) &&
+		printf '%s\n' "$jails" | sed -n 's/^.*Jail list:[[:space:]]*//p' | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -Fxq -- "$jail" &&
+		status=$(fail2ban-client status "$jail" 2>/dev/null); then
+		value=$(printf '%s\n' "$status" | awk -F: '/Currently banned[[:space:]]*:/ {gsub(/[[:space:]]/, "", $2); print $2; exit}')
+		case "$value" in ''|*[!0-9]*) value=0 ;; esac
+		current="$value"
+		value=$(printf '%s\n' "$status" | awk -F: '/Total banned[[:space:]]*:/ {gsub(/[[:space:]]/, "", $2); print $2; exit}')
+		case "$value" in ''|*[!0-9]*) value=0 ;; esac
+		total="$value"
+		printf '{"name":"%s","available":true,"currentlyBanned":%s,"totalBanned":%s}' "$jail" "$current" "$total"
+	else
+		printf '{"name":"%s","available":false,"currentlyBanned":0,"totalBanned":0}' "$jail"
+	fi
+}
+
+kpanel_ldnmp_migration_json() {
+	local raw="${1:-}" fallback='{"state":"current","importedRecords":0,"apiJailEnabled":false,"legacyCFDetected":false,"cfReentryRequired":false,"legacyReconcilerStopped":false}'
+	[ -n "$raw" ] || { printf '%s' "$fallback"; return 0; }
+	printf '%s' "$raw" | "$WAF_PYTHON" -I -c '
+import json,sys
+root=json.load(sys.stdin)
+s=root.get("migration")
+if not isinstance(s,dict):
+ print(json.dumps({"state":"unknown","importedRecords":0,"apiJailEnabled":False,"legacyCFDetected":False,"cfReentryRequired":False,"legacyReconcilerStopped":False},separators=(",",":")));raise SystemExit
+state=s.get("state","unknown")
+if state=="legacy-ready": state="legacy-pending"
+if state not in {"current","legacy-pending","legacy-imported","legacy-compatible"}: state="unknown"
+try: imported=int(s.get("importedRecords",0))
+except (TypeError,ValueError): imported=0
+if imported<0 or imported>10000: imported=0
+out={"state":state,"importedRecords":imported,"apiJailEnabled":s.get("apiJailEnabled") is True,"legacyCFDetected":s.get("legacyCFDetected") is True,"cfReentryRequired":s.get("cfReentryRequired") is True,"legacyReconcilerStopped":s.get("legacyReconcilerStopped") is True}
+print(json.dumps(out,separators=(",",":")))' 2>/dev/null || printf '{"state":"unknown","importedRecords":0,"apiJailEnabled":false,"legacyCFDetected":false,"cfReentryRequired":false,"legacyReconcilerStopped":false}'
+}
+
+kpanel_ldnmp_fail2ban_logs_json() {
+	local log_file="${1:-/var/log/fail2ban.log}" available=false separator="" line escaped
+	local -a lines=()
+	if [ -r "$log_file" ]; then
+		available=true
+		mapfile -t lines < <(tail -n 500 "$log_file" 2>/dev/null | grep -F -e '[waf-attack]' -e '[waf-rate]' -e '[waf-api-invalid]' | tail -n 20)
+	fi
+	printf '{"available":%s,"entries":[' "$available"
+	for line in "${lines[@]}"; do
+		line=$(printf '%s' "$line" | LC_ALL=C tr -d '\001-\010\013\014\016-\037')
+		line="${line:0:1024}"
+		escaped=$(kpanel_ldnmp_escape "$line")
+		printf '%s"%s"' "$separator" "$escaped"
+		separator=,
+	done
+	printf ']}'
+}
+
+kpanel_ldnmp_ddos_rules_present() {
+	local count=0
+	iptables -C DOCKER-USER -p tcp --syn -m limit --limit 500/s --limit-burst 100 -j ACCEPT >/dev/null 2>&1 && count=$((count + 1))
+	iptables -C DOCKER-USER -p tcp --syn -j DROP >/dev/null 2>&1 && count=$((count + 1))
+	iptables -C DOCKER-USER -p udp -m limit --limit 3000/s -j ACCEPT >/dev/null 2>&1 && count=$((count + 1))
+	iptables -C DOCKER-USER -p udp -j DROP >/dev/null 2>&1 && count=$((count + 1))
+	iptables -C INPUT -p tcp --syn -m limit --limit 500/s --limit-burst 100 -j ACCEPT >/dev/null 2>&1 && count=$((count + 1))
+	iptables -C INPUT -p tcp --syn -j DROP >/dev/null 2>&1 && count=$((count + 1))
+	iptables -C INPUT -p udp -m limit --limit 3000/s -j ACCEPT >/dev/null 2>&1 && count=$((count + 1))
+	iptables -C INPUT -p udp -j DROP >/dev/null 2>&1 && count=$((count + 1))
+	printf '%s' "$count"
+}
+
+kpanel_ldnmp_cloudflare_status_json() {
+	local raw="${1:-}" status='{"mode":"local","configured":false,"running":false,"healthy":false,"pending":false,"cleanupPending":false,"activeBans":0}'
+	[ -n "$raw" ] || { printf '%s' "$status"; return 0; }
+	status=$(printf '%s' "$raw" | "$WAF_PYTHON" -I -c '
+import json,sys
+s=json.load(sys.stdin)
+mode=s.get("mode")
+if mode not in {"cloudflare","local"}: mode="unknown"
+try: active=int(s.get("activeBans",0))
+except (TypeError,ValueError): active=0
+if active < 0 or active > 1000000: active=0
+out={"mode":mode,"configured":s.get("configured") is True,"running":s.get("running") is True,"healthy":s.get("healthy") is True,"pending":s.get("pending") is True,"cleanupPending":s.get("cleanupPending") is True,"activeBans":active}
+print(json.dumps(out,separators=(",",":")))' 2>/dev/null) || status='{"mode":"unknown","configured":false,"running":false,"healthy":false,"pending":false,"cleanupPending":false,"activeBans":0}'
+	printf '%s' "$status"
+}
+
+kpanel_ldnmp_cloudflare_shield_off() {
+	local current="" updated="" listing="" script_path="${1:-/root/CF-Under-Attack.sh}"
+	command -v crontab >/dev/null 2>&1 || return 1
+	if listing=$(crontab -l 2>&1); then
+		current="$listing"
+	else
+		if [[ "$listing" == *"no crontab for "* ]] || [[ "$listing" == *"can't open "* && "$listing" == *"No such file or directory"* ]]; then
+		current=""
+		else
+			return 1
+		fi
+	fi
+	updated=$(printf '%s\n' "$current" | grep -Fv 'CF-Under-Attack.sh') || true
+	if [ "$updated" != "$current" ]; then
+		printf '%s\n' "$updated" | crontab - || return 1
+	fi
+	rm -f -- "$script_path"
+}
+
+kpanel_ldnmp_protection_json() {
+	local waf="$1" waf_mode="$2" fail2ban_installed=false fail2ban=false
+	local cf_raw="" cf_json cf_status_known=false cloudflare=false ddos_count=0 ddos=false ddos_rules_available=false shield_scheduled=false shield_script=false shield_available=false cron_listing=""
+	local first="" second="" third="" logs="" migration_json='{"state":"current","importedRecords":0,"apiJailEnabled":false,"legacyCFDetected":false,"cfReentryRequired":false,"legacyReconcilerStopped":false}' legacy_cf=false
+	command -v fail2ban-client >/dev/null 2>&1 && fail2ban_installed=true
+	if [ "$fail2ban_installed" = true ] && fail2ban-client ping >/dev/null 2>&1; then fail2ban=true; fi
+	first=$(kpanel_ldnmp_site_jail_json waf-attack "$fail2ban")
+	second=$(kpanel_ldnmp_site_jail_json waf-rate "$fail2ban")
+	third=$(kpanel_ldnmp_site_jail_json waf-api-invalid "$fail2ban")
+	logs=$(kpanel_ldnmp_fail2ban_logs_json)
+	if { [ -f /home/web/config/waf/ban-cf.json ] || [ -f /home/web/config/waf/ban-migration.json ]; } && shared_waf_cached >/dev/null 2>&1; then
+		cf_raw=$(shared_waf ban-status 2>/dev/null) || cf_raw=""
+		[ -n "$cf_raw" ] && cf_status_known=true
+		[ -n "$cf_raw" ] && migration_json=$(kpanel_ldnmp_migration_json "$cf_raw")
+	fi
+	if [ ! -f /home/web/config/waf/ban-migration.json ] && [ ! -f /home/web/config/waf/ban-cf.json ]; then
+		if [ -f /home/web/config/waf/state.json ] || [ -f /etc/fail2ban/jail.d/zz-waf-api-invalid.local ] ||
+		   [ -f /etc/systemd/system/kejilion-waf.service ] || [ -f /etc/fail2ban/action.d/cloudflare-docker.conf ] ||
+		   grep -Fq '# Managed shared WAF; only trusted defence events, isolated by canonical site and client.' /etc/fail2ban/jail.d/zz-waf-managed.local 2>/dev/null; then
+			[ -e /etc/fail2ban/action.d/cloudflare-docker.conf ] && legacy_cf=true
+			migration_json=$(printf '{"state":"legacy-pending","importedRecords":0,"apiJailEnabled":false,"legacyCFDetected":%s,"cfReentryRequired":%s,"legacyReconcilerStopped":false}' "$legacy_cf" "$legacy_cf")
+			if shared_waf_cached >/dev/null 2>&1; then
+				cf_raw=$(shared_waf ban-preflight 2>/dev/null) || cf_raw=""
+				[ -n "$cf_raw" ] && migration_json=$(kpanel_ldnmp_migration_json "$cf_raw")
+			fi
+		fi
+	fi
+	if { [ -f /home/web/config/waf/ban-migration.json ] || [ -f /home/web/config/waf/ban-cf.json ]; } && [ "$cf_status_known" = false ]; then
+		migration_json='{"state":"unknown","importedRecords":0,"apiJailEnabled":false,"legacyCFDetected":false,"cfReentryRequired":false,"legacyReconcilerStopped":false}'
+	fi
+	cf_json=$(kpanel_ldnmp_cloudflare_status_json "$cf_raw")
+	if [ -f /home/web/config/waf/ban-cf.json ] && [ "$cf_status_known" = false ]; then
+		cf_json='{"mode":"unknown","configured":false,"running":false,"healthy":false,"pending":false,"cleanupPending":false,"activeBans":0}'
+	fi
+	if [ -n "$cf_raw" ] && printf '%s' "$cf_json" | "$WAF_PYTHON" -I -c 'import json,sys; s=json.load(sys.stdin); sys.exit(not (s["mode"]=="cloudflare" and s["healthy"]))' 2>/dev/null; then
+		cloudflare=true
+	else
+		cloudflare=false
+	fi
+	command -v iptables >/dev/null 2>&1 && ddos_rules_available=true
+	ddos_count=$(kpanel_ldnmp_ddos_rules_present)
+	[ "$ddos_count" -eq 8 ] && ddos=true
+	[ -f /root/CF-Under-Attack.sh ] && shield_script=true
+	if command -v crontab >/dev/null 2>&1; then
+		if cron_listing=$(crontab -l 2>&1); then
+			shield_available=true
+		elif [[ "$cron_listing" == *"no crontab for "* ]] || [[ "$cron_listing" == *"can't open "* && "$cron_listing" == *"No such file or directory"* ]]; then
+			shield_available=true
+			cron_listing=""
+		fi
+		if [ "$shield_available" = true ]; then
+			printf '%s' "$cron_listing" | grep -Fq 'CF-Under-Attack.sh' && shield_scheduled=true
+		fi
+	fi
+	printf '{"fail2ban":%s,"fail2banInstalled":%s,"waf":%s,"wafMode":"%s","cloudflare":%s,"cloudflareStatus":%s,"banMigration":%s,"ddos":%s,"ddosRuleCount":%s,"ddosRuleExpected":8,"ddosRulesAvailable":%s,"cloudflareShield":{"available":%s,"scheduled":%s,"scriptPresent":%s},"siteJails":[%s,%s,%s],"fail2banLogs":%s}' \
+		"$fail2ban" "$fail2ban_installed" "$waf" "$(kpanel_ldnmp_escape "$waf_mode")" "$cloudflare" "$cf_json" \
+		"$migration_json" "$ddos" "$ddos_count" "$ddos_rules_available" "$shield_available" "$shield_scheduled" "$shield_script" "$first" "$second" "$third" "$logs"
 }
 
 ldnmp_environment_status() {
@@ -16147,15 +16839,14 @@ ldnmp_environment_status() {
 		  docker inspect -f '{{.Id}} {{.Image}} {{.State.Status}}' nginx mysql php php74 redis 2>/dev/null; } |
 			sha256sum | awk '{print $1}'
 	)
-	local fail2ban=false waf=false waf_mode=off cloudflare=false ddos=false mode=custom gzip=false brotli=false zstd=false
-	command -v fail2ban-client >/dev/null 2>&1 && fail2ban=true
+	local waf=false waf_mode=off mode=custom gzip=false brotli=false zstd=false protection_json
 	grep -qE '^[[:space:]]*modsecurity on;' /home/web/nginx.conf 2>/dev/null && waf=true
 	if [ -f /home/web/config/waf/policy.json ]; then
 		waf_mode=$(shared_waf_mode 2>/dev/null) || waf_mode=unknown
 		case "$waf_mode" in on) waf=true ;; *) waf=false ;; esac
 	elif [ "$waf" = true ]; then waf_mode=legacy; fi
-	[ -f /etc/fail2ban/action.d/cloudflare-docker.conf ] && cloudflare=true
-	iptables -C INPUT -p tcp --syn -j DROP >/dev/null 2>&1 && ddos=true
+	protection_json=$(kpanel_ldnmp_protection_json "$waf" "$waf_mode")
+	# DDoS status is counted from all fixed rules in kpanel_ldnmp_protection_json.
 	docker exec mysql grep -q 4096M /etc/mysql/conf.d/custom_mysql_config.cnf 2>/dev/null && mode=high
 	[ "$mode" = custom ] && docker exec mysql test -f /etc/mysql/conf.d/custom_mysql_config.cnf >/dev/null 2>&1 && mode=standard
 	grep -qE '^[[:space:]]*gzip[[:space:]]+on;' /home/web/nginx.conf 2>/dev/null && gzip=true
@@ -16177,44 +16868,90 @@ ldnmp_environment_status() {
 	kpanel_ldnmp_component nginx true; printf ','; kpanel_ldnmp_component mysql true; printf ','
 	kpanel_ldnmp_component php true; printf ','; kpanel_ldnmp_component php74 false; printf ','
 	kpanel_ldnmp_component redis true
-	printf '],"protection":{"fail2ban":%s,"waf":%s,"wafMode":"%s","cloudflare":%s,"ddos":%s},"optimization":{"mode":"%s","gzip":%s,"brotli":%s,"zstd":%s},"observedAt":"%s"}\n' \
-		"$fail2ban" "$waf" "$waf_mode" "$cloudflare" "$ddos" "$mode" "$gzip" "$brotli" "$zstd" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+	printf '],"protection":%s,"optimization":{"mode":"%s","gzip":%s,"brotli":%s,"zstd":%s},"observedAt":"%s"}\n' \
+		"$protection_json" "$mode" "$gzip" "$brotli" "$zstd" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 }
 
 ldnmp_environment_catalog() {
-	printf '%s\n' '{"protocolVersion":"1","installProfiles":[{"id":"full","label":"完整 LDNMP"},{"id":"nginx","label":"仅 Nginx"}],"protectionActions":["fail2ban-install","fail2ban-uninstall","unban-all","waf-on","waf-off","ddos-on","ddos-off","cloudflare-fail2ban","cloudflare-shield"],"optimizationActions":["standard","high","gzip-on","gzip-off","brotli-on","brotli-off","zstd-on","zstd-off"],"updateComponents":[{"id":"nginx","versions":["latest"]},{"id":"mysql","versions":["latest","8.0","8.3","8.4","9.0"]},{"id":"php","versions":["7.4","8.0","8.1","8.2","8.3"]},{"id":"redis","versions":["latest"]},{"id":"all","versions":["latest"]}]}'
+	printf '%s\n' '{"protocolVersion":"1","installProfiles":[{"id":"full","label":"完整 LDNMP"},{"id":"nginx","label":"仅 Nginx"}],"protectionActions":["fail2ban-install","fail2ban-uninstall","unban-all","waf-on","waf-off","ddos-on","ddos-off","cloudflare-fail2ban","cloudflare-off","cloudflare-shield","cloudflare-shield-off"],"optimizationActions":["standard","high","gzip-on","gzip-off","brotli-on","brotli-off","zstd-on","zstd-off"],"updateComponents":[{"id":"nginx","versions":["latest"]},{"id":"mysql","versions":["latest","8.0","8.3","8.4","9.0"]},{"id":"php","versions":["7.4","8.0","8.1","8.2","8.3"]},{"id":"redis","versions":["latest"]},{"id":"all","versions":["latest"]}]}'
 }
 
 ldnmp_environment_install() {
 	local profile="${1:-full}" states
 	kpanel_ldnmp_event preflight 5 "正在检查安装条件"
 	case "$profile" in
-		full) kpanel_ldnmp_event install 15 "正在安装完整 LDNMP"; ldnmp_install_all ;;
-		nginx) kpanel_ldnmp_event install 15 "正在安装 Nginx"; nginx_install_all ;;
+		full) kpanel_ldnmp_event install 15 "正在安装完整 LDNMP"; ldnmp_install_all || return $? ;;
+		nginx) kpanel_ldnmp_event install 15 "正在安装 Nginx"; nginx_install_all || return $? ;;
 		*) echo "不支持的安装形态" >&2; return 2 ;;
 	esac
 	kpanel_ldnmp_event verify 90 "正在验证环境"
 	docker exec nginx nginx -t >/dev/null 2>&1 || return 1
 	docker compose -f /home/web/docker-compose.yml config -q || return 1
 	if [ "$profile" = full ]; then
-		states=$(docker inspect -f '{{.State.Running}}' nginx mysql php redis 2>/dev/null)
+		states=$(docker inspect -f '{{.State.Running}}' nginx mysql php redis 2>/dev/null) || return 1
 		[ "$(printf '%s\n' "$states" | sed '/^$/d' | wc -l)" -eq 4 ] || return 1
-		printf '%s\n' "$states" | grep -qv true && return 1
+		printf '%s\n' "$states" | grep -qxv true && return 1
 	fi
+	return 0
+}
+
+cf_shield_install_script() {
+	(
+	set -euo pipefail
+	local email="${1:-}" token="${2:-}" zone="${3:-}"
+	local target="${4:-/root/CF-Under-Attack.sh}" directory revision expected_sha url download stage actual_sha size line
+	local quoted_email quoted_token quoted_zone
+	local gh_prefix="${gh_proxy:-https://}"
+	[ -n "$email" ] && [ -n "$token" ] && [ -n "$zone" ] || { echo "Cloudflare 凭据不能为空" >&2; exit 1; }
+	[[ "$email$token$zone" != *$'\n'* && "$email$token$zone" != *$'\r'* ]] || { echo "Cloudflare 凭据格式无效" >&2; exit 1; }
+	[ "${#email}" -le 320 ] && [ "${#token}" -le 512 ] && [ "${#zone}" -le 128 ] || { echo "Cloudflare 凭据长度超限" >&2; exit 1; }
+	printf -v quoted_email '%q' "$email"
+	printf -v quoted_token '%q' "$token"
+	printf -v quoted_zone '%q' "$zone"
+	revision='f02b7b8d59fd090006304a998ea2b3410ae5f736'
+	expected_sha='781265062ba74bdeccb443177a9580190942c379dbe1e19a78ba1c774400086c'
+	directory=$(dirname -- "$target")
+	[ -d "$directory" ] && [ ! -L "$directory" ] || { echo "Cloudflare 防护目录无效" >&2; exit 1; }
+	download=$(mktemp "$directory/.CF-Under-Attack.download.XXXXXX") || exit 1
+	stage=$(mktemp "$directory/.CF-Under-Attack.stage.XXXXXX") || { rm -f -- "$download"; exit 1; }
+	trap 'rm -f -- "$download" "$stage"' EXIT
+	url="${gh_prefix}raw.githubusercontent.com/kejilion/sh/${revision}/CF-Under-Attack.sh"
+	if ! curl --fail --location --silent --show-error --connect-timeout 10 --max-time 45 --output "$download" "$url"; then
+		echo "Cloudflare 五秒盾脚本下载失败" >&2
+		exit 1
+	fi
+	size=$(wc -c < "$download")
+	[[ "$size" =~ ^[0-9]+$ ]] && [ "$size" -le 65536 ] || { echo "Cloudflare 五秒盾脚本大小异常" >&2; exit 1; }
+	actual_sha=$(sha256sum -- "$download" | awk '{print $1}')
+	[ "$actual_sha" = "$expected_sha" ] || { echo "Cloudflare 五秒盾脚本摘要校验失败" >&2; exit 1; }
+	grep -Fxq 'EMAIL="AAAA"' "$download" && grep -Fxq 'API_KEY="BBBB"' "$download" && grep -Fxq 'ZONE_ID="CCCC"' "$download" || {
+		echo "Cloudflare 五秒盾脚本占位符异常" >&2; exit 1;
+	}
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		case "$line" in
+			'EMAIL="AAAA"') printf 'EMAIL=%s\n' "$quoted_email" ;;
+			'API_KEY="BBBB"') printf 'API_KEY=%s\n' "$quoted_token" ;;
+			'ZONE_ID="CCCC"') printf 'ZONE_ID=%s\n' "$quoted_zone" ;;
+			*) printf '%s\n' "$line" ;;
+		esac
+	done < "$download" > "$stage"
+	grep -Fxq -- "EMAIL=$quoted_email" "$stage" && grep -Fxq -- "API_KEY=$quoted_token" "$stage" && grep -Fxq -- "ZONE_ID=$quoted_zone" "$stage" || {
+		echo "Cloudflare 五秒盾凭据写入失败" >&2; exit 1;
+	}
+	chmod 700 "$stage"
+	bash -n "$stage" || { echo "Cloudflare 五秒盾脚本语法校验失败" >&2; exit 1; }
+	mv -f -- "$stage" "$target"
+	)
 }
 
 ldnmp_protection_action_apply() {
-	local cfuser="" cftoken="" cfzone="" secret_content=""
+	local cfuser="" cftoken="" cfzone=""
 	case "$1" in
-		fail2ban-install)
-			f2b_install_sshd
-			mkdir -p /etc/fail2ban/filter.d /etc/fail2ban/jail.d
-			curl -sS -o /etc/fail2ban/filter.d/fail2ban-nginx-cc.conf "${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/fail2ban-nginx-cc.conf"
-			curl -sS -o /etc/fail2ban/jail.d/nginx-docker-cc.conf "${gh_proxy}raw.githubusercontent.com/kejilion/config/main/fail2ban/nginx-docker-cc.conf"
-			sed -i '/cloudflare/d' /etc/fail2ban/jail.d/nginx-docker-cc.conf
-			fail2ban-client reload ;;
-		fail2ban-uninstall) remove fail2ban; rm -rf /etc/fail2ban ;;
-		unban-all) fail2ban-client unban --all ;;
+		fail2ban-install) web_ban_install ;;
+		fail2ban-uninstall) web_ban_remove || return $?; remove fail2ban; rm -rf /etc/fail2ban ;;
+		unban-all) web_ban_clear ;;
+		cloudflare-off) shared_waf cf-off ;;
+		cloudflare-shield-off) kpanel_ldnmp_cloudflare_shield_off ;;
 		waf-on) nginx_waf on ;; waf-off) nginx_waf off ;;
 		ddos-on) enable_ddos_defense ;; ddos-off) disable_ddos_defense ;;
 		cloudflare-fail2ban|cloudflare-shield)
@@ -16227,33 +16964,15 @@ ldnmp_protection_action_apply() {
 			cftoken=$(sed -n '2p' "$KJ_LDNMP_SECRET_FILE")
 			cfzone=$(sed -n '3p' "$KJ_LDNMP_SECRET_FILE")
 			rm -f -- "$KJ_LDNMP_SECRET_FILE"
-			[ -n "$cfuser" ] && [ -n "$cftoken" ] || return 2
+			[ -n "$cftoken" ] || return 2
 			if [ "$1" = cloudflare-fail2ban ]; then
-				wget -O /home/web/conf.d/default.conf "${gh_proxy}raw.githubusercontent.com/kejilion/nginx/main/default11.conf"
-				docker exec nginx nginx -s reload
-				mkdir -p /etc/fail2ban/jail.d /etc/fail2ban/action.d
-				curl -sS -o /etc/fail2ban/jail.d/nginx-docker-cc.conf \
-					"${gh_proxy}raw.githubusercontent.com/kejilion/config/main/fail2ban/nginx-docker-cc.conf"
-				curl -sS -o /etc/fail2ban/action.d/cloudflare-docker.conf \
-					"${gh_proxy}raw.githubusercontent.com/kejilion/config/main/fail2ban/cloudflare-docker.conf"
-				secret_content=$(< /etc/fail2ban/action.d/cloudflare-docker.conf)
-				secret_content=${secret_content//kejilion@outlook.com/$cfuser}
-				secret_content=${secret_content//APIKEY00000/$cftoken}
-				printf '%s\n' "$secret_content" > /etc/fail2ban/action.d/cloudflare-docker.conf
-				chmod 600 /etc/fail2ban/action.d/cloudflare-docker.conf
-				f2b_status
+				web_cf_enable "$cfuser" "$cftoken" || return $?
 			else
 				[ -n "$cfzone" ] || return 2
 				cd /root || return 1
 				install jq bc
 				check_crontab_installed
-				curl -sS -o CF-Under-Attack.sh "${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/CF-Under-Attack.sh"
-				chmod 700 CF-Under-Attack.sh
-				secret_content=$(< CF-Under-Attack.sh)
-				secret_content=${secret_content//AAAA/$cfuser}
-				secret_content=${secret_content//BBBB/$cftoken}
-				secret_content=${secret_content//CCCC/$cfzone}
-				printf '%s\n' "$secret_content" > CF-Under-Attack.sh
+				cf_shield_install_script "$cfuser" "$cftoken" "$cfzone" || return $?
 				local cron_job="*/5 * * * * /root/CF-Under-Attack.sh"
 				(crontab -l 2>/dev/null | grep -Fv "/root/CF-Under-Attack.sh"; echo "$cron_job") | crontab -
 			fi
@@ -16265,7 +16984,11 @@ ldnmp_protection_action_apply() {
 ldnmp_protection_action() {
 	# Shared WAF owns its full configuration transaction and readiness verification.
 	# The legacy snapshot below cannot restore that write set and must not wrap it.
-	case "$1" in waf-on) nginx_waf on; return $? ;; waf-off) nginx_waf off; return $? ;; esac
+	case "$1" in
+		waf-on) nginx_waf on; return $? ;; waf-off) nginx_waf off; return $? ;;
+		fail2ban-install|fail2ban-uninstall|cloudflare-fail2ban|cloudflare-off|cloudflare-shield-off|unban-all)
+			ldnmp_protection_action_apply "$@"; return $? ;;
+	esac
 	local action="$1" snapshot rc=0 fail2ban_existed=false
 	snapshot=$(mktemp -d /home/.kpanel-ldnmp-protection.XXXXXX) || return 1
 	if [ -d /etc/fail2ban ]; then
@@ -16475,6 +17198,7 @@ ldnmp_restore_action() {
 	tar -xzf "$archive" -C "$stage" || { rm -rf "$stage"; return 1; }
 	docker compose -f "$stage/web/docker-compose.yml" config -q || { rm -rf "$stage"; return 1; }
 	kpanel_ldnmp_event restore_switch 60 "正在原子切换 /home/web"
+	web_ban_remove || { rm -rf "$stage"; return 1; }
 	if [ -d /home/web ]; then
 		cd /home/web || return 1
 		old_running_services=$(docker compose ps --services --filter status=running 2>/dev/null | tr '\n' ' ')
@@ -16489,7 +17213,12 @@ ldnmp_restore_action() {
 		return 1
 	fi
 	rm -rf "$stage"; cd /home/web || return 1
-	if docker compose up -d && docker exec nginx nginx -t >/dev/null 2>&1; then rm -rf "$rollback"; return 0; fi
+	if docker compose up -d && docker exec nginx nginx -t >/dev/null 2>&1; then
+		web_ban_remove || { echo "备份已恢复，但封禁状态清理未完成，需人工检查" >&2; return 86; }
+		rm -rf "$rollback"
+		echo "站点已恢复；如需累计封禁，请重新安装防护并开启CF模式。"
+		return 0
+	fi
 	docker compose down >/dev/null 2>&1; rm -rf /home/web
 	[ -d "$rollback" ] && mv "$rollback" /home/web
 	cd /home/web || return 1
@@ -16501,6 +17230,7 @@ ldnmp_restore_action() {
 
 ldnmp_uninstall_action() {
 	if [ "${1:-false}" = true ]; then ldnmp_backup_action || return $?; fi
+	web_ban_remove || return $?
 	if [ -d /home/web ]; then
 		cd /home/web || return 1
 		docker compose down --rmi all || return 1
@@ -16619,6 +17349,81 @@ kpanel_ldnmp_dispatch() {
 }
 
 
+ldnmp_fastadmin() (
+	local webname="FastAdmin 后台开发框架" stage="" published=0
+	local version="1.6.8.20261019"
+	local package_sha256="457bbe56d5a37d69a2e1371bea09bef8ce88e2dd11516da930ea442d70ae906f"
+	add_yuming || return 1
+	[[ "$yuming" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]] || return 64
+	local site_root="/home/web/html/$yuming" conf="/home/web/conf.d/$yuming.conf"
+	if [ -e "$site_root" ] || [ -L "$site_root" ] || [ -e "$conf" ] || [ -L "$conf" ]; then
+		echo "域名已存在，拒绝覆盖现有产物" >&2
+		return 1
+	fi
+	ldnmp_install_status || return 1
+	echo "KPANEL_PROGRESS 15 正在检查 FastAdmin 的 PHP74 环境"
+	docker exec php74 php -r '
+		if (PHP_MAJOR_VERSION !== 7 || PHP_MINOR_VERSION !== 4) { exit(1); }
+		foreach (["json", "curl", "pdo_mysql", "bcmath", "mbstring", "gd", "zip", "dom", "fileinfo"] as $ext) {
+			if (!extension_loaded($ext)) { fwrite(STDERR, "Missing extension: " . $ext . PHP_EOL); exit(1); }
+		}
+	' || { echo "PHP74 容器未就绪或缺少必要扩展" >&2; return 1; }
+	stage=$(mktemp -d /home/web/.fastadmin.XXXXXX) || return 1
+	trap 'rm -rf -- "$stage"' EXIT
+	echo "KPANEL_PROGRESS 30 正在下载并校验 FastAdmin 官方完整包"
+	curl -fL --retry 2 --connect-timeout 15 --max-time 300 \
+		-A 'Mozilla/5.0' -e 'https://www.fastadmin.net/download.html' \
+		"https://www.fastadmin.net/download/full.html?version=$version" -o "$stage/package.zip" || return 1
+	printf '%s  %s\n' "$package_sha256" "$stage/package.zip" | sha256sum -c - || return 1
+	unzip -q "$stage/package.zip" -d "$stage/site" || return 1
+	local required
+	for required in public/index.php public/install.php thinkphp/base.php vendor/autoload.php application/database.php; do
+		[ -f "$stage/site/$required" ] || { echo "FastAdmin 完整包缺少 $required" >&2; return 1; }
+	done
+	[ -d "$stage/site/public/assets/libs" ] || return 1
+	# The shared PHP74 policy disables parse_ini_file. Keep that policy and use
+	# equivalent INI string parsing in this pinned application's two loaders.
+	sed -i 's/parse_ini_file(\(.*\), true)/parse_ini_string(file_get_contents(\1), true)/' \
+		"$stage/site/thinkphp/base.php" "$stage/site/thinkphp/library/think/config/driver/Ini.php" || return 1
+	grep -Fq 'parse_ini_string(file_get_contents(' "$stage/site/thinkphp/base.php" &&
+		grep -Fq 'parse_ini_string(file_get_contents(' "$stage/site/thinkphp/library/think/config/driver/Ini.php" || return 1
+	wget -q -O "$stage/site.conf" "${gh_proxy}raw.githubusercontent.com/kejilion/nginx/c830bf34ae6da8e183b4892860fbce30ea6dc651/fastadmin.com.conf" || return 1
+	printf '%s  %s\n' "986b57db53211332331c1c0022e7894546c8e8d3a1e4baeef5f2c95f01c23f46" "$stage/site.conf" | sha256sum -c - || return 1
+	grep -Fq 'fastcgi_pass unix:/run/php74/php-fpm.sock;' "$stage/site.conf" &&
+		grep -Fq 'root /var/www/html/yuming.com/public;' "$stage/site.conf" || return 1
+	sed -i "s/yuming.com/$yuming/g" "$stage/site.conf" || return 1
+	install_ssltls || return 1
+	certs_status || return 1
+	add_db || return 1
+	echo "KPANEL_PROGRESS 65 正在配置 FastAdmin PHP74 站点"
+	# Move the verified package only after all downloads have succeeded.
+	mv -T -- "$stage/site" "$site_root" || return 1
+	normalize_ldnmp_site_permissions "$yuming" || return 1
+	docker exec php74 chown -R www-data:www-data "/var/www/html/$yuming" || return 1
+	mv -- "$stage/site.conf" "$conf" || return 1
+	published=1
+	trap 'if [ "$published" = 1 ]; then
+		rm -f -- "$conf"
+		docker exec nginx nginx -t >/dev/null 2>&1 && docker exec nginx nginx -s reload >/dev/null 2>&1 || true
+		echo "FastAdmin 站点启用失败；已撤回配置，源码和数据库保留供检查。" >&2
+	fi
+	rm -rf -- "$stage"' EXIT
+	nginx_http_on || return 1
+	docker exec nginx nginx -t && docker exec nginx nginx -s reload || return 1
+	published=0
+	echo "KPANEL_PROGRESS 90 FastAdmin 站点已就绪，请打开安装页面完成初始化"
+	local scheme=https suffix=""
+	if kpanel_web_http_mode; then scheme=http; suffix=":$KJ_WEB_HTTP_PORT"; fi
+	echo "安装地址: $scheme://$yuming$suffix/install.php"
+	echo "数据库地址: mysql"
+	echo "数据库端口: 3306"
+	echo "数据库名: $dbname"
+	echo "用户名: $dbuse"
+	echo "密码: $dbusepasswd"
+	echo "表前缀: fa_"
+	echo "请在安装页面设置管理员账号；安装成功后保存随机生成的后台入口。"
+)
+
 linux_ldnmp() {
   while true; do
 
@@ -16633,6 +17438,7 @@ linux_ldnmp() {
 	echo -e "${gl_huang}5.   ${gl_bai}安装苹果CMS影视站                 ${gl_huang}6.   ${gl_bai}安装独角数发卡网"
 	echo -e "${gl_huang}7.   ${gl_bai}安装flarum论坛网站                ${gl_huang}8.   ${gl_bai}安装typecho轻量博客网站"
 	echo -e "${gl_huang}9.   ${gl_bai}安装LinkStack共享链接平台         ${gl_huang}20.  ${gl_bai}自定义动态站点"
+	echo -e "${gl_huang}10.  ${gl_bai}安装FastAdmin后台框架（PHP7.4）"
 	echo -e "${gl_huang}------------------------"
 	echo -e "${gl_huang}21.  ${gl_bai}仅安装nginx ${gl_huang}★${gl_bai}                     ${gl_huang}22.  ${gl_bai}站点重定向"
 	echo -e "${gl_huang}23.  ${gl_bai}站点反向代理-IP+端口 ${gl_huang}★${gl_bai}            ${gl_huang}24.  ${gl_bai}站点反向代理-域名"
@@ -16652,7 +17458,7 @@ linux_ldnmp() {
 	if [ "${KJ_WEB_NONINTERACTIVE:-0}" = "1" ]; then
 		sub_choice="${KJ_WEB_RECIPE:-}"
 		case "$sub_choice" in
-			2|3|4|5|6|7|8|9|20|22|23|24|25|26|27|28|30) ;;
+			2|3|4|5|6|7|8|9|10|20|22|23|24|25|26|27|28|30) ;;
 			*)
 				echo "KPANEL_PROGRESS 100 不支持的 KJ_WEB_RECIPE"
 				return 1
@@ -16693,6 +17499,9 @@ linux_ldnmp() {
 		;;
 	  2)
 	  ldnmp_wp "${KJ_WEB_DOMAIN:-}"
+		;;
+	  10)
+	  ldnmp_fastadmin || return $?
 		;;
 
 	  3)
@@ -17489,6 +18298,7 @@ linux_ldnmp() {
 	  fi
 
 	  if [ -n "$filename" ]; then
+		  web_ban_remove || { echo "CF封禁清理未完成，停止还原" >&2; break; }
 		  cd /home/web/ > /dev/null 2>&1
 		  docker compose down > /dev/null 2>&1
 		  rm -rf /home/web > /dev/null 2>&1
@@ -17500,6 +18310,7 @@ linux_ldnmp() {
 		  install_docker
 		  install_certbot
 		  install_ldnmp
+		  web_ban_remove || echo "备份封禁状态需人工检查，请勿删除CF凭据。" >&2
 	  else
 		  echo "没有找到压缩包。"
 	  fi
@@ -17649,7 +18460,12 @@ linux_ldnmp() {
 		read -e -p "$(echo -e "${gl_hong}强烈建议：${gl_bai}先备份全部网站数据，再卸载LDNMP环境。确定删除所有网站数据吗？(Y/N): ")" choice
 		case "$choice" in
 		  [Yy])
-			ldnmp_uninstall_action false || return $?
+			if ! ldnmp_uninstall_action false; then
+				echo "LDNMP环境卸载失败，清理未完成，请检查上方错误。" >&2
+				echo "按任意键继续..."
+				read -n 1 -s -r
+				continue
+			fi
 			;;
 		  [Nn])
 
@@ -27690,6 +28506,7 @@ linux_work() {
 
 # 智能切换镜像源函数
 switch_mirror() {
+	preserve_armbian_mirrors && return 0
 	# 可选参数，默认为 false
 	local upgrade_software=${1:-false}
 	local clean_cache=${2:-false}
@@ -27702,7 +28519,7 @@ switch_mirror() {
 
 	if [ "$country" = "CN" ]; then
 		echo "使用国内镜像源..."
-		bash <(curl -sSL https://linuxmirrors.cn/main.sh) \
+		linuxmirrors_run_url https://linuxmirrors.cn/main.sh \
 		  --source mirrors.huaweicloud.com \
 		  --protocol https \
 		  --use-intranet-source false \
@@ -27715,7 +28532,7 @@ switch_mirror() {
 	else
 		echo "使用海外镜像源..."
 		if [ -f /etc/os-release ] && grep -qi "oracle" /etc/os-release; then
-			bash <(curl -sSL https://linuxmirrors.cn/main.sh) \
+			linuxmirrors_run_url https://linuxmirrors.cn/main.sh \
 			  --source mirrors.xtom.com \
 			  --protocol https \
 			  --use-intranet-source false \
@@ -27726,7 +28543,7 @@ switch_mirror() {
 			  --install-epel false \
 			  --pure-mode
 		else
-			bash <(curl -sSL https://linuxmirrors.cn/main.sh) \
+			linuxmirrors_run_url https://linuxmirrors.cn/main.sh \
 				--use-official-source true \
 				--protocol https \
 				--use-intranet-source false \
@@ -33109,15 +33926,15 @@ EOF
 		  case $choice in
 			  1)
 				  send_stats "中国大陆默认源"
-				  bash <(curl -sSL https://linuxmirrors.cn/main.sh)
+				  run_linuxmirrors_manual
 				  ;;
 			  2)
 				  send_stats "中国大陆教育源"
-				  bash <(curl -sSL https://linuxmirrors.cn/main.sh) --edu
+				  run_linuxmirrors_manual --edu
 				  ;;
 			  3)
 				  send_stats "海外源"
-				  bash <(curl -sSL https://linuxmirrors.cn/main.sh) --abroad
+				  run_linuxmirrors_manual --abroad
 				  ;;
 			  4)
 				  send_stats "智能切换更新源"
@@ -35146,6 +35963,10 @@ else
 			shift
 			kpanel_run_web_recipe_cli 5 "$@"
 			;;
+		fastadmin)
+			shift
+			kpanel_run_web_recipe_cli 10 "$@"
+			;;
 		dujiaoka)
 			shift
 			kpanel_run_web_recipe_cli 6 "$@"
@@ -35196,16 +36017,7 @@ else
 			;;
 		fd|rp|反代)
 			shift
-			ldnmp_Proxy "$@"
-	  		find_container_by_host_port "$port"
-	  		if [ -z "$docker_name" ]; then
-	  		  close_port "$port"
-			  echo "已阻止IP+端口访问该服务"
-	  		else
-			  ip_address
-			  close_port "$port"
-			block_container_port "$docker_name" "$ipv4_address" || return 1
-	  		fi
+			kpanel_proxy_cli "$@" || exit $?
 			;;
 
 		loadbalance|负载均衡)
